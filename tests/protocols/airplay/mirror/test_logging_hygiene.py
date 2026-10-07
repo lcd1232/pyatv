@@ -1,8 +1,4 @@
-"""What the mirror package is allowed to put in a log record.
-
-Structural checks over the whole package rather than over any one call site,
-so a new offender has to be added to an allowlist deliberately.
-"""
+"""What the mirror package is allowed to put in a log record."""
 
 import ast
 import pathlib
@@ -11,19 +7,11 @@ from pyatv.protocols.airplay.mirror import session
 
 
 def test_no_log_above_debug_prints_raw_key_material():
-    """Key material is logged at DEBUG, as everywhere else in pyatv.
+    """No ``_LOGGER`` call above DEBUG in the package passes a ``.hex()`` value.
 
-    The mirror once logged the video key, its IV, the SRTP session key and
-    salt, ``raw16`` and the pair-verify shared secret as hex at INFO -- six
-    sites.  pyatv's own convention is the opposite: ``mrp/pairing.py`` and
-    ``companion/protocol.py`` log credentials at DEBUG and nothing above it.
-    INFO is a level users routinely enable, and logs get pasted into issue
-    reports.
-
-    Rather than pin those six call sites, this checks the property: no
-    ``_LOGGER`` call above DEBUG in the package may pass a ``.hex()`` value.
-    Two are allowed, and neither carries a secret -- see ``ALLOWED``.  A new
-    one has to be added here deliberately, which is the point.
+    Key material may only be logged at DEBUG, as elsewhere in pyatv: INFO is
+    commonly enabled and logs end up in issue reports. Exceptions must be
+    added to ``allowed`` explicitly.
     """
     package = pathlib.Path(session.__file__).parent
     #: (module, format string) pairs whose hex payload is not key material.

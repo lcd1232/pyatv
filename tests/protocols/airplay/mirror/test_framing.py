@@ -19,12 +19,7 @@ def test_aes_ctr_encrypt_decrypt_round_trip():
 
 
 def test_mirror_encryptor_continuous_keystream_across_payloads():
-    """Two consecutive payloads should NOT decrypt with a fresh cipher.
-
-    The reference sender uses one continuous keystream across all frames. The cipher
-    state advances across boundaries, so a receiver decrypting frame N
-    must NOT reset the counter back to IV for frame N+1.
-    """
+    """The keystream continues across payloads instead of restarting at the IV."""
     key = b"\x00" * 16
     iv = b"\x01" * 16
     enc = framing.MirrorEncryptor.from_key_iv(key, iv)
@@ -50,12 +45,7 @@ def test_mirror_encryptor_decrypts_with_continuous_state():
 
 
 # ---------------------------------------------------------------------------
-# Block ciphers checked against NIST SP 800-38A's own vectors.
-#
-# The AES mode here has published test vectors, so they are proven against
-# those rather than pinned to whatever the code returns today: a silently
-# wrong mode or IV wiring is exactly the class of bug that negotiates fine and
-# renders nothing.
+# AES-CTR checked against the published NIST SP 800-38A vectors.
 # ---------------------------------------------------------------------------
 
 # NIST SP 800-38A, Appendix F -- AES-128 key and the shared 4-block plaintext.
@@ -77,7 +67,7 @@ _NIST_CTR_CIPHERTEXT = bytes.fromhex(
 
 
 def test_aes_ctr_matches_nist_sp800_38a_f_5_1():
-    """PROOF: AES-128-CTR with a 128-bit big-endian counter block."""
+    """AES-128-CTR uses a 128-bit big-endian counter block."""
     assert (
         framing.aes_ctr(_NIST_KEY, _NIST_CTR_IV).update(_NIST_PLAINTEXT)
         == _NIST_CTR_CIPHERTEXT
@@ -85,7 +75,7 @@ def test_aes_ctr_matches_nist_sp800_38a_f_5_1():
 
 
 def test_mirror_encryptor_keystream_matches_nist_sp800_38a_f_5_1():
-    """PROOF: the running keystream is plain AES-CTR across call boundaries."""
+    """The running keystream is plain AES-CTR across call boundaries."""
     enc = framing.MirrorEncryptor.from_key_iv(_NIST_KEY, _NIST_CTR_IV)
     out = b"".join(enc.encrypt(_NIST_PLAINTEXT[i : i + 16]) for i in range(0, 64, 16))
     assert out == _NIST_CTR_CIPHERTEXT
@@ -104,8 +94,7 @@ def test_ciphers_reject_a_wrong_length_iv():
 
 
 # ---------------------------------------------------------------------------
-# Apple-specific key derivations: no published reference exists for these, so
-# they are pinned rather than proven.
+# Apple-specific key derivations: no published vectors exist, so they are pinned.
 # ---------------------------------------------------------------------------
 
 
@@ -115,7 +104,7 @@ def test_derive_tcp_stream_key_iv_rejects_a_wrong_length_secret():
 
 
 def test_derive_tcp_stream_key_iv_folds_raw16_with_the_pair_secret():
-    """Characterize the reference sender's ``DeriveKeyAndIV``."""
+    """Key and IV are SHA-512 of a label plus sha512(raw16 || pair32)[:16]."""
     raw16, pair32 = bytes(range(16)), bytes(range(32, 64))
     secret16 = hashlib.sha512(raw16 + pair32).digest()[:16]
     key, iv = framing.derive_tcp_stream_key_iv(raw16, pair32, 527657112)
@@ -132,23 +121,17 @@ def test_derive_tcp_stream_key_iv_treats_the_connection_id_as_unsigned():
 
 
 def test_constants_defined_in_two_modules_still_agree():
-    """The HTTP `User-Agent` both handshakes send is written out twice.
-
-    It is one protocol fact with two definitions, so nothing makes them move
-    together.  Consolidating them is a production change.  This asserts they
-    have not drifted meanwhile, and fails whichever side moves.
-    """
+    """Both handshake modules send the same HTTP ``User-Agent``."""
     from pyatv.protocols.airplay.mirror import fairplay, fply  # noqa: PLC0415
 
     assert fairplay.USER_AGENT == fply.USER_AGENT
 
 
 def test_the_stream_key_labels_are_pinned_and_spelled_once():
-    """``AirPlayStreamKey``/``AirPlayStreamIV`` are domain separators.
+    """Pin the ``AirPlayStreamKey``/``AirPlayStreamIV`` derivation.
 
-    A drift in either would derive keys no receiver agrees with, and would do
-    it silently.  These vectors pin the labels themselves: changing either
-    string, or the digest, or the truncation, changes them.
+    A change to either label, the digest or the truncation would derive keys
+    no receiver agrees with, without any error.
     """
     key, iv = framing.stream_key_iv_from_secret(bytes(range(20)), 0x1122334455667788)
     assert key.hex() == "07b8707d3c121b4cc3d03a73bde5b405"
@@ -168,19 +151,12 @@ def test_the_stream_key_labels_are_pinned_and_spelled_once():
 
 
 def test_one_video_frame_costs_a_fraction_of_its_frame_budget():
-    """Not a benchmark -- a guard on the per-frame streaming path.
+    """Guard the per-frame cost of framing and encrypting a video frame.
 
-    Every frame is length-prefixed into avcC, AES-CTR encrypted against the
-    continuous keystream, and given a 128-byte data header.  Measured, that
-    is around 10us for a 58 KB frame against the 16.7ms a 60 fps frame gets:
-    four orders of magnitude of headroom, which is why ``session.py`` can
-    pace off wall-clock time and treat the encrypt cost as free.
-
-    The threshold is deliberately loose -- 1ms, still sixteen times inside
-    the budget and a hundred times the measured cost -- so a slow or noisy
-    runner cannot fail it.  What it catches is someone reintroducing
-    per-frame work of a different order: deriving a key per frame, hashing
-    the payload, or re-reading a file.
+    A 58 KB frame takes about 10us against a 16.7ms budget at 60 fps, which
+    lets ``session.py`` pace off wall-clock time. The 1ms threshold is loose
+    enough for slow runners and still catches per-frame work of a different
+    order (deriving a key per frame, hashing the payload).
     """
     import os
     import time

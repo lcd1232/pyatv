@@ -12,8 +12,8 @@ _LOGGER = logging.getLogger(__name__)
 class SendChannel(Protocol):
     """Anything the mirror pipeline can push an already-framed message at.
 
-    :class:`..tcp_stream.RawVideoTCPChannel` fills this role. ``send()`` is
-    the whole of what the drain task needs, so that is what is asked for here.
+    :class:`~pyatv.protocols.airplay.mirror.tcp_stream.RawVideoTCPChannel`
+    fills this role.
     """
 
     def send(self, data: bytes) -> None:

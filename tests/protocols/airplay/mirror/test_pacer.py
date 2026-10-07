@@ -51,11 +51,7 @@ def _annexb(*nalus: bytes) -> bytes:
 
 
 def test_scan_file_requires_sps_and_pps(tmp_path):
-    """An asset with no parameter sets cannot configure a decoder.
-
-    The message names the offending path, which is the only thing that makes
-    the failure actionable.
-    """
+    """An asset with no parameter sets is refused, naming the path."""
     asset = tmp_path / "no_ps.h264"
     asset.write_bytes(_annexb(b"\x65\x11\x22"))  # a lone IDR slice
 
@@ -74,15 +70,7 @@ def test_scan_file_requires_an_idr(tmp_path):
 
 
 def test_find_start_codes_reports_offset_and_width():
-    """Both Annex-B widths, at the offsets they actually occur.
-
-    ``session.py``'s live-encoder path needs the offsets rather than the
-    payloads, and carried its own copy of this scan nested inside an
-    I/O-bound coroutine, where no test could reach it -- it sat at zero
-    coverage for a reason that never applied to it: it needs bytes, not an
-    encoder.  ``split_nalus`` is now expressed in terms of this too, so the
-    two cannot drift.
-    """
+    """Both Annex-B start-code widths are reported at their offsets."""
     assert pacer.find_start_codes(b"\x00\x00\x01\x65") == [(0, 3)]
     assert pacer.find_start_codes(b"\x00\x00\x00\x01\x65") == [(0, 4)]
     assert pacer.find_start_codes(b"\x00\x00\x01a\x00\x00\x00\x01b") == [(0, 3), (4, 4)]
@@ -91,11 +79,8 @@ def test_find_start_codes_reports_offset_and_width():
     # and the leading zeros are not themselves start codes.
     assert pacer.find_start_codes(b"\x00\x00\x00\x00\x01") == [(1, 4)]
 
-    # Nothing to find. The all-zero cases matter more than they look: the
-    # four-byte branch reads data[i + 3], and its `i + 3 < n` guard is the
-    # only thing keeping that in bounds. Relaxing it to `<=` raises
-    # IndexError on exactly these -- and on nothing else here, because every
-    # other input short-circuits at `data[i + 2] == 0` first.
+    # Nothing to find. The all-zero inputs exercise the bounds check on the
+    # four-byte branch, which reads data[i + 3].
     for data in (
         b"",
         b"\x00",
@@ -109,12 +94,7 @@ def test_find_start_codes_reports_offset_and_width():
 
 
 def test_find_start_codes_never_returns_overlapping_codes():
-    """Each match consumes its own start code before scanning resumes.
-
-    Back-to-back start codes are the case that separates skipping by the
-    code's width from skipping by one: scanning by one would report a second,
-    overlapping code inside ``00 00 01 00 00 01``.
-    """
+    """Each match consumes its own start code before scanning resumes."""
     codes = pacer.find_start_codes(b"\x00\x00\x01" * 4)
     assert codes == [(0, 3), (3, 3), (6, 3), (9, 3)]
 
@@ -122,19 +102,13 @@ def test_find_start_codes_never_returns_overlapping_codes():
     starts = [off for off, _ in codes]
     assert all(e <= s for e, s in zip(ends, starts[1:])), codes
 
-    # The four-byte case is where skipping by the width rather than by one
-    # actually matters: the last three bytes of `00 00 00 01` are themselves
-    # a valid three-byte code, so a scanner that advanced by one would report
-    # (0, 4) and then an overlapping (1, 3).
+    # The last three bytes of a four-byte code are a valid three-byte code;
+    # it must not also be reported as (1, 3).
     assert pacer.find_start_codes(b"\x00\x00\x00\x01") == [(0, 4)]
 
 
 def test_split_nalus_and_find_start_codes_agree_on_the_same_buffer():
-    """The payloads must be exactly the gaps between the codes.
-
-    This is what stops the two from drifting apart again: whatever the
-    scanner finds, ``split_nalus`` must carve at precisely those boundaries.
-    """
+    """``split_nalus`` returns exactly the gaps between the found codes."""
     data = b"junk\x00\x00\x01\x65\x41\x00\x00\x00\x01\x67\x00\x00\x01\x68"
     codes = pacer.find_start_codes(data)
     expected = [
@@ -155,14 +129,7 @@ def _asset(tmp_path, *nalus: bytes) -> Path:
 
 
 def test_a_file_missing_its_pps_is_refused(tmp_path):
-    """Either parameter set missing is fatal, not both.
-
-    ``_scan_file`` raises when ``sps is None or pps is None``. Written
-    ``and`` it only objects when the file has neither, so a stream carrying
-    an SPS and no PPS is accepted and goes on to build an avcC around a
-    ``None``. Every asset the suite uses has both, so the change was
-    invisible.
-    """
+    """A file with only one of SPS and PPS is refused."""
     sps_only = _asset(tmp_path, b"\x67\x42\x00\x1f", b"\x65" + b"\xa0" * 8)
     with pytest.raises(ValueError, match="no SPS/PPS"):
         pacer._scan_file(sps_only)

@@ -66,12 +66,10 @@ def test_wrong_message_rejected():
 
 
 def test_xrecover_corrects_a_wrong_first_candidate_root():
-    """``_xrecover`` needs the ``*_I`` correction for half of all ``y``.
+    """``_xrecover`` applies the ``*_I`` correction when the first root is wrong.
 
-    The first candidate ``x = xx**((P+3)//8)`` is only a square root of ``xx``
-    when ``xx`` is a fourth power; otherwise it is off by the factor ``I``
-    (sqrt(-1) mod P) and must be corrected. The base point's ``y`` happens not
-    to need it, so nothing else in the module executes that branch.
+    The candidate ``xx**((P+3)//8)`` can be off by sqrt(-1) mod P. The base
+    point does not hit this branch, so it is exercised here with ``y = 3``.
     """
     P = ed25519_scalar._P
     D = ed25519_scalar._D

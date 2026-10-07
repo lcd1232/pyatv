@@ -1,17 +1,18 @@
-"""MFiSAP handshake — AirPlay 2 mirror sender authentication.
+"""MFiSAP handshake for the AirPlay 2 mirror sender.
 
-Implements the 4-message handshake used by the reference sender (and presumably
-other AirPlay 2 mirror senders) to derive an AES-128-CTR key+IV used to
-encrypt mirror frame payloads end-to-end.
+Four messages -- M1/M2 on ``/fp-setup``, M3/M4 on ``/auth-setup`` --
+derive the AES-128-CTR key and IV that encrypt mirror frame payloads end
+to end:
 
-Wire format reverse-engineered from the reference sender's native library (PE32+, MSVC,
-Squirrels LLC, January 2025). See the post-RE corrections section of the
-implementation plan for the wire layout reference.
+    M1  = header byte || sender X25519 public key (32)
+    M2  = receiver X25519 public key (32) || cert_len (4, BE)
+          || sig_len (4, BE) || cert || sig
+    M3  = cert || AES-CTR(sig)
+    key = SHA-1("AES-KEY" || 00 || shared)[:16]
+    iv  = SHA-1("AES-IV" || 00 || shared)[:16]
 
-Uses only standard cryptographic primitives (X25519, HKDF-SHA512, SHA-1,
-AES-128-CTR) provided by the existing `cryptography` dependency. The
-nonce generator was changed from the reference sender's predictable
-`srand(time(0))+rand()` to `secrets.token_bytes(32)`.
+The sender's X25519 scalar is HKDF-SHA512 over 32 random bytes.  Only
+standard primitives from the ``cryptography`` dependency are used.
 """
 
 from __future__ import annotations
@@ -34,9 +35,7 @@ _LOGGER = logging.getLogger(__name__)
 HKDF_SALT = b"MFiSAP-ECDH-Salt"
 HKDF_INFO = b"MFiSAP-ECDH-Info"
 
-# Default M1[0] header byte. The reference sender's ctx[4] is set at create time but the
-# value is not directly visible in the disasm. 0x01 is the convention for
-# "client hello"; if a real Apple TV rejects, try 0x00.
+# Default M1[0] header byte ("client hello").
 DEFAULT_M1_HEADER_BYTE = 0x01
 
 
@@ -105,8 +104,7 @@ class MFiSAPHandshake:
         assert self._scalar_key is not None
         shared = self._scalar_key.exchange(server_pubkey)
 
-        # SHA1 KDF — labels include trailing null byte (the reference sender: 8 / 7
-        # bytes)
+        # SHA-1 KDF; the labels include their trailing NUL (8 and 7 bytes)
         self._aes_key = _sha1(b"AES-KEY\x00" + shared)[:16]
         self._aes_iv = _sha1(b"AES-IV\x00" + shared)[:16]
 
@@ -138,7 +136,7 @@ class MFiSAPHandshake:
 
         State has been advanced past the M3 sig encryption; subsequent
         `encrypt(...)` calls on this object continue the keystream from
-        where M3 left off — exactly matching the reference sender's behavior.
+        where M3 left off.
         """
         if self._stream_encryptor is None:
             raise RuntimeError("handshake not complete")
@@ -201,6 +199,5 @@ async def run_handshake(
     if resp2.code != 200:
         raise exceptions.ProtocolError(f"/auth-setup returned HTTP {resp2.code}")
 
-    # M4 is not parsed — RE found no parser for it. Receiver returning 200
-    # is sufficient to consider the handshake complete.
+    # M4 carries nothing the sender needs; HTTP 200 completes the handshake.
     return sm

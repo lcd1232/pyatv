@@ -1,22 +1,10 @@
-"""In-process mock AirPlay 2 mirror receiver for integration testing.
+"""In-process AirPlay 2 mirror receiver for driving a MirrorSession in tests.
 
-Speaks just enough of the wire protocol to drive a MirrorSession start to
-finish without requiring a real Apple TV:
-  - HTTP/RTSP control on a randomly-allocated TCP port
-  - /fp-setup: real X25519 ephemeral ECDH + fixed cert + fixed sig
-  - /auth-setup: 200 OK
-  - ANNOUNCE / SETUP / RECORD / TEARDOWN: respond 200 (with bplist body for SETUP)
-  - Data sockets that count received bytes / "frames"
-
-The modelled flow is the one that renders on tvOS 26: no session init; a
-type-96 audio SETUP carries the ``eventPort``, RECORD follows, and the
-type-110 video SETUP returns a plain TCP ``dataPort``. The event channel is
-bidirectional RTSP driven by the receiver.
-
-The fake is symmetric enough with the real receiver that a real
-MirrorSession run against it derives the same AES-CTR keystream. It does
-NOT decrypt the mirror frames it receives — for the integration test we
-only assert that bytes/frames flowed.
+It serves RTSP/HTTP control on a random local port and answers /fp-setup,
+/auth-setup, /info, SETUP, RECORD and TEARDOWN. A type-96 audio SETUP returns
+the ``eventPort``, RECORD follows, and the type-110 video SETUP returns a TCP
+``dataPort``. The event channel is RTSP driven by the receiver. Data sockets
+count (and partly retain) what arrives; the fake does not decrypt video.
 """
 
 from __future__ import annotations
@@ -33,11 +21,9 @@ from cryptography.hazmat.primitives.asymmetric import x25519
 
 _LOGGER = logging.getLogger(__name__)
 
-#: Reason phrases for the status codes tests actually ask the fake to send.
-#: 250 is RTSP's "Low on Storage Space" -- a *successful* 2xx that is
-#: nonetheless not 200, which is the only way a receiver can trip the
-#: ``resp.code != 200`` guards in session.py (pyatv's HTTP layer raises
-#: HttpError for anything outside 2xx before those guards ever run).
+#: Reason phrases for the status codes tests ask the fake to send. 250 is a
+#: 2xx other than 200: the only way to reach session.py's ``resp.code != 200``
+#: guards, since pyatv's HTTP layer raises for anything outside 2xx.
 _REASONS = {
     200: "OK",
     250: "Low on Storage Space",
@@ -50,68 +36,42 @@ _REASONS = {
 # What a real receiver reads out of a SETUP body
 # ---------------------------------------------------------------------------
 #
-# The fake dispatches on ``streams[0]["type"]`` and answers 200 regardless of
-# everything else in the body, so without the checks below any captured
-# constant in session.py could be changed and every test would stay green --
-# while a real tvOS 26 receiver would reject the SETUP or mis-configure the
-# stream. These tables are an independent second copy of the captured values,
-# deliberately *not* imported from the production module: the whole point is
-# that the sender and the expectation can disagree.
-#
-# Two kinds of field live in a SETUP body and only the first is pinned:
-#
-#   * captured protocol constants -- the receiver interprets them, they came
-#     off the wire from a real sender, and any other value is a bug. Pinned.
-#   * per-session values -- IDs, ports, UUIDs. Checked for presence and shape
-#     only; pinning them would pin randomness.
+# The fake answers 200 to any SETUP, so these checks are what make a changed
+# protocol constant in session.py fail a test. They are a second copy of the
+# captured values, deliberately not imported from the production module.
+# Protocol constants are pinned; per-session values (IDs, ports, UUIDs) are
+# checked for presence and shape only.
 
-#: ``streams[0]`` of the TCP dialect's screen-audio SETUP. RE'd from the reference
-#: sender's negotiation callback (@0x10008e1a4) and seen on the wire in the Phase 28
-#: capture against tvOS 26.
+#: ``streams[0]`` of the screen-audio SETUP, as captured against tvOS 26.
 CAPTURED_AUDIO_STREAM: Dict[str, Any] = {
-    # 96 is the screen-audio stream type (the soundtrack of a mirroring
-    # session); 110 below is the screen video. The receiver keys its whole
-    # stream-configuration branch off this number.
+    # Screen-audio stream type (110 is screen video).
     "type": 96,
-    # Jitter-buffer bounds, in 44.1 kHz sample frames: 3750 / 44100 = 85 ms.
-    # The sender pins min == max, which asks the receiver for a fixed-latency
-    # buffer instead of an adaptive one.
+    # Jitter buffer in 44.1 kHz sample frames (85 ms); min == max asks for a
+    # fixed-latency buffer.
     "latencyMin": 3750,
     "latencyMax": 3750,
-    # Each audio packet is transmitted twice; the receiver de-duplicates by
-    # RTP sequence number. Sending a different factor than the one the
-    # receiver is told to expect desynchronises that de-duplication.
+    # Each audio packet is sent twice; the receiver de-duplicates by sequence.
     "redundantAudio": 2,
-    # Compression type 8 == AAC-ELD, which is what
-    # ``screen_audio.ScreenAudioPacketizer`` actually produces. A
-    # mismatch here points the receiver's decoder at the wrong codec.
+    # Compression type 8 is AAC-ELD, what ``ScreenAudioPacketizer`` produces.
     "ct": 8,
-    # Format bitfield: 0x1000000 is the single AAC-ELD 44100/2 entry. It must
-    # agree with ``ct`` -- both name the same codec, in two encodings.
+    # Format bit for AAC-ELD 44100/2; must agree with ``ct``.
     "audioFormat": 0x1000000,
-    # Marks this as mirroring audio rather than a standalone AirPlay audio
-    # stream, which is what makes the receiver accept the type-110 video
-    # SETUP that follows.
+    # Mirroring audio rather than a standalone AirPlay audio stream.
     "usingScreen": True,
 }
 
 #: Top-level (outside ``streams``) constants of the audio SETUP.
 CAPTURED_AUDIO_TOP: Dict[str, Any] = {
-    # Encryption type 32 == FairPlay SAP v3, the keying the ekey/eiv beside it
-    # belong to.
+    # Encryption type 32 is FairPlay SAP v3 (the ekey/eiv beside it).
     "et": 32,
 }
 
-#: ``streams[0]`` of the TCP dialect's screen-video SETUP.
+#: ``streams[0]`` of the screen-video SETUP.
 CAPTURED_VIDEO_STREAM_TCP: Dict[str, Any] = {
-    # The reference sender's screen-video stream type.
     "type": 110,
 }
 
-#: The ``timestampInfo`` probe names, in order, as the capture sends them.
-#: They label the timestamps the receiver reports back for latency
-#: accounting: submission, before/after pixel transfer, before encode, and
-#: encode-emitted.
+#: The ``timestampInfo`` probe names, in order, used for latency reporting.
 CAPTURED_TIMESTAMP_NAMES = ["SubSu", "BePxT", "AfPxT", "BefEn", "EmEnc"]
 
 #: Captured ``spf`` -- samples per AAC-ELD frame.
@@ -138,12 +98,7 @@ def _check_constants(where: str, actual: dict, expected: Dict[str, Any]) -> List
 
 
 def _check_session_fields(where: str, body: dict) -> List[str]:
-    """Check the per-session identity block for presence and shape only.
-
-    These values are freshly generated per run, so pinning them would pin
-    randomness. A real receiver still depends on them being well-formed: it
-    indexes sessions by ``sessionUUID`` and senders by ``deviceID``.
-    """
+    """Check the per-session identity fields for presence and shape only."""
     problems = []
     uuid = body.get("sessionUUID")
     if not isinstance(uuid, str) or not _UUID_RE.match(uuid):
@@ -162,11 +117,7 @@ def _check_session_fields(where: str, body: dict) -> List[str]:
 
 
 def _check_stream_connection_id(where: str, stream: dict, bits: int) -> List[str]:
-    """``streamConnectionID`` is per-session but must fit the receiver's field.
-
-    The receiver rebuilds the key-derivation label from this id, so it has to
-    fit the 32-bit field the receiver stores it in.
-    """
+    """Check that ``streamConnectionID`` fits the receiver's ``bits``-bit field."""
     sid = stream.get("streamConnectionID")
     if not isinstance(sid, int) or not 0 < sid < 2**bits:
         return [f"{where}: streamConnectionID {sid!r} is not a {bits}-bit id"]
@@ -186,12 +137,11 @@ def check_audio_setup(body: dict) -> List[str]:
             f"audio stream: spf is {stream.get('spf')!r}, "
             f"captured is {CAPTURED_AUDIO_SPF}"
         )
-    # The UDP port the sender will receive audio sync packets on. Per-session,
-    # but the receiver sends to it, so it must be a real bound port.
+    # Sender's UDP port for audio sync; the receiver sends to it.
     control_port = stream.get("controlPort")
     if not isinstance(control_port, int) or not 0 < control_port < 65536:
         problems.append(f"audio stream: controlPort {control_port!r} is not bound")
-    # FairPlay key transport. et=32 above promises these are here.
+    # et=32 requires the FairPlay ekey/eiv.
     if not isinstance(body.get("ekey"), bytes) or not body["ekey"]:
         problems.append("audio SETUP: et=32 but no ekey")
     if not isinstance(body.get("eiv"), bytes) or len(body["eiv"]) != 16:
@@ -233,10 +183,8 @@ def _abort_writers(writers: list[asyncio.StreamWriter]) -> None:
 class _FrameCounter:
     """Byte/frame tallies plus a "reached N frames" event.
 
-    ``wait_frames`` is what makes the integration test deterministic: instead
-    of sleeping for a guessed duration and hoping enough frames arrived, the
-    test blocks until the Nth frame has actually been counted. The timeout is
-    only a failure guard, never a pacing device.
+    A "frame" is one read or datagram. ``wait_frames`` lets a test block until
+    enough data arrived instead of sleeping; the timeout is only a guard.
     """
 
     def __init__(self) -> None:
@@ -266,10 +214,8 @@ class _FrameCounter:
 class _MirrorDataServer(_FrameCounter):
     """Counts bytes/frame-bursts received on the video or audio data port."""
 
-    #: Bytes retained from the head of the stream, for tests that need to see
-    #: what was sent rather than only how much. Bounded because a session
-    #: streams indefinitely; the first message is the plaintext avcC config,
-    #: which is what anything checking content cares about.
+    #: Bytes retained from the head of the stream (which starts with the
+    #: plaintext avcC config) for tests that check content.
     RETAIN_BYTES = 64 * 1024
 
     def __init__(self) -> None:
@@ -325,12 +271,11 @@ class _MirrorDataServer(_FrameCounter):
 
 
 class _MirrorEventServer(_MirrorDataServer):
-    """The receiver's end of the TCP dialect's event channel.
+    """The receiver's end of the event channel.
 
-    The event channel is bidirectional RTSP with the *receiver* as the client:
-    it POSTs ``/command`` to the sender and tears the whole mirror session down
-    if the sender never answers. Model that by issuing one request as soon as
-    the sender connects and recording its reply.
+    The receiver is the RTSP client here: it POSTs ``/command`` to the sender
+    and ends the session if the sender never answers. The fake sends its
+    requests as soon as the sender connects and records the reply.
     """
 
     def __init__(
@@ -346,13 +291,10 @@ class _MirrorEventServer(_MirrorDataServer):
         #: reader sees EOF rather than a live idle socket.
         self.hang_up_after_reply = hang_up_after_reply
         #: Bodies to send, one POST /command each, CSeq counting from 7.
-        #: The default is a single session-active update. Supplying several --
-        #: especially with ``\r\n\r\n`` inside one -- is what tells a reader
-        #: that frames on Content-Length from one that hunts for a blank line.
+        #: Defaults to a single session-active update.
         self.command_bodies = command_bodies
-        #: Deliver POST /command as headers-then-body in two separate writes.
-        #: A real receiver's request can arrive split across TCP segments, and
-        #: the sender must buffer rather than answer a half-read request.
+        #: Deliver POST /command as headers then body in two writes, as a
+        #: request split across TCP segments would arrive.
         self.split_request = split_request
 
     async def _handle(
@@ -417,16 +359,10 @@ class _MirrorDatagramServer(_FrameCounter):
     def __init__(self) -> None:
         super().__init__()
         self._transport: asyncio.DatagramTransport | None = None
-        #: Every datagram received, in arrival order. Retained (not just
-        #: counted) so a test can inspect the RTP framing and decrypt the
-        #: payload -- the only way to see which key actually encrypted the
-        #: wire.
+        #: Every datagram received, in order, so tests can decrypt payloads.
         self.datagrams: list[bytes] = []
-        #: Source ``(host, port)`` of each datagram, in the same order. The
-        #: screen-audio sync must leave from the socket whose port was
-        #: advertised as ``controlPort``, or the receiver never opens its
-        #: audio control channel -- so which socket sent it is part of the
-        #: protocol, not an implementation detail.
+        #: Source ``(host, port)`` of each datagram. Sync packets must come
+        #: from the port advertised as ``controlPort``.
         self.sources: list[tuple] = []
 
     class _Protocol(asyncio.DatagramProtocol):
@@ -465,14 +401,10 @@ class FakeMirrorReceiver:
         dead_audio_data_port: bool = False,
         hang_up_event_channel: bool = False,
     ) -> None:
-        # Misbehaviour knobs. A cooperative receiver is the default; these let
-        # a test make the fake answer the way a confused or older receiver
-        # does, so the sender's error handling runs on real wire bytes rather
-        # than on a monkeypatched internal.
-        #
-        # ``status_overrides`` maps a phase name -- "setup_session",
-        # "setup_audio", "setup_video", "record", "info" -- to the status code
-        # to answer it with.
+        # The keyword arguments make the fake misbehave so the sender's error
+        # handling runs on real wire bytes. ``status_overrides`` maps a phase
+        # ("setup_session", "setup_audio", "setup_video", "record", "info") to
+        # the status code to answer it with.
         self.status_overrides = dict(status_overrides or {})
         #: Answer SETUP without the ``eventPort`` the sender needs.
         self.omit_event_port = omit_event_port
@@ -502,9 +434,6 @@ class FakeMirrorReceiver:
         self.audio_setup_received = False
         self.stream_setup_received = False
         #: FairPlay key-transport fields as they arrived in each stream SETUP.
-        #: The fake cannot unwrap an ``ekey`` (that needs the receiver half of
-        #: FairPlay), but recording the bytes lets a test assert that whatever
-        #: the sender derived is what actually reached the wire.
         self.video_setup_ekey: bytes | None = None
         self.video_setup_eiv: bytes | None = None
         self.video_setup_et = None
@@ -515,11 +444,8 @@ class FakeMirrorReceiver:
         self.session_setup_body: dict | None = None
         self.audio_setup_body: dict | None = None
         self.video_setup_body: dict | None = None
-        #: Every way an arriving SETUP disagreed with the captured tvOS 26
-        #: protocol. A real receiver interprets these fields; this fake would
-        #: otherwise answer 200 to anything, so the checks are what makes a
-        #: changed constant visible. Tests read this via
-        #: ``assert_protocol_ok()``.
+        #: Every way an arriving SETUP disagreed with the captured protocol;
+        #: checked by ``assert_protocol_ok()``.
         self.protocol_violations: List[str] = []
         self._event_port = 49641
         self.record_received = False
@@ -627,10 +553,9 @@ class FakeMirrorReceiver:
     def _dispatch_setup(self, body: bytes) -> Tuple[bytes, str | None, int]:
         """Answer a SETUP, distinguishing session-init / audio / video.
 
-        The sender opens with a type-96 audio stream SETUP (which carries the
-        ``eventPort``), then sends the type-110 video stream SETUP after
-        RECORD. A metadata-only session-init SETUP (no ``streams``) is the
-        macOS sender's opening; it is recorded so a test can assert it is not
+        The sender opens with a type-96 audio SETUP (answered with the
+        ``eventPort``) and sends the type-110 video SETUP after RECORD. A
+        SETUP without ``streams`` is recorded so tests can assert it is not
         sent.
         """
         decoded = {}
@@ -654,8 +579,6 @@ class FakeMirrorReceiver:
 
         stream_type = streams[0].get("type")
         if stream_type == 96:
-            # The reference sender's screen-audio stream. Its response is where the
-            # sender learns the eventPort in that dialect.
             self.audio_setup_received = True
             # ekey/eiv/et sit at the top level of the SETUP body, alongside
             # "streams" -- not inside the stream dict.

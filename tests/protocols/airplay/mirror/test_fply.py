@@ -1,11 +1,7 @@
 """Tests for the FPLY v3 wire format and handshake state machine.
 
-Spec references: /tmp/fply_spec_v3.md (sections cited inline).
-
-This file covers the framing — M1, M2 parsing, M3 assembly, the state
-machine and the async runner.  The known-answer tests for what goes IN the
-messages (the device tag and the ekey, against 256 recorded handshakes) are
-in ``test_fairplay_sap.py``.
+Known-answer tests for the message contents (device tag, ekey) are in
+``test_fairplay_sap.py``.
 """
 
 from __future__ import annotations
@@ -18,12 +14,12 @@ import pytest
 from pyatv.protocols.airplay.mirror import fairplay_sap, fply
 
 # ---------------------------------------------------------------------------
-# §7.1 M1 known-answer test
+# M1
 # ---------------------------------------------------------------------------
 
 
 def test_build_m1_matches_spec_test_vector():
-    """build_m1(mode=0) must match the spec §7.1 test vector exactly."""
+    """build_m1(mode=0) matches a known M1 byte-for-byte."""
     expected = bytes.fromhex("46504c5903010100000000040200" + "00bb")
     assert fply.build_m1(0) == expected
 
@@ -53,7 +49,7 @@ def test_build_m1_mode_masked_to_2_bits():
 
 
 def test_build_m1_terminal_byte():
-    """M1[15] must always be 0xBB (spec §1)."""
+    """M1[15] must always be 0xBB."""
     for mode in range(4):
         assert fply.build_m1(mode)[15] == 0xBB
 
@@ -66,11 +62,7 @@ def test_build_m1_terminal_byte():
 def _valid_m2(mode: int = 1) -> bytes:
     """Build a minimal syntactically valid 142-byte M2.
 
-    The default mode is 1 because that is what every one of the 256 recorded
-    handshakes in ``fply_pure_golden.jsonl`` carries. It used to default to 0,
-    which no receiver has ever been observed to send, so every handshake test
-    quietly went down ``consume_m2_build_m3``'s "mode is not 0x01" warning
-    branch rather than the path a real session takes.
+    Mode 1 is the default because it is what real receivers send.
     """
     m2 = bytearray(142)
     m2[0:4] = b"FPLY"
@@ -95,13 +87,8 @@ def test_parse_m2_validates_magic():
 def test_parse_m2_validates_length():
     """parse_m2 must raise ValueError for truncated M2.
 
-    The 141-byte case is the one that matters. 142 is where the cipher
-    input ends -- ``parse_m2`` returns ``m2[14:142]`` -- and Python slices
-    short rather than raising, so one byte less yields a 127-byte payload
-    that is only rejected much later, by the 128-byte check in the M3
-    build, and under a message about the cipher rather than about M2.
-    Testing at 100 leaves the guard covered from far away; lowering it to
-    141 changed nothing that failed.
+    141 bytes is the boundary case: the payload is ``m2[14:142]`` and a short
+    slice would otherwise give a 127-byte payload instead of an error.
     """
     with pytest.raises(ValueError, match="truncated"):
         fply.parse_m2(_valid_m2()[:100])
@@ -126,12 +113,7 @@ def test_parse_m2_extracts_mode():
 
 
 def test_parse_m2_payload_length():
-    """M2Parsed.payload must be exactly 128 bytes (8 cipher blocks × 16 bytes, spec §3.6).
-
-    The cipher state machine receives m2[12:] and processes 8 × 16-byte blocks
-    from m2[12:140].  The first 4 bytes (M2[12:16]) are the mode header but
-    still feed the cipher as the head of block 0.
-    """
+    """M2Parsed.payload must be exactly 128 bytes (8 cipher blocks)."""
     parsed = fply.parse_m2(_valid_m2())
     assert len(parsed.payload) == 128
 
@@ -160,12 +142,12 @@ def test_build_m3_magic():
 
 
 def test_build_m3_message_type():
-    """M3[6] must be 0x03 (message type 'client response', spec §4.1)."""
+    """M3[6] must be 0x03 (message type 'client response')."""
     assert fply.build_m3(0, bytes(128))[6] == 0x03
 
 
 def test_build_m3_mode_byte():
-    """M3[12] must carry the mode byte (empirical: only one mode echo)."""
+    """M3[12] must carry the mode byte."""
     for mode in range(4):
         m3 = fply.build_m3(mode, bytes(128))
         assert m3[12] == mode
@@ -174,7 +156,7 @@ def test_build_m3_mode_byte():
 def test_build_m3_aux_header_default_and_custom():
     """M3[13:16] holds 3 aux header bytes (default 8f 1a 9c, overridable)."""
     m3 = fply.build_m3(0, bytes(128))
-    assert m3[13:16] == b"\x8f\x1a\x9c"  # as captured from a live sender
+    assert m3[13:16] == b"\x8f\x1a\x9c"  # value seen on the wire
     m3 = fply.build_m3(0, bytes(128), aux_header=b"\x00\x00\x00")
     assert m3[13:16] == b"\x00\x00\x00"
 
@@ -187,7 +169,7 @@ def test_build_m3_payload_placed():
 
 
 def test_build_m3_device_tag_default_zero():
-    """Default device_tag must be 20 zero bytes at M3[144:164] (spec §4.3)."""
+    """Default device_tag must be 20 zero bytes at M3[144:164]."""
     m3 = fply.build_m3(0, bytes(128))
     assert m3[144:164] == b"\x00" * 20
 
@@ -266,7 +248,7 @@ def test_handshake_build_m1_returns_16_bytes():
     h = fply.FPLYHandshake()
     m1 = h.build_m1()
     assert len(m1) == 16
-    # FPLYHandshake defaults to mode 1 (matches the reference sender's capture).
+    # FPLYHandshake defaults to mode 1, as real senders use.
     assert m1 == fply.build_m1(1)
 
 
@@ -334,9 +316,7 @@ class _FakeConnection:
     def __init__(self, responses):
         self._responses = list(responses)
         self.sent: list = []
-        #: Headers of each request, in order. Kept because the Apple headers
-        #: have no observable effect here -- the canned responses come back
-        #: either way -- so only what was sent can show they were sent.
+        #: Headers of each request, in order.
         self.headers: list = []
 
     async def send_and_receive(self, method, uri, **kwargs):
@@ -401,14 +381,12 @@ async def test_run_fply_handshake_raises_on_m3_non_200():
 
 
 # ---------------------------------------------------------------------------
-# Phase 14h: m2_stepper inner cipher — verified clean-room port
+# m2_stepper compression functions
 # ---------------------------------------------------------------------------
 
 
-# 5 ground-truth triples captured from the reference sender at runtime (Mac native
-# build) via Frida (snap_complete / m2stepper_capture2 instrumentation). Each is
-# (iv_hex, message_hex_64bytes, expected_output_hex). All five reproduce byte-perfectly
-# through `m2_stepper_compress`.
+# Known-answer triples (iv_hex, message_hex_64bytes, expected_output_hex)
+# recorded from a real sender.
 _M2_STEPPER_TRIPLES = (
     (
         "dcdcf3b90b74dcfb867ff76016729051",
@@ -448,7 +426,7 @@ _M2_STEPPER_TRIPLES = (
 
 @pytest.mark.parametrize("iv_h,msg_h,expected_h", _M2_STEPPER_TRIPLES)
 def test_m2_stepper_compress_matches_captured_triples(iv_h, msg_h, expected_h):
-    """Verify clean-room port against runtime-captured ground-truth triples."""
+    """m2_stepper_compress reproduces the recorded known-answer triples."""
     iv = bytes.fromhex(iv_h)
     msg = bytes.fromhex(msg_h)
     if len(msg) > 64:
@@ -467,7 +445,6 @@ def test_m2_stepper2_compress_signature():
     """STEPPER2 has the right signature and validates input lengths."""
     iv = b"\x00" * 16
     msg = b"\x00" * 64
-    # Unknown-but-valid inputs return real values now (no NotImplementedError).
     out = fply.m2_stepper2_compress(iv, msg)
     assert isinstance(out, bytes) and len(out) == 16
     with pytest.raises(ValueError, match="iv must be 16 bytes"):
@@ -477,17 +454,7 @@ def test_m2_stepper2_compress_signature():
 
 
 def test_m2_stepper2_compress_validated_block1_macp1():
-    """STEPPER2 validated against the Unicorn emulator (which is bit-perfect
-    against the real reference sender binary in trace-replay mode WHEN configured
-    with non-session-aligned VM addresses). The 16-byte output
-    be3496aacd2e73de6e6d0cb54fec78fa is the protocol-correct output
-    (i.e. what AirPlay 2 receivers expect, per @systemcrash's
-    airplay2-receiver implementation).
-
-    Real binary's STEPPER2 mixes session-specific VM addresses into its
-    output, producing different bytes per call (verified by capturing two
-    consecutive fps M3 calls). Pyatv's deterministic implementation
-    matches the protocol cipher, not any specific session capture."""
+    """m2_stepper2_compress matches a known-answer vector."""
     iv = bytes.fromhex("4dad9cfa8c26684b9988f37f952e92de")
     msg = bytes.fromhex(
         "4dad9cfa8c26684b9988f37f952e92de"
@@ -522,11 +489,8 @@ def test_m2_stepper_compress_rejects_wrong_lengths():
 # ---------------------------------------------------------------------------
 # Validation and state guards
 #
-# Every branch below refuses to do something, so none of them run during a
-# successful handshake -- and an f-string in a `raise` that has never been
-# evaluated fails with NameError rather than reporting the problem. Each test
-# therefore asserts the exception type *and* that the message names the field
-# and, where the code promises it, the offending value.
+# These branches never run in a successful handshake, so each test checks the
+# exception type and that the message names the field (and value, if given).
 # ---------------------------------------------------------------------------
 
 
@@ -584,11 +548,7 @@ def test_finish_ekey_rejects_wrong_raw16_length():
 
 
 def test_finish_ekey_warns_when_m4_echoes_a_different_device_tag(caplog):
-    """M4 echoes M3's device tag back; a mismatch means the receiver disagrees.
-
-    It is only a warning -- the handshake continues -- so nothing else would
-    ever evaluate this message.
-    """
+    """M4 echoes M3's device tag; a mismatch is logged as a warning."""
     caplog.set_level(logging.WARNING, logger="pyatv.protocols.airplay.mirror.fply")
     handshake = _handshake_awaiting_m2()
     handshake.consume_m2_build_m3(_valid_m2())
@@ -661,21 +621,9 @@ def test_m3_payload_before_m3_is_refused():
 async def test_run_fply_handshake_accepts_every_shape_of_m4_body(m4_body, expected):
     """M4 arrives as bytes or as latin-1 text, and may be empty.
 
-    pyatv's HTTP layer hands back a ``str`` when it decoded the body and
-    ``bytes`` when it did not, so both reach this code.  Only the bytes path
-    was ever exercised: the ``str`` branch sat uncovered, and the comment on
-    it records a bug that had already been fixed there --
-
-        The previous spelling, ``bytes(resp2.body or b"", "latin-1")``,
-        raised TypeError on an empty body: the b"" fallback is not a str and
-        bytes() rejects an encoding without one.
-
-    -- with nothing to stop it coming back.  Restoring that spelling raises
-    TypeError on the two empty cases here.
-
-    Latin-1 matters as much as emptiness: it is the one encoding that maps
-    0x00-0xff to the same code points, so a byte above 0x7f survives the
-    decode/encode round trip. UTF-8 would turn ``\\xff`` into two bytes.
+    pyatv's HTTP layer returns ``str`` for a decoded body and ``bytes``
+    otherwise.  A ``str`` must be encoded as latin-1 so bytes above 0x7f
+    survive, and an empty or missing body must give ``b""``.
     """
     conn = _FakeConnection(
         [_FakeHttpResponse(200, _valid_m2()), _FakeHttpResponse(200, m4_body)]
@@ -686,17 +634,7 @@ async def test_run_fply_handshake_accepts_every_shape_of_m4_body(m4_body, expect
 
 @pytest.mark.asyncio
 async def test_a_normal_m2_produces_no_warning(caplog):
-    """The happy path must be quiet.
-
-    ``consume_m2_build_m3`` warns when ``parsed.mode`` is not 0x01, because
-    only that mode was ever verified against a receiver. The condition is
-    diagnostic, so inverting it changes nothing a handshake test would catch
-    -- M3 is still built and still correct -- and every ordinary session
-    starts warning that it is unverified.
-
-    A warning that fires on every healthy session is worse than no warning:
-    it is the one people learn to ignore before the real one arrives.
-    """
+    """A handshake with the usual M2 mode (0x01) logs no warning."""
     caplog.set_level(logging.WARNING, logger="pyatv.protocols.airplay.mirror.fply")
 
     conn = _FakeConnection(
@@ -709,11 +647,7 @@ async def test_a_normal_m2_produces_no_warning(caplog):
 
 @pytest.mark.asyncio
 async def test_an_unverified_m2_mode_does_warn(caplog):
-    """...and the warning still fires for a mode nobody has confirmed.
-
-    The pair matters: without this, deleting the warning entirely would pass
-    the test above.
-    """
+    """An M2 mode other than 0x01 logs a warning."""
     caplog.set_level(logging.WARNING, logger="pyatv.protocols.airplay.mirror.fply")
 
     conn = _FakeConnection(
@@ -728,14 +662,7 @@ async def test_an_unverified_m2_mode_does_warn(caplog):
 async def test_the_fply_handshake_sends_the_apple_headers():
     """Both FPLY posts carry ``X-Apple-HKP: 3`` and ``X-Apple-ET: 32``.
 
-    ``run_fply_handshake``'s own docstring lists them as what a real sender
-    sends, and ``X-Apple-ET: 32`` is not decoration: ``atvproxy`` strips it to
-    steer a receiver away from FairPlay and down the legacy AES path, so the
-    value selects which encryption the Apple TV expects.
-
-    Dropping either header passed the entire suite. Nothing else can see them
-    -- the fake answers the same way regardless -- so only a check on what was
-    sent will notice.
+    ``X-Apple-ET: 32`` selects FairPlay encryption on the receiver.
     """
     conn = _FakeConnection(
         [_FakeHttpResponse(200, _valid_m2()), _FakeHttpResponse(200, b"")]

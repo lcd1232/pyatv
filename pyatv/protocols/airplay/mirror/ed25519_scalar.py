@@ -1,22 +1,16 @@
 """Ed25519 signing from a raw clamped scalar (no seed / no nonce prefix).
 
-The AirPlay-2 raw *media* pair-verify requires the client to sign M3 with an
-ed25519 identity that the receiver has REGISTERED in its media peer store. A
-freshly generated pyatv identity is rejected (HTTP 500); the only identity the
-Apple TV accepts is one that completed a raw ``/pair-setup`` — in practice the
-registered the reference sender's identity, whose *clamped expanded scalar* (not the
-RFC-8032 seed) is all that was recoverable.
+The AirPlay 2 raw *media* pair-verify requires the client to sign M3 with
+an ed25519 identity the receiver has registered through a raw
+``/pair-setup``; a fresh identity is rejected with HTTP 500.  Such an
+identity may only be available as its clamped expanded scalar ``a``, not
+the RFC 8032 seed, and ``cryptography`` only signs from the seed.
 
-Standard libraries (``cryptography``) only sign from the 32-byte seed, so this
-module implements the minimal edwards25519 arithmetic needed to sign directly
-from the scalar ``a``. Ed25519 does not actually require the deterministic
+This module implements the minimal edwards25519 arithmetic needed to sign
+directly from ``a``.  Ed25519 does not require the deterministic
 prefix-derived nonce: any nonce ``r`` yields ``sig = R ‖ S`` with
-``R = r·B`` and ``S = (r + H(R‖A‖M)·a) mod L`` that verifies under the public
-key ``A = a·B``. We derive ``r`` from a random value so no nonce prefix is
-needed.
-
-Only used for the media pair-verify M3 signature; everything else uses
-``cryptography``.
+``R = r·B`` and ``S = (r + H(R‖A‖M)·a) mod L``, which verifies under the
+public key ``A = a·B``.  ``r`` is derived from a random value instead.
 """
 
 from __future__ import annotations

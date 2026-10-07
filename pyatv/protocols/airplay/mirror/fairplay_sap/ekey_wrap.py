@@ -1,86 +1,27 @@
-"""Region C -- the ekey wrap -- read rather than compressed.
-
-Region C ships as seven generated windows (`boundary_image.windows()`,
-engine span 1,094,859..1,333,775), tens of thousands of machine-translated
-statements each.  This module is what those windows turn out to BE --
-all of them, in closed form, with no emulator and no interpreter.  What
-is claimed is measured, and every measurement says how.
+"""The 72-byte FairPlay ekey that carries a media secret to the receiver.
 
     ekey(sap36, raw16)
         = HEADER || mac(sap36, raw16) || wrap(sap36[0:16], raw16)
             36    +        20         +           16              = 72
 
-WHAT REGION C ACTUALLY READS.  Its boundary is 276 bytes of FairPlay
-context plus `raw16`, but flipping one bit of the context at a time --
-all 276 of them, through `opexec`-grade replays, not through the
-generated port -- says only 48 of those bytes reach the answer:
+``sap36`` is the 36-byte SAP secret of the handshake and ``raw16`` the
+16-byte media secret being sent.  The two halves of the SAP secret are
+independent: ``sap36[0:16]`` keys the wrap and only affects
+``ekey[0x38:0x48]``; ``sap36[16:36]`` keys the MAC and only affects
+``ekey[0x24:0x38]``.
 
-    ctx[0:16]     a gate.  Any bit flipped and the entry returns an
-                  EMPTY ekey (length 0), so it is checked, not used.
-    ctx[16:32]    moves all 36 session-dependent bytes.
-    ctx[32:48]    moves ekey[0x24:0x38] only -- the 20-byte MAC.
-    ctx[48:256]   DEAD.  208 bytes, not one of them reaches the ekey.
-    ctx[256:273]  a second gate (same empty-ekey behaviour).
-    ctx[273:276]  dead.
-
-And those 48 live bytes are the **SAP secret, encrypted**.  Ops 0
-through ~145,000 of the engine -- windows 0 to 4, three fifths of the
-region -- are one thing: they decrypt the context in place, and when
-they are done the package frame at logical 0x40001d70 holds
-``opexec.sap_secret(m2)`` verbatim, all 36 bytes of it.  (Peeked out of
-a live Sim at op 145,000; the same run finds sap36[16:36] already in
-place at op 121,000, which is when the MAC starts.)  Region A already
-produces sap36 from M2 with no emulator, so for a SENDER that whole
-stretch is redundant work: it is the receiver's context being unwrapped
-back into a secret the sender computed itself in Region A.
-
-HOW THE SECRET SPLITS.  Injecting a one-bit change into sap36 with
-``opexec.handshake_with_sap`` -- 36 probes, one per byte -- splits the
-secret perfectly in two:
-
-    sap36[0:16]   -> ekey[0x38:0x48] and nothing else
-    sap36[16:36]  -> ekey[0x24:0x38] and nothing else
-
-So the wrap key and the MAC key are disjoint halves of the SAP secret,
-and the two outputs are independent.
-
-THE MAC -- SOLVED, EXACTLY.  ``ekey[0x24:0x38]`` is a **stock
-HMAC-SHA-1**, no modification of any kind:
+The MAC is stock HMAC-SHA-1:
 
     ekey[0x24:0x38] = HMAC-SHA1(sap36[16:36] ^ 0x0d, HEADER || raw16)
 
-The key is the secret's tail under FPLY's usual 0x0d mask -- the same
-mask ``fply_md5.SECRET_MASK`` applies before the device_tag's hashing.
-The message is 52 bytes: the ekey's own constant header with the
-plaintext ``raw16`` where the wrapped key will later sit.
+keyed by the secret's tail under FPLY's usual 0x0d mask (the same mask
+``fply_md5.SECRET_MASK`` applies).  The message is the ekey's constant
+header followed by the *plaintext* ``raw16``, not the wrapped value that
+goes on the wire.
 
-This was read out of the engine, not guessed.  The four SHA-1
-compressions are ops 121,167..140,921 and they are shaped 16 + 64 + 20 +
-20 + 20 + 20: sixteen message words, sixty-four schedule expansions,
-four round groups of twenty.  Their block buffer stores everything
-XORed with 0x0d0d0d0d, and unmasked it reads
-
-    block 1  key^0x36...            eleven words of 0x36363636   ipad
-    block 2  "FPLY" 01 02 01 ...    length 0x3a0 = 928 bits      message
-    block 3  key^0x5c...            eleven words of 0x5c5c5c5c   opad
-    block 4  the inner digest       length 0x2a0 = 672 bits      outer
-
-which is HMAC by construction.  The expansion array at 0x6ffff8bc is
-masked with 0x55f3fdec and satisfies
-``w[i] = rol(w[i-3]^w[i-8]^w[i-14]^w[i-16], 1)`` under it for 61 of the
-64 expansions (the last three are overwritten before the snapshot).
-``mac`` below reproduces ``ekey[0x24:0x38]`` on all eight handshakes in
-``VECTORS`` -- 1001, 4242, 7, 13, 99, 555, 2024 and 12345 -- byte for
-byte.
-
-THE WRAP -- SOLVED.  ``ekey[0x38:0x48]`` is **AES-128 with Apple's own
-tables**: AES's key schedule, AES's ShiftRows, AES's MixColumns matrix
-over the Rijndael field, ten rounds, and not one of AES's S-boxes.
-
-    wrap(key16, raw16) = the block cipher below, keyed by sap36[0:16]
-
-It runs at ops 148,918..152,817 over the sixteen bytes at logical
-0x40001ecc, and what it does there is
+The wrap is AES-128 with Apple's own tables: AES's key schedule and round
+constants, ShiftRows, the MixColumns matrix over the Rijndael field and
+ten rounds, but none of AES's S-boxes:
 
     state = raw16 ^ PLAINTEXT_XOR ^ K[0]
     for r in 0..8:
@@ -89,87 +30,17 @@ It runs at ops 148,918..152,817 over the sixteen bytes at logical
         state ^= K[r + 1]
     state[p] = LAST[p][ state[SHIFT_ROWS[p]] ] ^ K[10][p] ^ OUTPUT_XOR[p]
 
-with ``K = key_schedule(sap36[0:16] ^ KEY_XOR)`` -- AES's own schedule,
-AES's own round constants (01 02 04 08 10 20 40 80 1B 36), one SubWord
-table per round key instead of one for all ten.
+with ``K = key_schedule(sap36[0:16] ^ KEY_XOR)``, which uses a different
+SubWord table for each of its ten round keys.  All sixty-three tables
+(ten for the key schedule, four per full round, sixteen for the last
+round, one before the column step) have the form ``T(x) = R[x ^ d] ^ e``
+for one of three base tables; ``fply_wrap_tables`` stores the three bases
+and a (class, in-xor, out-xor) triple per use.
 
-Every table is a permutation and every one of them is Apple's.  There
-are sixty-three: ten for the key schedule, four per round for the nine
-full rounds, sixteen for the tenth, and one folded into the four column
-tables.  They live in a 19,968-byte block at 0x3352ef08, and they are
-static rodata -- byte-identical in the entry image, before the run and
-after it, on every seed.  Under ``T(x) = R[x ^ d] ^ e`` all sixty-three
-collapse into **three** classes, which is what ``fply_wrap_tables``
-ships: three 256-byte tables and a (class, in-xor, out-xor) triple per
-use, 1.7 KB in total.
-
-The column step is the prettiest part.  The four 1,024-byte tables are
-not linear, which is what made this look unlike MixColumns at first;
-subtract each one's four-byte offset and what is left IS MixColumns --
-``columns[lane][x] = rotate_right([2q, q, q, 3q], lane) ^ offset[lane]``
-for ``q = COLUMN[x]``, and rotating ``[2, 1, 1, 3]`` by the lane is
-exactly AES's circulant.  So the tables carry one more substitution and
-one more constant than AES does, and nothing else.  Only the XOR of the
-four offsets can reach the answer, since every column step XORs all four
-in; that XOR is ``COLUMN_XOR``, 4a4a4a4a.
-
-None of this was guessed.  ``extract_wrap_tables`` reads the program off
-a traced run with the same ``spn.recover_program`` that read Region B's
-network, finds the ten SubWord tables as the last ten runs of four
-consecutive lookups before the network starts, derives the column lanes
-from the traced state with ``spn.mix_lanes``, and refuses to write the
-file unless the column tables really are MixColumns on all 1,024 inputs
-and the result reproduces the traced ekey.
-
-Two earlier readings were wrong and are worth recording.  It is not
-stock AES: neither AES's S-box nor its inverse is anywhere in the image
-under any single-byte mask, and no 176-byte AES-128 key schedule is
-either -- because the schedule uses ten different S-boxes and none of
-them is AES's.  And Region C touches none of ``fply_tables``' addresses
--- 0 accesses in 239,294 ops, counted -- because this is a second copy
-of the network with its own table set, in a different constant region.
-
-WHAT ELSE IS IN THE SEVEN WINDOWS.  From the dispatch trace (6,667
-indirect dispatches, 260 distinct handler entries) and the loop counts:
-
-    op       0..  11,500   two modified-MD5 compressions
-    op  11,900..  23,600   a 256-step byte loop, then a 10/36/16 triple
-    op  23,600..  67,600   16 blocks, 2,743 ops each, walking the context
-                           backwards -- straight-line, no dispatch
-    op  67,600.. 116,000   a second 256-step loop, then four passes of
-                           (227, 396) over a 2,560-byte table region
-    op 116,300.. 141,000   raw16 enters; the four HMAC-SHA-1 compressions
-    op 143,000.. 152,800   the SPN: key schedule, then the 31 passes
-    op 152,800.. 164,300   two more modified-MD5 compressions, over a
-                           48-byte message that is ASCII-salted:
-                           "3498vyregm9i314n" || 16 bytes ||
-                           "lvq34n9p30;sce;," -- both salts are built at
-                           runtime, neither is in the image
-    op 164,700.. 233,100   the context re-encrypted (the mirror of
-                           23,600..67,600, forwards this time)
-    op 233,100.. 239,294   a last 256-step loop and the 72-byte assembly
-
-So of the seven windows: 0-3 and most of 4 are the context decryption,
-which a sender does not need at all -- Region A already has the secret;
-the MAC and the wrap are windows 4-5, and both are closed here; windows
-5-6 are the context write-back and the assembly, of which only the
-ekey's constant header survives.
-
-WHAT THIS WAS CHECKED ON.  Sixteen SAP secrets and sixteen plaintexts
-that no handshake produces (all zeros, all ones, one bit set,
-structured, and random ones), pushed through the real engine with
-``opexec.handshake_with_sap``; the eight frozen ``VECTORS``; and eight
-further seeds -- 31337, 8, 424242, 65535, 111, 90210, 2718, 1618 -- run
-end to end through ``opexec.run_handshake``.  Thirty-two agreements, all
-72 bytes each.  The chosen inputs are the ones that matter: the
-generated port constant-folds loads whose value it happened to know, so
-a rule fitted to handshakes that agree by accident reproduces them and
-nothing else.  ``test_ekey_wrap``'s slow tier re-runs a sample of both.
-
-Run: uv run --with capstone python -m pytest \\
-         examples/mirror_pyfply/devirt/test_ekey_wrap.py -v
-     ... --runslow      to also re-derive the tables from a live trace
-                        and re-check chosen inputs against the engine
+The column step is MixColumns preceded by one more substitution
+(``COLUMN``) plus a per-lane constant.  Every column step XORs in all four
+lane constants, so only their XOR, ``COLUMN_XOR``, reaches the output.
+This network has its own tables and shares none with ``fply_tables``.
 """
 
 import hashlib
@@ -208,8 +79,7 @@ __all__ = [
 
 # The ekey's constant 36 bytes: "FPLY" 01 02 01, a zero, the remaining
 # length 0x3c big-endian, a 16-byte constant, then the wrapped-key
-# length 0x10.  Identical on every handshake -- test_characterization
-# proves it and every vector below repeats it.
+# length 0x10.  Identical on every handshake.
 HEADER = bytes.fromhex(
     "46504c59010201000000003c00000000" + "99ef4c8b1d98dadd67c71a3c76a68da600000010"
 )
@@ -221,7 +91,9 @@ WRAP_AT = slice(0x38, 0x48)  # the 16-byte wrapped secret
 # FPLY's usual byte mask, the one `fply_md5.SECRET_MASK` also applies
 MAC_KEY_MASK = 0x0D
 
-# of the 276-byte FairPlay context, what Region C reads at all
+# The bytes of the 276-byte FairPlay context the ekey depends on: two
+# integrity gates (any change yields an empty ekey) and the encrypted SAP
+# secret.  DEAD_CONTEXT is never read.
 LIVE_CONTEXT = (
     (0, 16, "gate"),
     (16, 48, "the encrypted SAP secret"),
@@ -238,12 +110,10 @@ def mac_key(sap36: bytes) -> bytes:
 
 
 def mac(sap36: bytes, raw16: bytes) -> bytes:
-    """``ekey[0x24:0x38]`` -- the 20-byte tag, in closed form.
+    """Return ``ekey[0x24:0x38]``, the 20-byte HMAC-SHA-1 tag.
 
-    Stock HMAC-SHA-1 over the ekey's header followed by the PLAINTEXT
-    secret, keyed by ``sap36[16:36] ^ 0x0d``.  Note what the message is
-    not: it is not the ekey as it goes on the wire, because the wrapped
-    key has not been substituted in yet.
+    Keyed by ``sap36[16:36] ^ 0x0d``, over the ekey's header followed by
+    the *plaintext* secret -- not the ekey as it goes on the wire.
     """
     if len(raw16) != 16:
         raise ValueError(f"raw16 must be 16 bytes, got {len(raw16)}")
@@ -314,10 +184,10 @@ def _mix_columns(state):
 
 
 def wrap(key16: bytes, raw16: bytes) -> bytes:
-    """``ekey[0x38:0x48]`` -- the wrapped secret, in closed form.
+    """Return ``ekey[0x38:0x48]``, the wrapped secret.
 
-    Ten rounds keyed by ``sap36[0:16]``; see the module docstring for
-    what each constant is and how it was measured.
+    Ten rounds keyed by ``sap36[0:16]``; see the module docstring for the
+    meaning of each constant.
     """
     if len(key16) != 16:
         raise ValueError(f"key16 must be 16 bytes, got {len(key16)}")
@@ -336,10 +206,7 @@ def wrap(key16: bytes, raw16: bytes) -> bytes:
 
 
 def ekey(sap36: bytes, raw16: bytes) -> bytes:
-    """The whole 72-byte ekey, from the SAP secret and the secret to wrap.
-
-    This is Region C: 239,294 interpreted ops, or the three lines below.
-    """
+    """Return the 72-byte ekey that wraps *raw16* under the SAP secret."""
     return assemble(sap36, raw16, wrap(sap36[:16], raw16))
 
 
@@ -357,11 +224,8 @@ def split(blob: bytes) -> tuple:
     return blob[:0x24], blob[MAC_AT], blob[WRAP_AT]
 
 
-# (seed, sap36, raw16, ekey) for the eight handshakes the recovery was
-# checked on.  `sap36` is `oracle.golden_vectors(...)["ctx_m3"][8:44]`,
-# i.e. Region A's output for that seed's M2; `test_ekey_wrap` re-derives
-# every one of them from the emulator in its slow tier, so this table
-# cannot drift away from the oracle without saying so.
+# (seed, sap36, raw16, ekey) known-answer vectors; `seed` only labels the
+# handshake, and `sap36` is the SAP secret derived from its M2.
 VECTORS = (
     (
         1001,

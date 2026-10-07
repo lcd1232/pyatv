@@ -1,10 +1,8 @@
-"""Apple's FPLY v3 sender handshake, in Python, with no emulator.
+"""Apple's FPLY v3 sender handshake, in pure Python.
 
-The FairPlay SAP handshake an AirPlay mirror sender runs against a
-current Apple TV -- ``M1 -> M2 -> M3 -> M4 -> ekey`` on ``/fp-setup`` --
-used to be reachable only by emulating Apple's own obfuscated ARM64 in
-Unicorn: ~32 MB of bundled blobs and seconds per handshake.  It is four
-algorithms, and they are these modules:
+The FairPlay SAP handshake an AirPlay mirror sender runs against an Apple
+TV -- ``M1 -> M2 -> M3 -> M4 -> ekey`` on ``/fp-setup`` -- is four
+algorithms:
 
 * :func:`.region_a.sap_secret` -- ``M2`` in, the 36-byte SAP secret out;
   two SAPHash calls over one 290-byte message.
@@ -16,21 +14,10 @@ algorithms, and they are these modules:
   16-byte media secret to the receiver: an HMAC-SHA-1 tag and an
   AES-128 wrap.
 
-The derivation -- the VM disassembler, the lifter, the generated ports
-each stage was read out of, and the Unicorn oracle every one of them was
-checked against -- lives under ``examples/mirror_pyfply/devirt/`` and is
-not shipped.  These modules are copies of the four it ended at plus what
-they import; the tests there are the equivalence proof, and
-``tests/protocols/airplay/mirror/test_fairplay_sap.py`` pins the answers
-here against recorded emulator vectors.
-
-``M3[0:144]``, by contrast, is not computed: it is a constant.  The
-sender's session randomness enters through ``arc4random``, which the
-recovered path pins to zero exactly as the shipped emulator slice did,
-so the 128-byte cipher block and the header in front of it are the same
-bytes in every session -- see :data:`M3_PREFIX` in
-:mod:`pyatv.protocols.airplay.mirror.fply`, which is where M3 is
-assembled.
+``M3[0:144]`` is not computed: the sender's session randomness is fixed
+at zero, so the 128-byte cipher block and the header in front of it are
+the same bytes in every session.  See :data:`M3_CIPHER_BLOCK` in
+:mod:`pyatv.protocols.airplay.mirror.fply`, where M3 is assembled.
 """
 
 from pyatv.protocols.airplay.mirror.fairplay_sap import m4_derive
@@ -59,8 +46,7 @@ def context_after_m3(sap36: bytes) -> bytes:
 
     :func:`.m4_derive.context` is the same context after M4, which is where
     it gets encrypted; this is the plaintext one, and the only thing in it
-    that varies per session is the SAP secret at ``[8:44]``.  Verified
-    byte-for-byte against the emulator's memory after ``build_m3``.
+    that varies per session is the SAP secret at ``[8:44]``.
     """
     if len(sap36) != m4_derive.SECRET_LENGTH:
         raise ValueError(f"sap36 must be {m4_derive.SECRET_LENGTH} bytes")

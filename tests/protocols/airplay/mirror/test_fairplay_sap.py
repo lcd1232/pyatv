@@ -1,15 +1,8 @@
-"""The recovered FairPlay handshake against the emulator that produced it.
+"""Golden-vector tests for :mod:`pyatv.protocols.airplay.mirror.fairplay_sap`.
 
-``fply_pure_golden.jsonl`` is 256 handshakes recorded from the Unicorn
-emulation of the reference sender's own FairPlay code, before that code was read out
-as algorithms: for each one the M2 that went in and the M3, the M4, the
-chosen raw16, the ekey and the first 44 bytes of the FairPlay context that
-came out.  pyatv no longer ships that emulator (it lives in
-``examples/mirror_pyfply/`` with the devirtualisation tooling), so these
-rows are what stands between
-:mod:`pyatv.protocols.airplay.mirror.fairplay_sap` and a silent
-regression: every byte of M3 and of the ekey has to still come out the
-same.
+``fply_pure_golden.jsonl`` holds 256 recorded FairPlay handshakes: for each,
+the M2 that went in and the M3, M4, chosen raw16, ekey and first 44 bytes of
+the FairPlay context that came out.  Every byte of M3 and the ekey must match.
 """
 
 from __future__ import annotations
@@ -84,7 +77,7 @@ def test_device_tag_varies_with_m2_and_nothing_else_in_m3_does():
 
 
 def test_the_shipped_m3_constants_are_the_recorded_ones():
-    """:data:`fply.M3_CIPHER_BLOCK` and the aux header come from the capture."""
+    """:data:`fply.M3_CIPHER_BLOCK` and the aux header match the recording."""
     m3 = bytes.fromhex(VECTORS[0]["m3"])
     assert m3[16:144] == fply.M3_CIPHER_BLOCK
     assert m3[13:16] == fply.M3_AUX_HEADER
@@ -127,15 +120,9 @@ def test_a_different_raw16_wraps_to_a_different_ekey_tail():
 def test_split_takes_every_recorded_ekey_apart_where_the_fields_are():
     """:func:`ekey_wrap.split` on all 256 recorded ekeys.
 
-    The three parts have to be the ekey again when concatenated (nothing
-    dropped, nothing reordered), they have to be exactly what
-    :data:`~ekey_wrap.MAC_AT` and :data:`~ekey_wrap.WRAP_AT` name -- those
-    slices are what a receiver indexes with, so a `split` that disagreed
-    with them would be the more dangerous half of the pair -- and the two
-    session-dependent fields have to be the ones the algorithm derives:
-    the tag is :func:`ekey_wrap.mac` of that handshake's secret, and the
-    wrapped key puts the ekey back together through
-    :func:`ekey_wrap.assemble`.
+    The parts must concatenate back to the ekey, agree with the
+    :data:`~ekey_wrap.MAC_AT` and :data:`~ekey_wrap.WRAP_AT` slices, and match
+    what :func:`ekey_wrap.mac` and :func:`ekey_wrap.assemble` derive.
     """
     for v in VECTORS:
         raw = bytes.fromhex(v["ekey"])
@@ -168,7 +155,7 @@ def test_ekey_rejects_a_wrong_length_secret():
 
 
 def test_nothing_here_needs_the_emulator():
-    """The whole point: no unicorn, no blobs."""
+    """The handshake runs without importing the unicorn emulator."""
     fairplay_sap.handshake(bytes.fromhex(VECTORS[0]["m2"]), b"\x02" * 16)
     assert "unicorn" not in sys.modules
 
@@ -176,33 +163,23 @@ def test_nothing_here_needs_the_emulator():
 class _Unavailable(importlib.abc.MetaPathFinder):
     """An import of *names*, or of anything under them, fails outright.
 
-    What an installed pyatv looks like.  ``unicorn`` is a dev dependency and
-    ``devirt`` lives in ``examples/``, which is not packaged -- but both are
-    importable in this checkout, so a shipped module that reached for one
-    would pass the suite here and raise :class:`ImportError` on a user's
-    machine.  Making them genuinely absent is the only way to see it.
+    Simulates an installed pyatv, where development-only modules are absent.
     """
 
     def __init__(self, *names):
         self.names = names
 
     def find_spec(self, fullname, path=None, target=None):
-        """Refuse *fullname* if it is one of ours; fall through if not.
-
-        Falling through is returning ``None``, which is what the finder
-        protocol asks for and what this does implicitly.
-        """
+        """Refuse *fullname* if it is one of ours; return ``None`` if not."""
         if fullname.split(".")[0] in self.names:
             raise ImportError(f"no module named {fullname!r}")
 
 
 def test_the_whole_handshake_runs_with_the_harness_unavailable():
-    """All 256, on a package imported with unicorn and devirt made absent.
+    """All 256 handshakes, with development-only modules made unimportable.
 
-    The package is dropped from ``sys.modules`` and imported again inside
-    the blocker, so a top-level import is caught as well as a deferred one
-    -- and put back afterwards, so the rest of the suite keeps the module
-    objects it already holds.
+    The package is re-imported inside the blocker so top-level imports are
+    caught too, and restored afterwards for the rest of the suite.
     """
     package = "pyatv.protocols.airplay.mirror.fairplay_sap"
     loaded = {
@@ -230,17 +207,8 @@ def test_the_whole_handshake_runs_with_the_harness_unavailable():
     assert "devirt" not in sys.modules
 
 
-# ---------------------------------------------------------------------------
-# Length guards
-#
-# Every remaining uncovered statement in the package was one of these, and
-# they are not decoration: `sap_secret` and everything downstream index into
-# fixed-size buffers, so a short input reaches a generated port and comes back
-# as `IndexError: index out of range` from the middle of recovered code.
-# `fply.parse_m2` keeps that off the wire, but these are the guards that make
-# the package safe to call directly.  A guard with the wrong comparison or a
-# copy-pasted message passes silently today; this notices.
-# ---------------------------------------------------------------------------
+# Length guards: the algorithms index fixed-size buffers, so a wrong-length
+# input must raise a clear ValueError rather than an IndexError deep inside.
 
 _GOOD = {36: bytes(36), 20: bytes(20), 16: bytes(16), 210: bytes(210), 64: bytes(64)}
 
@@ -272,13 +240,7 @@ def test_a_wrong_length_is_refused_with_its_own_message(call, wrong, want):
 
 
 def test_load_refuses_a_short_block_but_accepts_a_long_one():
-    """`load` guards with `<`, not `!=`, and that is deliberate.
-
-    Its docstring says "tiled, not padded": buffer1 is filled by repeating
-    the block, so anything at least BLOCK_SIZE long is usable and only a
-    short one is an error.  Asserting `!=` here would pin a stricter
-    contract than the function offers.
-    """
+    """`load` tiles the block, so only a block shorter than 64 bytes is an error."""
     with pytest.raises(ValueError, match="need 64 bytes"):
         saphash.load(bytes(63))
     assert len(saphash.load(bytes(64))) == saphash.BUFFER_SIZE
@@ -303,21 +265,11 @@ def test_context_after_m3_rejects_a_wrong_length_secret():
 
 
 def test_the_constants_duplicated_across_recovered_modules_still_agree():
-    """Several constants are defined in more than one recovered module.
+    """Constants defined in more than one module must keep the same value.
 
-    ``region_a`` and ``region_b`` each define ``SAP_LENGTH``;
-    ``fply_wrap_tables`` and ``m4_derive`` each define the AES ``RCON``
-    table; three modules each define the 32-bit mask.  That is not
-    sloppiness to be tidied away: these modules are generated from the
-    devirtualisation sources by ``test_fairplay_sap_sync.py``'s ``port()``,
-    and each is self-contained the way the routine it was recovered from is.
-    Editing them by hand to share a definition would fail that sync test.
-
-    So the duplication stays and this checks it stays *consistent*.  Nothing
-    else would notice one copy being changed and the other not -- the two
-    ``SAP_LENGTH``s in particular describe the same 36-byte SAP secret, and
-    a disagreement would corrupt either the tag or the ekey depending on
-    which module read its own copy.
+    ``SAP_LENGTH``, the AES ``RCON`` table and the 32-bit mask each appear in
+    several self-contained modules; a disagreement would corrupt the tag or
+    the ekey.
     """
     from pyatv.protocols.airplay.mirror.fairplay_sap import (
         fply_md5,
@@ -359,21 +311,6 @@ def test_the_constants_duplicated_across_recovered_modules_still_agree():
     ],
 )
 def test_a_wrong_length_is_refused_by_name(call, expected):
-    """Each length guard must say which argument was wrong.
-
-    Every one of these raises already ran -- checked with coverage, with this
-    test deselected -- so the ``NameError``-in-an-unevaluated-f-string failure
-    that ``test_session_error_paths`` guards against does not apply here.
-    What nothing checked was the *message*: the callers reached these guards
-    through ``pytest.raises(ValueError)`` with no ``match``, so a guard naming
-    the wrong argument would have passed.
-
-    That is the whole claim, and it is worth having: renaming ``wrapped16`` to
-    ``raw16`` in ``assemble``'s guard fails this and nothing else, which is
-    exactly the mistake a copy-pasted validator makes.
-
-    Nothing here checks the algorithms -- the 256 golden handshakes do that.
-    This is only about what a caller sees when they pass the wrong shape.
-    """
+    """Each length guard's message names the argument that was wrong."""
     with pytest.raises(ValueError, match=expected):
         call()

@@ -1,83 +1,25 @@
-"""SAPHash's fold, as the algorithm instead of as its trace.
+"""SAPHash's fold: the 16-byte delta block and the modified MD5.
 
-`fold_read` used to say this window one Python statement per executed
-instruction: 18,063 lines for one fold and 17,888 for the other, 2.8 MB
-of file for a 16-byte answer.  Straight-line output proved the recovery
-was exact; it was never the thing to ship.  This module is the same
-window ROLLED, and every constant in it was measured rather than
-guessed.
+Each 64-byte block of a SAPHash call updates the running four-word keyOut
+twice -- the order of the two differs between calls, see
+:func:`.region_a.run`:
 
-WHAT THE FOLD ACTUALLY IS.  Two pieces, run back to back:
+    keyOut[w] += delta[w]                  # four 32-bit adds
+    keyOut     = compress(keyOut, block)   # modified MD5
 
-  1. a DELTA BLOCK -- 548 byte-writes into the 16 bytes at
-     `saphash.KEYOUT_AT - 0x1b4`, which the slice hides behind about
-     17,000 named values of mixed boolean arithmetic.  548 is not a
-     round number by accident: it is 16 + 11 + 20 + 35 + 210 + 256, and
-     those are the six loops of `SAPHash.hash`'s tail in
-     airplay2-receiver's published `fairplay3.py` -- fill with 0xe1,
-     add eleven bytes of buffer3, XOR in buffer0, buffer2 and buffer1,
-     then sixteen passes of a sixteen-byte scramble.  `delta` is those
-     six loops, twenty lines, and it reproduces the block exactly.
+:func:`delta` is the tail of ``SAPHash.hash`` in airplay2-receiver's
+``fairplay3.py``: fill 16 bytes with 0xe1, add eleven bytes gathered from
+buffer3, XOR in buffer0, buffer2 and buffer1, then sixteen passes of a
+sixteen-byte scramble.  The gather table is not the published ``i0_index``
+([18, 22, 23, 0, 5, 19, 32, 31, 10, 21, 30]) and the difference is not a
+constant offset.  Word 33 is the four bytes just past the 132-byte buffer3,
+which is why :func:`delta` wants 136.
 
-  2. a MODIFIED MD5 -- `compress`, keyed by the running keyOut and fed
-     the 64-byte staging block.  This is the same compression
-     `fply_md5` already uses for the device_tag, with the same step-31
-     message shuffle in spirit but NOT with the same rule: there the
-     left index of each swap is a plain counter, here BOTH indices come
-     from the state.
-
-     And not one rule but TWO.  A handshake folds twice, and the two
-     SAPHash calls run their own copies of the code: the second walks a
-     chain of seven swaps along a path of eight state nibbles
-     (`shuffle`), the first swaps five pairs of words that ten state
-     nibbles name (`shuffle_pairs`).  Everything else about the two
-     compressions -- state, message, all sixty-four rounds -- is the
-     same, which is why one of them was mistaken for the other for as
-     long as only two handshakes were on the bench.
-
-  So one fold is
-
-      keyOut[w] += delta[w]                      # four 32-bit adds
-      keyOut     = compress(keyOut, staging)     # four more
-
-  which is `saphash`'s "three stages of plain 128-bit adds" seen
-  properly: the second and third stage are one MD5 compression, and its
-  addend looked input-dependent only because MD5's own chaining value
-  IS the keyOut it is adding to.
-
-WHAT IS MEASURED HERE.  `GATHER`, the eleven buffer3 word indices, was
-solved by intersecting the candidates over both handshakes and both
-folds -- every entry pins to exactly one word.  Entry 3 is not a gather
-at all: the slice stores 0x3d there outright, which is 0xe1 + 0x5c and
-is the same hard-coded byte the published implementation has.  The
-scramble taps and rotations, and `shuffle`, were fitted against the
-port itself and then checked on 400 randomised states.
-
-`shuffle_pairs` was measured rather than fitted.  The generated port of
-the first fold is a pure function of memory, so the state it hands the
-shuffle can be CHOSEN -- rounds 0..31 invert -- and the message it
-shuffles is left in memory at 0x6fffc378 where it can be read straight
-off.  Driving one nibble at a time says which nine of the state's
-thirty-two nibbles the shuffle reads.  Giving those nine distinct
-values, all of them inside the ten message words the padding does not
-zero, then makes the whole permutation readable at once, and it comes
-back as five disjoint transpositions.  60 random states pin the order
-they are made in, which shows only where two nibbles collide.
-
-The tenth nibble -- a's lowest, the left end of the first swap -- the
-port cannot answer for.  It is 8 on both of the handshakes the port was
-lifted from, so the lift folded that read to the literal 8, and a rule
-that hard-codes 8 reproduces those two exactly and nothing else.  That
-one was settled against six FURTHER handshakes, where it is 3, 5, 6, 7,
-8 and 15.  Both shuffles are checked on all eight by
-`test_saphash_fold`.
-
-The published `i0_index` is [18, 22, 23, 0, 5, 19, 32, 31, 10, 21, 30]
-and this one is [22, 26, 27, -, 5, 23, 33, 32, 10, 25, 31].  They are
-not the same table and the difference is not a constant offset, so the
-published one is a near miss rather than a different indexing of the
-same thing.  Note 33: buffer3 is 132 bytes in `garble`'s layout and
-word 33 is the four bytes just past it, which is why `delta` wants 136.
+:func:`compress` is MD5 with a message shuffle after round 31, and the two
+SAPHash calls of a handshake shuffle differently: the first with
+:func:`shuffle_pairs`, the second with :func:`shuffle`.  In both, each swap
+takes both of its indices from the state, unlike the device-tag MD5 in
+``fply_md5`` whose left index is a plain counter.
 """
 
 from .md5_constants import MD5_SHIFTS, MD5_T
@@ -101,7 +43,8 @@ _M32 = 0xFFFFFFFF
 
 # every byte of the delta block starts here
 FILL = 0xE1
-# ...except byte 3, which the slice stores outright.  0xe1 + 0x5c.
+# ...except byte 3, which is stored outright: 0xe1 + 0x5c, the same
+# hard-coded byte as in the published implementation.
 HARD_BYTE = 0x3D
 # the eleven buffer3 WORDS the block adds in, one per output byte; the
 # `None` is the byte that is stored rather than gathered
@@ -124,11 +67,10 @@ def _rotate32(value, count):
 def scramble(key, passes=PASSES):
     """Apply the delta block's finisher: `passes` sweeps over sixteen bytes.
 
-    Each step rewrites one byte from four -- itself and three taps back,
-    the taps taken as unsigned 32-bit subtractions before the modulo,
-    exactly as in the 210-byte scramble.  Sixteen is divisible by
-    2**32's factors, so the unsigned wrap makes no difference here and
-    the taps are plain (i - 7), (i - 37), (i - 177) modulo 16.
+    Each step rewrites one byte from itself and three earlier bytes.  The
+    taps are unsigned 32-bit subtractions as in the 210-byte scramble, but
+    since 16 divides 2**32 the wrap makes no difference and they are plain
+    (i - 7), (i - 37), (i - 177) modulo 16.
     """
     key = bytearray(key)
     for _pass in range(passes):
@@ -162,18 +104,13 @@ def delta(buffer0, buffer1, buffer2, buffer3):
 
 
 def shuffle(block, state):
-    """Apply the SECOND SAPHash call's step-31 message shuffle.
+    """Apply the second SAPHash call's step-31 message shuffle.
 
     Eight nibbles of the state -- the low two of each of A, B, C and D,
     in the order A B C D A B C D -- name eight message words, and the
     block is rotated along that path: seven swaps, each between
     consecutive names.  When the eight are distinct the net effect is
-    one 8-cycle, m'[p[k]] = m[p[k+1]], which is how it was recognised.
-
-    `fply_md5.compress` swaps `m[k]` with the k-th nibble instead, with
-    a plain counter on the left.  That rule is wrong for this window --
-    it disagrees on the first randomised state -- so the two are kept
-    apart rather than merged.
+    one 8-cycle, m'[p[k]] = m[p[k+1]].
     """
     path = [(state[k & 3] >> (4 * (k >> 2))) & 15 for k in range(8)]
     for k in range(7):
@@ -181,9 +118,9 @@ def shuffle(block, state):
         block[left], block[right] = block[right], block[left]
 
 
-# the FIRST call's shuffle swaps five pairs of message words, each end
+# The first call's shuffle swaps five pairs of message words, each end
 # named by one nibble of the state -- (word, nibble) of (a, b, c, d) as
-# round 31 left it.  Measured, in this order, on eight handshakes.
+# round 31 left it.  The order matters.
 SWAP_PAIRS = (
     ((0, 0), (1, 0)),  # a's low nibble with b's
     ((2, 0), (3, 0)),  # then c's low nibble with d's
@@ -194,19 +131,13 @@ SWAP_PAIRS = (
 
 
 def shuffle_pairs(block, state):
-    """Apply the FIRST SAPHash call's step-31 message shuffle.
+    """Apply the first SAPHash call's step-31 message shuffle.
 
-    Five swaps between message words the state names, NOT the chain
-    `shuffle` walks -- the two SAPHash calls run their own copies of the
-    code and their shuffles are different rules.  Eight of the state's
-    nibbles pair off, a against b at each of the four nibble positions,
-    and c's low nibble against d's is done second.
-
-    The order only shows when two of the ten nibbles collide -- which is
-    why it took a fit over 60 states rather than one reading -- but that
-    is not a rare accident: on 90% of states some reordering of
-    `SWAP_PAIRS` gives a different answer, so the order is as much of the
-    rule as the pairs are.
+    Five swaps between message words the state names (`SWAP_PAIRS`): a
+    against b at each of the four nibble positions, with c's low nibble
+    against d's done second.  The order only shows when two of the ten
+    nibbles collide, but that happens on most states, so it is part of
+    the rule.
     """
     for left, right in SWAP_PAIRS:
         i = (state[left[0]] >> (4 * left[1])) & 15
@@ -218,13 +149,10 @@ def compress(state, block, step31=shuffle):
     """Run one modified-MD5 compression over *state* and sixteen words.
 
     Returns the pair (the message as the shuffle left it, the four-word
-    result).  The message is returned as well because the slice keeps it in
-    memory, and a port of the fold has to leave those words behind
-    exactly as the compression did.
+    result).
 
     *step31* is the shuffle to run after round 31: `shuffle` for the
-    second SAPHash call, `shuffle_pairs` for the first.  Everything
-    else about the two is the same compression.
+    second SAPHash call, `shuffle_pairs` for the first.
     """
     a, b, c, d = state
     message = list(block)

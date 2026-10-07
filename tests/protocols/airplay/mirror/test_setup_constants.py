@@ -1,30 +1,10 @@
-"""The captured constants in the mirror SETUP bodies.
+"""Tests that pin the constant values in the mirror SETUP bodies.
 
-``session.py`` builds two SETUP plists whose values came off the wire from a
-real sender talking to a real tvOS 26 receiver -- ``latencyMin``/``Max``
-3750, ``redundantAudio`` 2, ``ct`` 8, ``audioFormat`` 0x1000000, ``et`` 32,
-and the five ``timestampInfo`` probe names.
-The receiver *interprets* every one of them, but
-:class:`~tests.protocols.airplay.mirror.fake_receiver.FakeMirrorReceiver`
-only dispatches on ``streams[0]["type"]`` and answers 200 to whatever else
-arrives, so before ``fake_receiver.check_audio_setup`` /
-``check_video_setup`` existed any of these could be changed with the whole
-suite staying green.
-
-Those checks run inside the fake on every SETUP it receives, which is what
-makes a changed constant fail the tests that already drive a session. This
-module is the guard on the guard. It pins:
-
-  * that the checks actually ran against a live session's bodies, so they
-    cannot rot into being skipped, and
-  * that they reject each individual captured constant being changed --
-    driving one real session and then mutating a copy of the body it sent,
-    one key at a time. A check that compared nothing would pass silently.
-
-The per-session values (``streamConnectionID``, ``sessionUUID``, ports,
-``deviceID``) are deliberately *not* pinned to literals anywhere: they are
-regenerated every run. They are checked for shape only, and the shape checks
-are exercised here too.
+``fake_receiver.check_audio_setup`` and ``check_video_setup`` validate every
+SETUP the fake receiver gets.  These tests make sure the checks run against a
+live session and that each checked field, changed on its own, is reported.
+Per-session values (``streamConnectionID``, ``sessionUUID``, ports,
+``deviceID``) are checked for shape only.
 """
 
 from __future__ import annotations
@@ -72,9 +52,8 @@ async def _captured_bodies(monkeypatch):
 async def test_the_checks_run_against_a_live_session(monkeypatch):
     """A real session's SETUPs reach the checks and satisfy them.
 
-    Recording the bodies is what proves the checks were reached at all: an
-    empty ``protocol_violations`` list is equally consistent with the checks
-    having been dropped from ``_dispatch_setup``.
+    The recorded bodies prove the checks ran; an empty violation list alone
+    would not.
     """
     async with driven_session(monkeypatch) as (receiver, sess):
         await stream_then_stop(receiver, sess)
@@ -84,13 +63,10 @@ async def test_the_checks_run_against_a_live_session(monkeypatch):
         assert receiver.protocol_violations == []
 
 
-#: Every captured constant of the type-96 audio SETUP, with a value that is
-#: wrong in the way a typo or a "tidied" magic number would be wrong. The
-#: comment on each is why the receiver cares; see ``fake_receiver.CAPTURED_*``
-#: for the provenance of the correct value.
+#: Every constant of the type-96 audio SETUP, paired with a slightly wrong value.
+#: The comment on each says why the receiver cares.
 AUDIO_CONSTANT_MUTATIONS = [
-    # 85 ms of jitter buffer at 44.1 kHz. Off-by-one here is exactly the kind
-    # of change nothing else would notice.
+    # 85 ms of jitter buffer at 44.1 kHz.
     (["streams", 0, "latencyMin"], 3751),
     (["streams", 0, "latencyMax"], 3751),
     # 2x redundancy; the receiver de-duplicates on this factor.
@@ -113,13 +89,12 @@ AUDIO_CONSTANT_MUTATIONS = [
 #: The per-session fields of the audio SETUP, replaced with a malformed value
 #: rather than a different one. These must never be pinned to a literal.
 AUDIO_SHAPE_MUTATIONS = [
-    # The receiver stores this in a 32-bit field and rebuilds the video
-    # key-derivation label from it, so a 63-bit value would silently
-    # mis-key the stream.
+    # The receiver stores this in a 32-bit field and derives the video key
+    # from it, so a larger value would mis-key the stream.
     (["streams", 0, "streamConnectionID"], 2**40),
     # The receiver sends audio sync packets here; port 0 is not bound.
     (["streams", 0, "controlPort"], 0),
-    # Real senders send an upper-case UUID and index the session by it.
+    # The receiver indexes the session by an upper-case UUID.
     (["sessionUUID"], "not-a-uuid"),
     (["deviceID"], "nope"),
     (["macAddress"], "nope"),
@@ -157,9 +132,8 @@ def _with(body: dict, path: list, value) -> dict:
 async def test_audio_setup_check_rejects_each_field(monkeypatch, path, bad):
     """Changing any one checked field of a real audio SETUP is reported.
 
-    The body is the one a live session actually sent, so this also pins that
-    the sender still sends every field the check looks for -- a field renamed
-    in ``session.py`` would make the unmutated body fail first.
+    The unmutated body must pass first, so a field the sender stopped sending
+    is caught too.
     """
     audio_body, _ = await _captured_bodies(monkeypatch)
 
@@ -183,8 +157,7 @@ VIDEO_TCP_MUTATIONS = [
 async def test_video_setup_check_rejects_each_field(monkeypatch):
     """Changing any one checked field of a real video SETUP is reported.
 
-    One live session for all of them: running one per parametrized field
-    would pay for a full handshake per assertion.
+    One live session is shared by all fields to avoid a handshake per field.
     """
     _, video_body = await _captured_bodies(monkeypatch)
 
@@ -198,10 +171,9 @@ async def test_video_setup_check_rejects_each_field(monkeypatch):
 
 
 async def test_video_setup_check_rejects_a_changed_timestamp_probe(monkeypatch):
-    """The five ``timestampInfo`` probe names are ordered and captured.
+    """The five ``timestampInfo`` probe names are fixed, in a fixed order.
 
-    They label the latency timestamps the receiver reports back, so a renamed
-    or reordered probe is a protocol change, not a cosmetic one.
+    They label the latency timestamps the receiver reports back.
     """
     _, video_body = await _captured_bodies(monkeypatch)
 
@@ -229,19 +201,10 @@ async def test_a_missing_captured_constant_is_reported_as_missing(monkeypatch):
 
 
 async def test_the_inlined_audio_constants_still_match_the_tested_helper(monkeypatch):
-    """`session.py` inlines what `screen_audio` already returns.
+    """The audio SETUP sent agrees with `screen_audio.audio_setup_stream_params`.
 
-    `screen_audio.audio_setup_stream_params` is the documented source of
-    the AAC-ELD stream parameters and is pinned by
-    `test_screen_audio.py::test_setup_params_match_tcp`.  `session.py`
-    does not call it -- it writes the same keys out by hand -- so the tested
-    helper and the live path are free to drift, and mutation showed they had
-    no shared guard: changing the inlined `ct` left the helper's test green.
-
-    They agree today.  This is the check that says so, against the body an
-    actual session put on the wire rather than against a re-typed copy, so it
-    fails whichever of the two moves.  `controlPort` is per-session and
-    rightly absent from a constants helper, so it is excluded.
+    `session.py` writes the same keys out by hand, so the two could drift.
+    `controlPort` is per-session and so not part of the helper.
     """
     audio_body, _ = await _captured_bodies(monkeypatch)
     sent = dict(audio_body["streams"][0])
@@ -257,16 +220,8 @@ async def test_the_inlined_audio_constants_still_match_the_tested_helper(monkeyp
 async def test_both_tcp_setups_agree_on_who_this_session_is(monkeypatch):
     """One session identity, repeated verbatim across both stream SETUPs.
 
-    In the TCP dialect ``sessionUUID``/``deviceID``/``macAddress`` go out
-    in the audio SETUP and again in the video SETUP, because the receiver ties
-    both streams back to one session by them.  Nothing checked that the second
-    copy matches the first.
-
-    Both sites read the UUID as
-    ``getattr(self, "_session_uuid", None) or str(uuid4()).upper()`` -- so if
-    ``_session_uuid`` is ever unset, each SETUP mints a *different* identity
-    and the two streams claim to belong to different sessions.  That shared
-    fallback is what this test is aimed at.
+    The receiver ties both streams to one session by ``sessionUUID``,
+    ``deviceID`` and ``macAddress``, so the two copies must match.
     """
     async with driven_session(monkeypatch) as (receiver, sess):
         await stream_then_stop(receiver, sess)
@@ -283,14 +238,8 @@ async def test_both_tcp_setups_agree_on_who_this_session_is(monkeypatch):
 async def test_a_caller_supplied_device_identity_is_what_goes_on_the_wire(monkeypatch):
     """``ctx.device_id``/``ctx.mac_address`` override the derived defaults.
 
-    Both are read as ``self._ctx.device_id or _device_id_from_uuid(...)``, so
-    the configured value is used only when it is truthy.  Every other test
-    leaves them unset and gets the derived form, which means the left-hand
-    side of both ``or``s was never exercised: dropping it entirely, and always
-    deriving, passed.
-
-    A sender that cannot present a chosen MAC is a real problem -- receivers
-    remember paired devices by it.
+    Receivers remember paired devices by these, so a configured value must
+    reach the wire.
     """
     device_id, mac_address = "AA:BB:CC:DD:EE:01", "AA:BB:CC:DD:EE:02"
     async with driven_session(
@@ -325,13 +274,8 @@ async def test_a_caller_supplied_video_encryptor_is_the_one_used(
 ):
     """``ctx.video_encryptor`` outranks the derived encryptor in every path.
 
-    ``_stream_until_done`` promises ``self._ctx.video_encryptor or encryptor``
-    and then, when a FairPlay keybuf encryptor could be built, reassigned over
-    the top of it -- so in the *shipping* configuration (raw16 present) a
-    caller-supplied encryptor was silently dropped.
-
-    Both parametrisations run because the bug lived in exactly one of them; a
-    test that happened to pick the other would have passed against it.
+    Runs with and without raw16, since a FairPlay-derived encryptor is only
+    built when raw16 is present.
     """
     encryptor = _RecordingEncryptor()
     async with driven_session(
@@ -347,25 +291,9 @@ async def test_a_caller_supplied_video_encryptor_is_the_one_used(
 async def test_one_session_presents_exactly_two_airplay_versions(monkeypatch):
     """The handshake and the session identify the sender differently.
 
-    Measured on one session of the reference sender: ``/fp-setup`` and ``/auth-setup``
-    go out as ``AirPlay/550.10`` and every RTSP request as ``AirPlay/870.14.1``, on the
-    same connection. ``session.py`` explains its half --
-
-        The Apple TV only offers screen mirroring to senders advertising a
-        recent AirPlay version. pyatv's default (AirPlay/550.10) is iOS-12
-        era
-
-    -- which makes the handshake's half the older, gated one.  Mirroring does
-    work on tvOS 26, so the receiver evidently does not gate on the handshake
-    requests; this test records that the split is real and deliberate rather
-    than pinning it as correct.  If the two are ever unified, this test is
-    where to say so.
-
-    What it does guard is ``fairplay.USER_AGENT == fply.USER_AGENT``.  Those
-    are two implementations of the same handshake step -- MFiSAP and FPLY v3
-    -- and each defines the constant itself, so bumping one and not the other
-    would have a session identify itself differently depending on which
-    handshake it ran, with nothing to catch it.
+    ``/fp-setup`` and ``/auth-setup`` use the handshake user agent and every
+    RTSP request uses ``MIRROR_USER_AGENT``, matching what real senders do.
+    The MFiSAP and FPLY handshake modules must agree on their user agent.
     """
     assert (
         fairplay.USER_AGENT == fply.USER_AGENT
@@ -394,19 +322,9 @@ async def test_one_session_presents_exactly_two_airplay_versions(monkeypatch):
 async def _sockets_at_stop(monkeypatch):
     """Run a session and return the raw sockets it held when stop() ran.
 
-    stop() drops the references as it closes them, and it is called twice --
-    once by stream_then_stop and again by driven_session on the way out --
-    so only the first call sees anything. Reading the attributes afterwards
-    finds None and proves nothing.
-
-    There is a second reason not to look later, and it is the more dangerous
-    one: by the time the session's context manager has exited, the loop and
-    the transports have reclaimed those descriptors anyway. A version of this
-    check written after the ``async with`` reports zero open sockets whether
-    the fix is present or not -- measured, by removing the fix and watching it
-    still pass. The leak is only observable at the moment stop() returns,
-    which is exactly the moment that matters to a process holding sessions
-    open.
+    The sockets are captured on the first stop() call: stop() clears the
+    references, and once the session has exited the loop has reclaimed the
+    descriptors anyway, so a later check could not see a leak.
     """
     captured = {}
 
@@ -430,11 +348,8 @@ async def _sockets_at_stop(monkeypatch):
 async def test_stop_closes_the_raw_sockets_it_opened(monkeypatch):
     """No file descriptor outlives a session.
 
-    One of the session's sockets is not a transport: ``_audio_control_sock``
-    is never wrapped at all; it is used for bare ``sendto``.
-
-    A leaked UDP descriptor per session only shows up after a long-running
-    process has mirrored a few thousand times.
+    ``_audio_control_sock`` is a bare socket rather than a transport, so it
+    must be closed explicitly.
     """
     captured = await _sockets_at_stop(monkeypatch)
 
@@ -450,26 +365,8 @@ async def test_stop_closes_the_raw_sockets_it_opened(monkeypatch):
 async def test_stop_returns_only_once_every_task_is_finished(monkeypatch):
     """``stop()`` must not return while a task it started is still running.
 
-    ``stop()`` cancels and awaits ``self._tasks``.  ``_stream_until_done``
-    adds the producers and pacers to that list, which ``run()`` and
-    ``_open_event_channel()`` have already put the screen-audio sender and
-    the event-channel responder in.  The code carries a comment saying to
-    EXTEND the list and never replace it, because assigning drops the earlier
-    two -- ``stop()`` then never awaits them and they wind down off the
-    ``_stopped`` flag instead, which the comment itself calls luck.
-
-    Checking for pending tasks *after* ``stop()`` is too weak to see that:
-    the orphans do finish, a loop turn or two later, so a check that sleeps
-    first passes either way.  The property with teeth is that they are done
-    the moment ``stop()`` returns -- that is the difference between awaited
-    and merely lucky.
-
-    What this does NOT pin is the ``await`` in ``stop()``'s cancel loop.
-    Removing it still passes, because the TEARDOWN request that follows
-    yields to the loop and lets the cancellations settle anyway.  That is a
-    real near-equivalence, not a gap this test can close: the two versions
-    differ only if TEARDOWN stops awaiting.  Removing the ``cancel()``
-    instead deadlocks ``stop()``, which CI's ``--timeout=30`` catches.
+    Tasks not awaited by ``stop()`` would still finish a loop turn or two
+    later, so the check is made at the moment ``stop()`` returns.
     """
     before = set(asyncio.all_tasks())
     outcome = {}
@@ -514,20 +411,8 @@ async def test_which_requests_still_carry_the_raop_remote_control_headers(
     """``_SUPPRESS_RAOP_HEADERS`` is applied to SETUP but not RECORD/TEARDOWN.
 
     ``RtspSession`` adds ``DACP-ID``/``Active-Remote``/``Client-Instance`` to
-    every request, and ``session.py`` suppresses them by passing each as
-    ``None``.  The constant's comment says why: *the macOS sender captured in
-    Phase 28 sends none of them on a mirroring session*.
-
-    It is passed to both SETUPs and to neither RECORD nor TEARDOWN, so
-    those two still carry all three -- narrower than the stated ground truth.
-    Mirroring works on tvOS 26 regardless, so this pins what is actually sent
-    rather than asserting what ought to be; closing the gap changes what a
-    real device receives, and that wants hardware to confirm.
-
-    ``record()`` already takes a ``headers`` argument, so it is one line.
-    ``teardown()`` hardcodes ``{"Session": ...}`` and would need an
-    ``rtsp.py`` signature change.  If either is fixed, this test is where to
-    say so.
+    every request; a mirroring sender should not send them.  RECORD and
+    TEARDOWN still do, and this pins the current behaviour.
     """
     raop_headers = {"DACP-ID", "Active-Remote", "Client-Instance"}
     seen: dict = {}
@@ -548,7 +433,7 @@ async def test_which_requests_still_carry_the_raop_remote_control_headers(
         seen.get("POST") == set()
     ), f"/fp-setup leaked RAOP headers: {seen.get('POST')}"
 
-    # Documented gap, not an endorsement: these two still send all three.
+    # Current behaviour, not a requirement: these two still send all three.
     assert seen.get("RECORD") == raop_headers, seen.get("RECORD")
     assert seen.get("TEARDOWN") == raop_headers, seen.get("TEARDOWN")
 
@@ -556,17 +441,8 @@ async def test_which_requests_still_carry_the_raop_remote_control_headers(
 async def test_the_config_frame_carries_the_sources_own_sps_and_pps(monkeypatch):
     """The plaintext avcC must describe the H.264 actually being streamed.
 
-    ``tcp_video_producer`` picks the SPS and PPS out of the source file
-    by NAL type -- ``nal_type(n) == 7`` and ``== 8`` -- and hands them to
-    ``build_avcc_config``. That record is the first thing on the data channel
-    and is what the receiver initialises its decoder from; a wrong one is a
-    black screen with a healthy-looking session, which is the failure mode
-    this project has already been bitten by.
-
-    ``build_avcc_config`` is unit-tested, but nothing checked that the
-    producer feeds it the right NALs: inverting either selector to ``!= 7``
-    picked some other NAL and no test noticed, because the fake counted the
-    bytes on the data port without keeping them.
+    The receiver initialises its decoder from this first message on the data
+    channel; a wrong SPS or PPS gives a black screen on a healthy session.
     """
     async with driven_session(monkeypatch) as (receiver, sess):
         await stream_then_stop(receiver, sess)
@@ -575,7 +451,7 @@ async def test_the_config_frame_carries_the_sources_own_sps_and_pps(monkeypatch)
 
     assert head, "nothing was retained from the data channel"
 
-    # First message: 128-byte TCP-dialect header, then the avcC record.
+    # First message: 128-byte data header, then the avcC record.
     avcc = head[128:]
     assert avcc[0] == 0x01, f"not an avcC record: {avcc[:8].hex()}"
 
@@ -596,19 +472,10 @@ async def test_the_config_frame_carries_the_sources_own_sps_and_pps(monkeypatch)
 
 
 async def test_encrypted_frames_carry_no_sps_or_pps(monkeypatch):
-    """The reference sender's video frames are [SEI][slice]; the parameter sets are not.
+    """Video frames omit SPS/PPS; those are sent once, in the avcC config.
 
-    ``tcp_video_producer`` strips NAL types 7 and 8 from every frame
-    because the reference sender transports them only once, plaintext, in the avcC
-    config.  Not stripping them sends the parameter sets inside the encrypted
-    frames too, giving the receiver's decoder a structure no real sender
-    produces, and nothing noticed.
-
-    The frames are encrypted, but AES-CTR preserves length, so the payload
-    size on the wire settles it without needing the key: a stripped access
-    unit is exactly SPS + PPS + their two length prefixes shorter than an
-    unstripped one.  Asserting both -- equal to one, different from the other
-    -- is what makes it a real check rather than an arithmetic coincidence.
+    AES-CTR preserves length, so the frame size on the wire shows whether the
+    parameter sets were stripped without needing the key.
     """
     async with driven_session(monkeypatch) as (receiver, sess):
         await stream_then_stop(receiver, sess, video_frames=3)
@@ -649,20 +516,9 @@ async def test_encrypted_frames_carry_no_sps_or_pps(monkeypatch):
 async def test_frame_timestamps_advance_at_the_frame_rate(monkeypatch, fps):
     """Consecutive frames are stamped exactly one frame interval apart.
 
-    ``tcp_video_producer`` stamps frame *n* at
-    ``ts_base + n * (1_000_000_000 // fps)`` nanoseconds, in the header's
-    little-endian u64 at offset 8.  The receiver plays back off those
-    timestamps, so an interval in the wrong unit -- microseconds, or a
-    hard-coded 30 against a different ``fps`` -- is a stream that plays at
-    the wrong speed while every byte of it decodes.
-
-    Nothing asserted them.  This reads the stamps off the wire rather than
-    timing anything, so it says nothing about how fast frames were actually
-    sent; the schedule is what the receiver acts on, and it is exactly
-    checkable.
-
-    Two rates run because the default is 30: a hard-coded 30 in place of
-    ``self._ctx.fps`` is indistinguishable at the default and obvious at 15.
+    Stamps are nanoseconds in the header's little-endian u64 at offset 8; the
+    receiver plays back off them.  A non-default rate is included so a
+    hard-coded 30 fps would be caught.
     """
     async with driven_session(monkeypatch, ctx_overrides={"fps": fps}) as (
         receiver,
@@ -692,24 +548,10 @@ async def test_frame_timestamps_advance_at_the_frame_rate(monkeypatch, fps):
 async def test_screen_audio_sends_rtp_packets_for_each_eld_frame(monkeypatch, tmp_path):
     """The screen-audio sender end to end, from an ELD file.
 
-    One assertion here earns its place, and it is not the RTP framing.
-    ``test_screen_audio`` already unit-tests the packetiser, so the
-    payload-type, sequence and timestamp checks below are caught there too --
-    measured, by running those mutations against the suite with this test
-    deselected.  They stay because they describe what the packets should look
-    like at the point they actually reach a socket, but they are not why this
-    exists.
-
-    The sync's *source port* is.  ``_stream_screen_audio``'s docstring calls
-    it the detail that decides whether audio plays at all: the packet has to
-    leave from the socket whose port was advertised as ``controlPort``, or the
-    receiver never opens its audio control channel.  Disabling that send still
-    delivers a sync here, because the code falls through to a second socket --
-    so nothing but the source port distinguishes the two, and nothing else in
-    the suite catches it.
-
-    AES-CBC encrypts whole blocks and passes the remainder through, so payload
-    length is preserved and each packet is its source frame's length.
+    The key check is the sync's source port: it must be the advertised
+    ``controlPort`` or the receiver never opens its audio control channel.
+    AES-CBC leaves a partial final block in the clear, so each packet's
+    payload is its source frame's length.
     """
     frames = [bytes([0x20 + i]) * (48 + i) for i in range(5)]
     eld = tmp_path / "frames.eld"
@@ -729,11 +571,8 @@ async def test_screen_audio_sends_rtp_packets_for_each_eld_frame(monkeypatch, tm
     assert packets, "no screen audio reached the type-96 data port"
     assert syncs, "no sync packet reached the audio control port"
 
-    # The method's docstring calls this the detail that decides whether audio
-    # plays at all: the sync has to leave from the socket whose port was
-    # advertised as controlPort, or the receiver never opens its audio control
-    # channel. Sending it from any other socket still delivers a packet here,
-    # so only the source port tells the two apart.
+    # A sync sent from any other socket would still arrive here, so only the
+    # source port tells the two apart.
     assert sync_sources[0][1] == advertised, (
         f"sync came from port {sync_sources[0][1]}, but controlPort "
         f"{advertised} was advertised"
@@ -760,20 +599,9 @@ async def test_screen_audio_sends_rtp_packets_for_each_eld_frame(monkeypatch, tm
 async def test_the_announced_timing_port_is_actually_served(monkeypatch):
     """A timing request sent to the advertised port must get an answer.
 
-    Advertising a port nothing listens on is this project's most expensive
-    historical bug: the Apple TV stalls silently at SETUP, with no error and
-    no ICMP to explain it, which is what made it take five phases to find.
-    The fix was to run a real ``TimingServer`` and announce *its* port.
-
-    Nothing checked the announcement against the server. The fake's guard
-    says "timingPort is not a bound UDP port" but only tests ``0 < port <
-    65536``, so any non-zero number passes -- including one nothing is
-    listening on, which is precisely the failing case.
-
-    This sends a real timing request to the advertised port and waits for the
-    reply, so it fails for a wrong port, a closed server, or a server that
-    stops answering. It runs against a live session because ``stop()`` closes
-    the timing server; querying afterwards raises instead of failing.
+    An Apple TV stalls silently at SETUP if the advertised timing port is not
+    served.  The query runs while the session is live because ``stop()``
+    closes the timing server.
     """
     async with driven_session(monkeypatch) as (receiver, sess):
         task = asyncio.ensure_future(sess.run())
@@ -818,16 +646,8 @@ async def test_the_announced_timing_port_is_actually_served(monkeypatch):
 async def test_the_announced_stream_id_is_the_one_the_key_is_derived_from(monkeypatch):
     """The receiver keys from the id we announce, so it must be the id we use.
 
-    ``derive_tcp_stream_key_iv`` folds the streamConnectionID into the
-    video key, and the Apple TV does the same with the value it read from the
-    SETUP.  Announce one id and key from another and every byte still flows:
-    the session looks healthy and the screen stays black, which is the failure
-    mode this project has spent the most time chasing.
-
-    The two currently come from the same attribute, so they cannot drift by
-    accident -- but nothing held them together.  Adding ``+ 1`` to the
-    announced id passes the entire suite; the same change on the key side
-    fails three tests.  That asymmetry is what this closes.
+    ``derive_tcp_stream_key_iv`` folds the streamConnectionID into the video
+    key; a mismatch gives a healthy-looking session with a black screen.
     """
     used: list = []
     real_derive = framing.derive_tcp_stream_key_iv
@@ -850,22 +670,10 @@ async def test_the_announced_stream_id_is_the_one_the_key_is_derived_from(monkey
 
 
 async def test_the_tcp_request_order_is_the_captured_one(monkeypatch):
-    """The TCP flow is a sequence, and the receiver depends on it.
+    """Requests go SETUP(audio 96), RECORD, SETUP(video 110), TEARDOWN.
 
-    ``session.py`` records it from an LLDB socket capture: SETUP(audio 96),
-    connect the eventPort the audio SETUP returned, RECORD, SETUP(video 110),
-    connect the video dataPort.  It also notes that RECORD is only answered
-    once the event channel is up -- so the order is not a stylistic choice,
-    it is what the receiver waits for.
-
-    Nothing pinned it.  The bodies of each SETUP are checked in detail, and
-    the sequence they arrive in was not checked at all, so moving RECORD
-    ahead of the audio SETUP -- or sending the video SETUP first -- would
-    have gone unnoticed here and failed on a device.
-
-    The audio SETUP is identified by its type-96 stream and the video one by
-    type 110, rather than by position, so this fails with a useful message
-    rather than an index error if the order changes.
+    The receiver only answers RECORD once the event channel from the audio
+    SETUP is up, so the order matters.
     """
     seen: list = []
     real = http.HttpConnection.send_and_receive
@@ -901,17 +709,10 @@ async def test_the_tcp_request_order_is_the_captured_one(monkeypatch):
 
 
 async def test_the_handshake_requests_carry_the_apple_headers(monkeypatch):
-    """``/fp-setup`` and ``/auth-setup`` must identify themselves as a real
-    sender does.
+    """``/fp-setup`` and ``/auth-setup`` carry ``X-Apple-HKP: 3``.
 
-    ``X-Apple-HKP: 3`` selects the HAP pairing generation, and pyatv's own
-    server side refuses anything else -- ``server_auth`` checks it explicitly
-    -- so a receiver plausibly does too.  Dropping it from either handshake
-    request passed the whole suite.
-
-    Like the captured ``/info``, these headers have no effect on anything the
-    tests observe: the fake answers regardless.  A structural assertion is the
-    only kind that can notice them going missing.
+    The header selects the HAP pairing generation; the fake receiver ignores
+    it, so only this check notices it going missing.
     """
     seen: dict = {}
     real = http.HttpConnection.send_and_receive
@@ -934,19 +735,10 @@ async def test_the_handshake_requests_carry_the_apple_headers(monkeypatch):
 async def test_the_periodic_audio_sync_goes_out_once_every_sync_every_frames(
     monkeypatch, tmp_path
 ):
-    """The sync cadence, which the five-frame test above never reaches.
+    """One opening sync, then one sync every ``AUDIO_SYNC_EVERY`` packets.
 
-    ``sync_every`` defaults to about a second of audio -- 46 frames at the
-    shipped 1024-sample size -- and the test above sends five, so the only
-    sync it sees is the opening one and the periodic branch never runs.
-    Inverting that branch makes a sync follow nearly every frame instead of
-    every 46th, roughly fortyfold the control traffic, and nothing failed.
-
-    ``AUDIO_SYNC_EVERY`` is patched for exactly this, so the cadence
-    is checked at three rather than by sending a hundred frames. The count is
-    exact rather than approximate: ``idx`` advances once per audio packet and
-    the sync fires when it divides, so a run that emitted *n* packets must
-    show ``n // 3`` periodic syncs, on top of the opening one.
+    The interval is patched down to three so a few frames exercise the
+    periodic branch: *n* packets must give ``n // 3`` periodic syncs.
     """
     frames = [bytes([0x20 + i]) * (48 + i) for i in range(5)]
     eld = tmp_path / "frames.eld"
@@ -978,17 +770,10 @@ async def test_the_periodic_audio_sync_goes_out_once_every_sync_every_frames(
 async def test_screen_audio_stays_silent_when_half_its_key_is_missing(
     monkeypatch, tmp_path
 ):
-    """Both halves, or nothing. Not either half.
+    """Without pair32 the audio stream cannot be keyed, so nothing is sent.
 
-    The audio key is ``sha512(raw16 || pair32)[:16]`` and the guard is
-    ``len(raw16) == 16 and pair32``. Written ``or`` it accepts a raw16
-    with no pair32 and hashes ``raw16 + b""``, which is a perfectly
-    well-formed 16-byte key -- long enough to clear the length check below
-    it, and wrong. The receiver would decrypt noise and play it.
-
-    Nothing caught that because every test that sends audio has both halves.
-    This one withholds the pair32 and asks for silence: the sender is
-    supposed to notice it cannot key the stream and send nothing at all.
+    The audio key is ``sha512(raw16 || pair32)[:16]``; hashing raw16 alone
+    would still give a well-formed but wrong 16-byte key.
     """
     frames = [bytes([0x40 + i]) * (32 + i) for i in range(3)]
     eld = tmp_path / "half.eld"

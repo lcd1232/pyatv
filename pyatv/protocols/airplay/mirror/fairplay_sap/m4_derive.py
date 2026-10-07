@@ -1,86 +1,22 @@
-"""The M4 call's derive engine, as the algorithm instead of as its trace.
+"""Derive the 276-byte FairPlay context that the M4 step leaves behind.
 
-`sap_image.M4_DERIVE` says this engine one Python statement per executed
-instruction: 86,021 ops become 53,728 statements and 2.6 MB of generated
-source, half a minute to build, for a 276-byte answer.  Read instead of
-compressed it is this file, and what it turns out to be is short enough
-to state in one line:
+    context = AES-128-CBC(KEY, IV, plaintext[0:256]) || plaintext[256:276]
 
-    cph = AES-128-CBC(TEMPLATE with the secret spliced in), flag byte set
+where ``plaintext`` is ``TEMPLATE`` with the 36-byte SAP secret at offset
+8, and byte 256 of the unencrypted tail is then set to ``FLAG``.  The
+cipher is textbook AES-128 (FIPS-197 S-box, key schedule and MixColumns)
+under a fixed key and IV.
 
-That is the whole of it.  A textbook AES-128 -- the FIPS-197 S-box, the
-FIPS-197 key schedule, the FIPS-197 MixColumns -- under a hard-coded
-16-byte key, in CBC over the 256-byte body of the FairPlay context, with
-the 36-byte SAP secret sitting at offset 8 of the plaintext.  The last
-20 bytes are not encrypted; one byte of them is set to 1.
+Apple ships it as a white-box: masked substitution tables, column tables
+with constant offsets, and whitening constants before and after the
+cipher.  Folding every mask into the adjacent round key leaves a plain
+AES-128 key schedule expanding from ``KEY``, and the remaining whitening
+reduces to the CBC IV, ``IV``.
 
-HOW IT WAS READ.  `spn.recover_program` already knows how to read an
-AES-shaped network off a trace -- it is what recovered the device_tag's
-network in `spn.py` -- and the derive engine is the same shape, so it
-reads straight out with `buffer` pointed at the staged context:
-
-    8,225 stores    5,089 plain, 2,560 substitutions, 576 column steps
-
-2,560 = 16 blocks x 10 rounds x 16 bytes and 576 = 16 x 9 x 4, which is
-sixteen ten-round encryptions before anything else is looked at.  The
-plain stores are the four things around them: an initial XOR of a 16-byte
-constant over all 256 bytes, the CBC chaining (`ctx[16k+j] ^= ctx[16k-16+j]`,
-visible as a load of the previous block against a load of this one), the
-round keys, and a final XOR of a second 16-byte constant.
-
-WHY THERE IS NO PLAINTEXT WHITENING IN THIS FILE.  The engine really does
-XOR those two constants, and the round keys it applies really are not an
-AES key schedule -- as the slice has them,
-
-    F = d0d0d0d0 79797979 bfbfbfbf 67676767   before
-    G = afafafaf eeeeeeee a1a1a1a1 3e3e3e3e   after
-
-with sixteen more masks inside: each round's four substitution tables are
-`S(x ^ d)` for four different d, the last round's sixteen are
-`S(x ^ d) ^ e`, and the four column tables carry an offset that XORs to
-0x4a4a4a4a.  Folding every one of those into the round keys where it
-belongs -- an input mask into the key before it, an output mask into the
-key after, MixColumns being linear with coefficient sum 1 so a constant
-passes through it unchanged -- leaves eleven 16-byte round keys, and
-words 8..39 of THOSE are a plain AES-128 expansion with the plain Rcon.
-Inverting the expansion back to words 0..3 gives `KEY`, and the two
-places the recovered keys then disagree with the schedule are exactly the
-two a whitening constant can hide in: round key 0, which XORs where the
-plaintext does, and round key 10, which XORs where the output does.  Both
-differences come out equal to the whitening:
-
-    RK[0]  ^ schedule[0]  = 7f7f7f7f 97979797 1e1e1e1e 59595959
-    RK[10] ^ schedule[10] = G exactly, and F ^ that difference ^ G = 0
-
-so F and G cancel and the IV is the last thing left, `IV`.  Nothing here
-is fitted: every constant is a measured one folded by an identity.
-
-THE TABLES ARE APPLE'S, THE CIPHER IS NOT APPLE'S.  52 substitution
-tables of 256 bytes and 4 column tables of 1,024 sit in the slice's
-masked rodata at 0x3352f908..0x33533d08.  Reduced by the same
-`T(x) = R(x ^ d) ^ e` relation `extract_tables` uses on VM-17's networks
-they collapse to TWO classes, one for rounds 0..8 and one for round 9,
-and the round-9 class is `AES_SBOX[x ^ 0xf2] ^ 0x29`.  The other class is
-not the S-box on its own; composed with the byte the column table looks
-up it is -- `column(class0(x)) = AES_SBOX[x ^ 0x7d] ^ 0x35`, and the
-column table minus its offset is `(2s, s, s, 3s)`, MixColumns by the
-book, with lanes 1..3 the byte rotations of lane 0.  So the whitebox
-splits its S-box across the substitution and the column table and the
-join is textbook AES.
-
-    17,408 bytes of Apple's tables  ->  the FIPS-197 S-box
-    2.6 MB of generated Python      ->  this file, 10 KB
-
-WHAT DEPENDS ON WHAT.  `TEMPLATE` is the 276-byte context as it stands
-when the derive engine opens, with the secret's 36 bytes zeroed.  It is
-the same for every handshake -- `test_m4_derive` checks that against the
-emulator on eight of them -- which is why this map is a function of the
-secret alone, the thing `boundary_image`'s docstring records from the
-other side.  The dependency pattern it predicted falls straight out of
-CBC: `sap36[0:8]` lands in block 0, `[8:24]` in block 1, `[24:36]` in
-block 2, and the chaining carries each into everything after.
-
-Run: uv run --with capstone python -m devirt.m4_derive
+``TEMPLATE`` is the same for every handshake, so the context is a function
+of the SAP secret alone.  Through CBC, ``sap36[0:8]`` lands in block 0,
+``[8:24]`` in block 1 and ``[24:36]`` in block 2, and each block chains
+into all that follow.
 """
 
 __all__ = [
@@ -102,15 +38,15 @@ __all__ = [
     "SHIFT_ROWS",
 ]
 
-# the AES-128 key the slice's round keys expand from, and the CBC IV --
-# both recovered by folding the whitebox's masks into the round keys
+# the AES-128 key and CBC IV that the white-box's masked round keys and
+# whitening constants reduce to
 KEY = bytes.fromhex("f83eb39446ec36c7b5e49af7676fac4d")
 IV = bytes.fromhex("486474c19f83dbff8c53e93038fc4e7a")
 
 # The 276-byte plaintext, with the secret's slot zeroed.  Sparse: an
-# eight-byte header, the secret, a 36-byte run of the 0x0d mask this
-# slice XORs over secrets everywhere, a four-byte version word at 124,
-# and the 20-byte tail the cipher does not touch.
+# eight-byte header, the secret, a 36-byte run of FPLY's 0x0d mask, a
+# four-byte version word at 124, and the 20-byte tail the cipher does not
+# touch.
 TEMPLATE = bytes.fromhex(
     "0005000000000000000000000000000000000000000000000000000000000000"
     "0000000000000000000000000000000000000000000000000000000000000000"
@@ -124,9 +60,9 @@ TEMPLATE = bytes.fromhex(
 )
 
 CONTEXT_LENGTH = 0x114  # 276
-SECRET_AT, SECRET_LENGTH = 8, 36  # where the entry preamble stages it
+SECRET_AT, SECRET_LENGTH = 8, 36  # where the SAP secret sits in the plaintext
 BODY = 256  # how much of the context is encrypted
-# the one byte of the tail the engine changes: 0 going in, 1 coming out
+# the one byte of the unencrypted tail that changes: 0 going in, 1 coming out
 FLAG_AT, FLAG = 256, 1
 
 # FIPS-197, verbatim
@@ -202,11 +138,7 @@ def cbc_encrypt(plaintext, key=KEY, iv=IV):
 
 
 def context(sap36, template=TEMPLATE):
-    """Return the 276-byte FairPlay context the M4 call derives from *sap36*.
-
-    What `sap_image.context` reads out of the memory the generated port
-    leaves behind, and what `boundary_image.build` needs.
-    """
+    """Return the 276-byte FairPlay context the M4 step derives from *sap36*."""
     if len(sap36) != SECRET_LENGTH:
         raise ValueError(f"sap36 is {len(sap36)} bytes, not {SECRET_LENGTH}")
     plain = bytearray(template)

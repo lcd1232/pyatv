@@ -1,4 +1,4 @@
-"""Tests for the TCP-dialect data-channel framing."""
+"""Tests for the mirror video data-channel framing."""
 
 import asyncio
 import logging
@@ -52,8 +52,7 @@ def test_geometry_lands_at_offset_40():
 
 
 def test_derive_stream_key_matches_tcp_ground_truth():
-    # Captured live from the reference sender's DeriveKeyAndIV (2026-08-24): given these
-    # raw16/pair32/streamConnectionID, its AES key/iv were exactly these.
+    # Known-good key/iv for these raw16/pair32/streamConnectionID inputs.
     from pyatv.protocols.airplay.mirror.framing import (
         derive_tcp_stream_key_iv,
     )
@@ -93,14 +92,8 @@ def test_group_access_units_without_a_trailing_group():
 def test_group_access_units_does_not_split_on_an_sei_nal():
     """SEI (type 6) is not a coded slice, so it must not close an access unit.
 
-    A real stream carries SEI immediately before nearly every IDR, and the SEI
-    describes the picture that follows it. Counting type 6 as VCL would emit it
-    as an access unit of its own and strip it from the frame it belongs to.
-
-    The trailing-SEI case above cannot catch that: an SEI left pending at end
-    of stream is flushed as its own unit whether or not it counts as VCL, so
-    both readings produce the same grouping there. Putting a slice *after* the
-    SEI is what separates them.
+    An SEI describes the picture that follows it. The slice after the SEI is
+    what makes this distinct from the trailing-SEI case above.
     """
     sei, idr = b"\x06\xdd", b"\x65\xcc"
 
@@ -112,11 +105,8 @@ def test_group_access_units_does_not_split_on_an_sei_nal():
 def test_avcc_config_follows_the_decoder_configuration_record_layout():
     """avcC must lift profile/compat/level from bytes 1..3 of the SPS.
 
-    The receiver configures its H.264 decoder from this record before the
-    first frame arrives, so each of the three bytes has to come from its own
-    SPS offset: profile_idc, then the constraint-flag byte, then level_idc.
-    They are asserted as the values a real High@4.0 SPS carries, so lifting
-    the wrong offset advertises a profile the stream is not encoded in.
+    The receiver configures its decoder from this record. The layout is
+    asserted field by field rather than against a captured blob.
     """
     # An H.264 High profile, level 4.0 SPS: NAL header, then 0x64 0x00 0x28.
     sps = bytes([0x67, 0x64, 0x00, 0x28, 0xAC, 0xD9, 0x40])

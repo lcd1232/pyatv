@@ -1,16 +1,13 @@
-"""FPLY v3 handshake — AirPlay FPS v2 mirror sender authentication.
+"""FPLY v3 handshake for AirPlay screen mirroring.
 
-Implements the FairPlay handshake (M1 → server, M2 ← server, M3 → server,
-M4 ← server, then the wrapped media key) that AirPlay mirror senders use to
-authenticate with current Apple TVs (tvOS 14+).
+Implements the FairPlay handshake a mirror sender runs against current Apple
+TVs: M1 is POSTed to ``/fp-setup``, the receiver answers with M2, M3 is POSTed
+back and answered with M4, after which the sender wraps its media key into an
+``ekey``.
 
-Wire format: spec §1–§6 in the accompanying spec doc.
-
-The cryptography behind M3 and the ekey is Apple's, and it is implemented in
-:mod:`pyatv.protocols.airplay.mirror.fairplay_sap` — recovered as readable
-Python (see that package's docstring), so nothing here emulates ARM64 or
-loads a vendor blob.  This module is the wire format and the state machine
-around it.
+This module holds the wire format and the state machine.  The cryptography
+behind M3 and the ekey lives in
+:mod:`pyatv.protocols.airplay.mirror.fairplay_sap`.
 """
 
 from __future__ import annotations
@@ -35,30 +32,23 @@ _LOGGER = logging.getLogger(__name__)
 _FPLY_MAGIC = b"FPLY"
 _FPLY_VERSION = 0x03
 
-# M1 message type; M3 uses 0x03
 _MSGTYPE_M1 = 0x01
 _MSGTYPE_M3 = 0x03
 
-# M1[12]: device sub-type, hard-coded literal 2 for the reference sender (spec §1)
+# M1[12]: device sub-type
 _M1_DEVICE_SUBTYPE = 0x02
 
-# M3 payload length (bytes 16..143 = 128 bytes) encoded in M3[8..11] BE
-_M3_PAYLOAD_LEN_FIELD = 0x98  # 152 decimal
+# M3[8:12], big-endian: body length after the 12-byte header (152 bytes)
+_M3_PAYLOAD_LEN_FIELD = 0x98
 
-# M3[0:144] is a CONSTANT, and that is not a simplification.
+# M3[0:144] is constant on purpose.  The 128 bytes at M3[16:144] are the
+# sender's half of the FairPlay session; the only randomness that would reach
+# them is the sender's RNG, and this block is what a sender whose RNG returns
+# zero produces.  The receiver accepts it.  Real senders send a different
+# block here (see test_fply_groundtruth.py) but the same aux header.
 #
-# The 128 bytes at M3[16:144] are the sender's half of the FairPlay session,
-# and the only session randomness that reaches them comes from ``arc4random``.
-# The emulator this module used to run pinned that to zero (deterministic
-# session), the Apple TV accepted the resulting M3s, and every handshake
-# therefore produced the same 144 bytes: header, mode echo, the three aux
-# bytes ``8f 1a 9c``, and this block.  ``M3_AUX_HEADER`` and the mode echo
-# are the same in the live captures of the reference sender in
-# ``tests/protocols/airplay/mirror/test_fply_groundtruth.py``; that session's
-# cipher block differs, because the reference sender's arc4random was real.
-#
-# What DOES vary per session is the 20-byte device tag at M3[144:164], which
-# is a function of M2 through the SAP secret — see :mod:`.fairplay_sap`.
+# The part that varies per session is the 20-byte device tag at M3[144:164],
+# a function of M2 through the SAP secret (see :mod:`.fairplay_sap`).
 M3_AUX_HEADER = bytes.fromhex("8f1a9c")
 M3_CIPHER_BLOCK = bytes.fromhex(
     "eb7e9ea373b1c4479177bcf09470646c08a54c58c818fcf348ee4ff805bf751e"
@@ -68,43 +58,36 @@ M3_CIPHER_BLOCK = bytes.fromhex(
 )
 
 # ---------------------------------------------------------------------------
-# M1 construction (spec §1)
+# M1 construction
 # ---------------------------------------------------------------------------
 
 
 def build_m1(mode_byte: int = 0) -> bytes:
     """Return the 16-byte M1 message for mode *mode_byte* (0–3).
 
-    The byte layout is fully deterministic; see spec §1 for the field table.
-    Test vector::
+    The layout is fixed apart from the mode byte.  Test vector::
 
         build_m1(0) == bytes.fromhex("46504c590301010000000004020000bb")
     """
     mode_byte &= 0x03
     msg = bytearray(16)
-    # Bytes 0–3: "FPLY" magic
     msg[0:4] = _FPLY_MAGIC
-    # Byte 4: FPLY version 3
     msg[4] = _FPLY_VERSION
-    # Bytes 5–7: fixed (spec §1)
+    # Bytes 5-7: 01, message type, 00
     msg[5] = 0x01
     msg[6] = _MSGTYPE_M1
     msg[7] = 0x00
-    # Bytes 8–11: hard-coded 0x00000004 big-endian (spec §1)
+    # Bytes 8-11: body length, big-endian
     struct.pack_into(">I", msg, 8, 0x00000004)
-    # Byte 12: device sub-type literal (spec §1)
     msg[12] = _M1_DEVICE_SUBTYPE
-    # Byte 13: zero
     msg[13] = 0x00
-    # Byte 14: mode selector (hwinfo[0x7e] & 3 — spec §1; caller supplies)
     msg[14] = mode_byte
-    # Byte 15: hard-coded 0xBB (spec §1)
     msg[15] = 0xBB
     return bytes(msg)
 
 
 # ---------------------------------------------------------------------------
-# M2 parsing (spec §2)
+# M2 parsing
 # ---------------------------------------------------------------------------
 
 
@@ -112,8 +95,7 @@ def build_m1(mode_byte: int = 0) -> bytes:
 class M2Parsed:
     """Parsed M2 message from the server.
 
-    M2 wire layout (142 bytes, empirically confirmed against captured handshake
-    /tmp/airplay_capture/M2.bin):
+    M2 wire layout (142 bytes):
 
       M2[0:4]    = b"FPLY" magic
       M2[4]      = version (0x03)
@@ -139,7 +121,6 @@ def parse_m2(m2: bytes) -> M2Parsed:
         raise ValueError(f"M2 too short: {len(m2)} bytes (need >= 16)")
     if m2[0:4] != _FPLY_MAGIC:
         raise ValueError(f"M2 magic mismatch: got {m2[0:4].hex()!r}, expected 'FPLY'")
-    # Byte 4 should be version 3 (spec §2)
     if m2[4] != _FPLY_VERSION:
         _LOGGER.warning(
             "M2 version byte 0x%02x != expected 0x%02x; continuing",
@@ -149,11 +130,7 @@ def parse_m2(m2: bytes) -> M2Parsed:
     if len(m2) < 142:
         raise ValueError(f"M2 truncated: {len(m2)} bytes (expected 142)")
     mode = m2[13] & 0x03
-    # Empirical: the 128-byte cipher input is M2[14:142], i.e. immediately
-    # after the 2-byte mode header (subtype + mode).  Earlier comments
-    # claimed M2[12:140]; that included the 2 mode bytes in the cipher feed
-    # and would shift the entire input by 2 bytes.  The captured M3 only
-    # decodes correctly when the cipher consumes M2[14:142].
+    # The cipher input starts after the subtype and mode bytes.
     payload = bytes(m2[14:142])
     return M2Parsed(mode=mode, payload=payload, raw=bytes(m2))
 
@@ -165,36 +142,7 @@ def _rotl32(value: int, amount: int) -> int:
 
 
 # ---------------------------------------------------------------------------
-# m2_stepper — VERIFIED clean-room port (Phase 14h)
-# ---------------------------------------------------------------------------
-#
-# Closed-form port of the reference sender's `_call_0x3351c59c` (the 13 KB cipher core
-# function on the Mac binary). Verified empirically against 5 distinct (IV,
-# message, output) triples captured from the reference sender at runtime via Frida — all
-# 5 reproduce byte-perfectly.
-#
-# Algorithm:
-#   1. Run textbook MD5 rounds 1+2 (steps 0..31) with the supplied 16-byte IV
-#      and 64-byte message buffer M[0..15].
-#   2. Apply 5 sequential swap operations to M[]:
-#        swap(M[A & 0xf],         M[B & 0xf])
-#        swap(M[C & 0xf],         M[D & 0xf])
-#        swap(M[(B >> 4) & 0xf],  M[(A >> 4) & 0xf])
-#        swap(M[(A >> 8) & 0xf],  M[(B >> 8) & 0xf])
-#        swap(M[(B >> 12) & 0xf], M[(A >> 12) & 0xf])
-#      where (A, B, C, D) is the MD5 state at the start of step 32.
-#   3. Run textbook MD5 rounds 3+4 (steps 32..63) on the shuffled M[].
-#   4. Final-add: output_state = original_IV + working_state (textbook MD5).
-#
-# This is the cipher's INNER PRIMITIVE. Each FPS#2 (M2 → M3) cipher step
-# invokes m2_stepper roughly 4–5 times with chained or independent IVs
-# coming from the OUTER pipeline (state_helper_94fc0 / aes_helper_a /
-# `_call_0x334f68b4`). The outer pipeline still needs to be characterized
-# for a full M2 → M3 port.
-#
-# The hardcoded IV for the FIRST stepper invocation per fps#2 is observed
-# to be `dcdcf3b9 0b74dcfb 867ff760 16729051` (LE u32) — fixed across
-# sessions, but subsequent stepper calls use session-specific chained IVs.
+# MD5 variant with a message shuffle
 # ---------------------------------------------------------------------------
 
 # Textbook MD5 K constants (per RFC 1321, floor(2^32 * |sin(i+1)|))
@@ -351,17 +299,19 @@ def _md5_I(x: int, y: int, z: int) -> int:  # pylint: disable=invalid-name
 def m2_stepper_compress(  # pylint: disable=too-many-locals
     iv: bytes, message: bytes
 ) -> bytes:
-    """Run the verified clean-room port of the reference sender's m2_stepper cipher.
+    """Run one MD5 compression whose message words are shuffled half-way.
+
+    Rounds 1 and 2 (steps 0-31) are textbook MD5.  Before round 3, five
+    message words are swapped, at indices taken from the state (A, B, C, D)
+    at that point; rounds 3 and 4 then run on the shuffled message, followed
+    by the usual final add of *iv*.
 
     Args:
-        iv: 16 bytes — the cipher's input state, parsed as 4 little-endian uint32s.
-        message: 64 bytes — the message buffer, parsed as 16 little-endian uint32s.
+        iv: 16 bytes, the input state as 4 little-endian uint32s.
+        message: 64 bytes, the message as 16 little-endian uint32s.
 
     Returns:
-        16 bytes — the output state (textbook MD5 final-add applied).
-
-    Verified against 5 distinct captured (iv, message, output) triples from
-    the reference sender at runtime — all reproduce byte-perfectly.
+        16 bytes, the output state.
     """
     if len(iv) != 16:
         raise ValueError(f"iv must be 16 bytes, got {len(iv)}")
@@ -378,7 +328,7 @@ def m2_stepper_compress(  # pylint: disable=too-many-locals
     K = _MD5_K_TEXTBOOK
     S = _MD5_S_TEXTBOOK
 
-    # Phase 1: textbook MD5 rounds 1 (F) + 2 (G), steps 0..31
+    # Textbook MD5 rounds 1 (F) and 2 (G), steps 0..31
     for i in range(32):
         if i < 16:
             f, g = _md5_F(B, C, D), i
@@ -387,7 +337,7 @@ def m2_stepper_compress(  # pylint: disable=too-many-locals
         T = (A + f + M[g] + K[i]) & M32
         A, B, C, D = D, (B + _rotl32(T, S[i])) & M32, B, C
 
-    # Phase 2: state-driven 5-swap permutation on M[]
+    # State-driven 5-swap permutation on M[]
     swaps = (
         (A & 0xF, B & 0xF),
         (C & 0xF, D & 0xF),
@@ -398,7 +348,7 @@ def m2_stepper_compress(  # pylint: disable=too-many-locals
     for ia, ib in swaps:
         M[ia], M[ib] = M[ib], M[ia]
 
-    # Phase 3: textbook MD5 rounds 3 (H) + 4 (I), steps 32..63 on shuffled M[]
+    # Textbook MD5 rounds 3 (H) and 4 (I), steps 32..63, on the shuffled M[]
     for i in range(32, 64):
         if i < 48:
             f, g = _md5_H(B, C, D), (3 * i + 5) % 16
@@ -407,96 +357,25 @@ def m2_stepper_compress(  # pylint: disable=too-many-locals
         T = (A + f + M[g] + K[i]) & M32
         A, B, C, D = D, (B + _rotl32(T, S[i])) & M32, B, C
 
-    # Phase 4: textbook MD5 final-add
+    # Textbook MD5 final add
     return struct.pack(
         "<4I", (A0 + A) & M32, (B0 + B) & M32, (C0 + C) & M32, (D0 + D) & M32
     )
 
 
-# m2_stepper / MD5 compression primitive (Phase 14 re-classification):
-#
-# The reference sender's function at 0x180277fd0 implements an MD5-style compression:
-# reads 16 little-endian uint32 words via *(param_1+4), uses 4 state words
-# from *(param_1+8), runs 64 mixing rounds over four "round families" with
-# rotation amounts 7/12/17/22, 5/9/14/20, 4/11/16/23, 6/10/15/21 (textbook
-# MD5 schedule).  Round constants K[0]=0xd76aa478 and K[1]=0xe8c7b756 were
-# verified by simplifying the obfuscated arithmetic identity
-# `(x + (x&K)*-2 + K) ≡ x XOR K` and `2*(x&K) + (x^K) ≡ x + K`.
-#
-# **Structural correction (Phase 14)**: prior phases (8-13) treated this
-# function as the "M2 stepper" — a one-shot pre-cipher mutation of the M2
-# payload.  Re-tracing the call graph shows it is invoked from inside the
-# cipher core via ``state_helper_94fc0`` and ``aes_helper_a`` as a generic
-# inner primitive (likely for key-schedule or per-round constant
-# generation).  The setup pattern at the call sites is uniform:
-#
-#   ctx[0x1c] = data_buf + 0x18         # m2_stepper input pointer
-#   ctx[0x20] = data_buf                 # m2_stepper state-buffer pointer
-#   FUN_1801b9840(ctx)                   # init/absorb 16 bytes
-#   FUN_180277fd0(ctx)                   # compress
-#
-# Both findings still hold, and together they are why
-# :func:`m2_stepper_compress` above takes an *iv* rather than a fixed one:
-# it is an inner primitive fed chained per-call state, and nothing
-# pre-mutates M2 — the cipher reads M2[14:142] verbatim.
-#
-# What Phase 14 could not say was where the compression output is consumed,
-# and it parked two speculative primitives here against the day that was
-# answered: a second, standalone MD5 compression, and a partly decoded
-# interpreter for the STEPPER2 bytecode VM.  The question was settled a
-# different way.  The M2 → M3 cipher is not reassembled from this primitive
-# at all; it is devirtualized in full under
-# :mod:`~pyatv.protocols.airplay.mirror.fairplay_sap`, which is what a
-# handshake runs.  That left both parked primitives unreachable, and they
-# have been removed — see git history for the STEPPER2 VM tables and the
-# opcode-dispatch notes.  A third artefact of the same phase outlived that
-# sweep: a `_FIRST_STEPPER_IV` constant holding the observed first-call IV,
-# read by nothing and duplicating the value written in prose above.  It has
-# gone the same way, and the prose is where that IV is recorded.
-#
-# ``m2_stepper`` itself is kept above because its port is verified
-# byte-for-byte against captured triples.
-
-
 def m2_stepper2_compress(iv: bytes, message: bytes) -> bytes:
-    """STEPPER2 compression — pure-Python implementation.
+    """Run the SAPHash block compression over *message*.
 
-    Runs ``fairplay_sap.region_a.hash_block``: SAPHash as recovered from the
-    reference sender's binary by devirtualisation, which is this project's own code
-    under its own licence.  ``test_m2_stepper2_compress_validated_block1_macp1``
-    pins the output against a captured vector.
+    Delegates to :func:`.fairplay_sap.region_a.hash_block`.
 
-    Verified against the real reference sender binary's STEPPER2 (via the Unicorn
-    emulator with deterministic / non-session-aligned VM addresses): the
-    SAPHash algorithm produces the same 16-byte output bit-for-bit.
-
-    Note on session-determinism: real binary's STEPPER2 mixes session-
-    specific VM addresses into its computation, producing different bytes
-    per session. SAPHash (the protocol-correct algorithm) is deterministic
-    in (iv, message) — this is what AirPlay 2 receivers expect. So
-    pyatv's M3 will be byte-different from real binary's, but is
-    cryptographically correct per the FairPlay protocol.
-
-    Wire format conversion: SAPHash internally treats input/output as
-    big-endian per u32, while our (iv, message) parameters are
-    little-endian (per the trace's data layout). We swap bytes per u32
-    on input and output to match.
-
-    Inputs/outputs:
-    - iv: 16-byte chaining variable (state_p8 lane). Length-checked and
-      otherwise unused: the compression is over ``message`` alone, and in
-      every call pyatv makes ``message[0:16] == iv`` anyway. The parameter
-      stays because it is the shape callers already pass.
-    - message: 64 bytes (state_p8 || extras). For typical use,
-      message[0:16] == iv.
-    - returns: 16 bytes new state_p8.
+    *iv* is the 16-byte chaining value; it is only length-checked, because
+    the compression reads *message* alone and callers always pass
+    ``message[0:16] == iv``.  *message* is 64 bytes.  Returns 16 bytes.
     """
     if len(iv) != 16:
         raise ValueError(f"iv must be 16 bytes, got {len(iv)}")
     if len(message) != 64:
         raise ValueError(f"message must be 64 bytes, got {len(message)}")
-    # Lazy import: fairplay_sap pulls in the recovered constant tables, and
-    # nothing that never calls this function needs to pay for them.
     # pylint: disable=import-outside-toplevel
     from .fairplay_sap import region_a
 
@@ -504,7 +383,7 @@ def m2_stepper2_compress(iv: bytes, message: bytes) -> bytes:
 
 
 # ---------------------------------------------------------------------------
-# M3 construction (spec §4)
+# M3 construction
 # ---------------------------------------------------------------------------
 
 
@@ -516,7 +395,7 @@ def build_m3(
 ) -> bytes:
     """Assemble the 164-byte M3 message.
 
-    M3 layout (confirmed against live captures):
+    M3 layout:
 
       M3[0:4]      = b"FPLY"
       M3[4]        = 0x03 (version)
@@ -544,29 +423,21 @@ def build_m3(
     mode &= 0x03
 
     msg = bytearray(164)
-    # Header bytes 0–3: "FPLY"
     msg[0:4] = _FPLY_MAGIC
-    # Byte 4: version
     msg[4] = _FPLY_VERSION
-    # Bytes 5–7: fixed (spec §4.1)
     msg[5] = 0x01
     msg[6] = _MSGTYPE_M3
     msg[7] = 0x00
-    # Bytes 8–11: payload length 0x98 = 152 (spec §4.1)
     struct.pack_into(">I", msg, 8, _M3_PAYLOAD_LEN_FIELD)
-    # Byte 12: mode echo
     msg[12] = mode
-    # Bytes 13–15: 3 aux header bytes
     msg[13:16] = aux_header
-    # Bytes 16–143: the 128-byte session block (spec §4.2)
     msg[16:144] = cipher_payload
-    # Bytes 144–163: 20-byte device tag (spec §4.3)
     msg[144:164] = device_tag
     return bytes(msg)
 
 
 # ---------------------------------------------------------------------------
-# Stream key derivation (spec §5)
+# Legacy stream key derivation
 # ---------------------------------------------------------------------------
 
 
@@ -576,35 +447,16 @@ def derive_stream_key(
     label: bytes,
     stream_id: int,
 ) -> bytes:
-    """Derive a 16-byte stream key or IV via SHA-512 KDF (spec §5.2).
+    """Derive a 16-byte value as SHA-512 over M3 material, truncated.
 
-    *round0_block* — 16-byte session cipher prefix key (spec §5.2 candidate A:
-        first 16 bytes of cipher output from M2→M3 round 0 processing; i.e.
-        M3[16:32]).
-    *m3_payload* — 128-byte M3 encrypted payload (M3[16:144]).
-    *label* — 16-byte ASCII label; e.g. b'AirPlayStreamKey' or
-        b'AirPlayStreamIV '.
-    *stream_id* — stream identifier encoded as big-endian uint64.
+    Returns the first 16 bytes of
+    SHA-512(round0_block || m3_payload || label || stream_id as BE uint64),
+    where *round0_block* is M3[16:32], *m3_payload* is M3[16:144] and
+    *label* is a 16-byte ASCII label such as ``b"AirPlayStreamKey"``.
 
-    Returns: first 16 bytes of SHA-512(round0_block || m3_payload || label ||
-        stream_id_BE64).
-
-    SUPERSEDED -- read this before using it. This derives the stream key
-    *from M3*, which is a guess: spec §5.2 lists three candidates for the
-    16-byte "session_key_16" prefix and this picks candidate A (round-0
-    cipher output = M3[16:32]). The question was never settled, because it
-    stopped mattering.
-
-    The mirror's real video key is not derived from M3 at all. It is
-    negotiated inside FairPlay and read out of the SAP context, then folded
-    with the pair-verify shared secret by
-    ``framing.derive_tcp_stream_key_iv`` -- verified live against
-    the reference sender, and what ``session.py`` actually streams with. Nothing in
-    ``pyatv`` reads ``stream_aes_key``/``stream_aes_iv``; only this module
-    sets them, and ``examples/airplay_mirror_e2e.py`` reads them back.
-
-    Kept because that example still calls it. If a mirror stream will not
-    decrypt, this function is not where the problem is.
+    This is not the key the mirror stream is encrypted with; that one is
+    derived from the raw16 wrapped in the ekey and the pair-verify shared
+    secret by ``framing.derive_tcp_stream_key_iv``.
     """
     if len(round0_block) != 16:
         raise ValueError(f"round0_block must be 16 bytes, got {len(round0_block)}")
@@ -640,14 +492,13 @@ class FPLYHandshake:
     callers can swap between the two implementations.
     """
 
-    # Standard stream labels (spec §5.2)
+    # Labels for derive_stream_key
     LABEL_STREAM_KEY: bytes = b"AirPlayStreamKey"
     LABEL_STREAM_IV: bytes = b"AirPlayStreamIV "
 
     def __init__(self, mode_byte: int = 1) -> None:
         """Start an FPLY v3 handshake in mode *mode_byte* (0-3)."""
-        # Default mode 1 matches what the reference sender uses on the wire (Phase 12
-        # capture) and is the only mode the recovered path was verified at.
+        # Mode 1 is the mode this implementation has been tested with.
         self._mode_byte = mode_byte & 0x03
         self._state = _State.INIT
         self._m3_payload: bytes | None = None
@@ -657,8 +508,8 @@ class FPLYHandshake:
         self._stream_aes_iv: bytes | None = None
         # The media secret we choose and package into the ekey.
         self.chosen_raw16: bytes = b""
-        # the mirror session's audio SETUP wants its own ekey; it
-        # wraps the same raw16, so it is the video one
+        # The audio SETUP needs an ekey too; it wraps the same raw16 as the
+        # video one, so the same blob is used.
         self.audio_ekey: bytes = b""
         self.ekey: bytes = b""
         # The M4 body, when a runner collected it for us.
@@ -693,10 +544,8 @@ class FPLYHandshake:
 
         self._m3_payload = M3_CIPHER_BLOCK
         self._sap_context = fairplay_sap.context_after_m3(self._sap36)
-        # Legacy spec §5.2 fields.  The TCP media path does not use
-        # them — it derives the video key from the raw16 in the ekey (see
-        # session.py) — and because M3[16:144] is constant these are the
-        # same in every session.  Kept so callers that read them still work.
+        # Not used by the media path (see derive_stream_key).  Since
+        # M3[16:144] is constant, these are the same in every session.
         self._stream_aes_key = derive_stream_key(
             M3_CIPHER_BLOCK[:16], M3_CIPHER_BLOCK, self.LABEL_STREAM_KEY, 0
         )
@@ -708,11 +557,7 @@ class FPLYHandshake:
         return m3
 
     def build_m3_stateful(self, m2: bytes) -> bytes:
-        """Alias of :meth:`consume_m2_build_m3` (the handshake is stateful).
-
-        The name dates from when M3 came out of a stateful emulator that had
-        to survive to M4; the SAP secret this keeps plays that role now.
-        """
+        """Alias of :meth:`consume_m2_build_m3`."""
         return self.consume_m2_build_m3(m2)
 
     def finish_ekey(self, m4: bytes, raw16: bytes | None = None) -> bytes:
@@ -762,30 +607,21 @@ class FPLYHandshake:
 
     @property
     def sap_context(self) -> bytes:
-        """The 276-byte FairPlay context after M3 (ctx[8:44] = the SAP secret).
-
-        The same bytes the emulator used to be asked for, and what
-        ``session.py`` slices the FairPlay secret out of.
-        """
+        """The 276-byte FairPlay context after M3 (ctx[8:44] = the SAP secret)."""
         return self._sap_context
 
     @property
     def stream_aes_key(self) -> bytes:
-        """16-byte AES-128-GCM stream key (available after M3 is built)."""
+        """16-byte key from :func:`derive_stream_key` (after M3 is built)."""
         if self._stream_aes_key is None:
             raise RuntimeError("handshake not complete")
         return self._stream_aes_key
 
     @property
     def stream_aes_iv(self) -> bytes:
-        """16-byte AES-128-GCM stream IV / nonce (available after M3 is built).
+        """16-byte IV from :func:`derive_stream_key` (after M3 is built).
 
-        Derived by :func:`derive_stream_key`, which is SUPERSEDED -- see
-        its docstring. Spec §6.2 offered a second interpretation (XOR the IV
-        with the big-endian frame counter) to try if frames were rejected;
-        neither is what the working mirror uses, so do not spend time on
-        that choice. ``framing.derive_tcp_stream_key_iv`` supplies the
-        real key and IV.
+        Not the IV the mirror stream uses; see :func:`derive_stream_key`.
         """
         if self._stream_aes_iv is None:
             raise RuntimeError("handshake not complete")
@@ -826,19 +662,15 @@ async def run_fply_handshake(
     """Execute the FPLY v3 handshake over an existing HTTP connection.
 
     Posts M1 to ``/fp-setup``, receives M2, posts M3 to ``/fp-setup``,
-    and expects HTTP 200 for both.  M3 is built by
-    :meth:`FPLYHandshake.consume_m2_build_m3` — the recovered FairPlay path,
-    about ten milliseconds, no emulator.
+    and expects HTTP 200 for both.  The response to M3 is M4; it is stored on
+    the handshake and a media key is wrapped into :attr:`FPLYHandshake.ekey`
+    (and :attr:`FPLYHandshake.audio_ekey`) before returning.
 
-    ``mode_byte`` 3 matches what a real macOS sender uses -- with it, M1 is
-    byte-identical to a captured Apple sender.
+    ``mode_byte`` 3 is what macOS senders use; with it M1 is byte-identical
+    to theirs.
 
-    Returns the completed :class:`FPLYHandshake`.  The response to M3 is M4;
-    pass it to :meth:`~FPLYHandshake.finish_ekey` to package the media key.
-
-    Headers used: ``User-Agent: AirPlay/550.10``, ``X-Apple-HKP: 3``,
-    ``X-Apple-ET: 32`` (FairPlay encryption type, sent by real senders --
-    Phase 28 capture).
+    Both requests carry ``X-Apple-HKP: 3`` and ``X-Apple-ET: 32`` (FairPlay
+    encryption type).
     """
     sm = FPLYHandshake(mode_byte=mode_byte)
 
@@ -880,18 +712,12 @@ async def run_fply_handshake(
     if isinstance(m4_body, (bytes, bytearray)):
         sm.m4 = m4_body
     else:
-        # A str body is latin-1 text the HTTP layer already decoded, so encode
-        # it back.  The previous spelling, `bytes(resp2.body or b"",
-        # "latin-1")`, raised TypeError on an empty body: the b"" fallback is
-        # not a str and bytes() rejects an encoding without one.
+        # A str body is latin-1 text the HTTP layer already decoded.
         sm.m4 = m4_body.encode("latin-1") if m4_body else b""
     _LOGGER.debug("FPLY handshake complete: M4 is %d bytes", len(sm.m4))
-    # Wrap a media key while the SAP secret is in hand.  A caller that
-    # only wants the stream key never notices, but a mirror session needs
-    # `ekey` for its video SETUP and `audio_ekey` for the audio one --
-    # and the audio SETUP has to precede RECORD or the receiver answers
-    # 455 Method Not Valid In This State.  Both wrap the same raw16; the
-    # receiver unwraps each back to it.
+    # A mirror session needs `ekey` for its video SETUP and `audio_ekey` for
+    # the audio SETUP, which must precede RECORD (otherwise the receiver
+    # answers 455 Method Not Valid In This State).  Both wrap the same raw16.
     sm.finish_ekey(sm.m4)
     sm.audio_ekey = sm.ekey
     _LOGGER.debug("FPLY: ekey wrapped (%d bytes)", len(sm.ekey))

@@ -88,8 +88,7 @@ class RtspSession:
         self.dacp_id: str = f"{randrange(2 ** 64):X}"
         self.active_remote: int = randrange(2**32)
         # Overridable per session: AirPlay 2 screen mirroring is only offered
-        # to senders advertising a recent enough AirPlay version (a real macOS
-        # sender reports AirPlay/870.14.1).
+        # to senders advertising a recent enough AirPlay version.
         self.user_agent: str = USER_AGENT
 
     @property
@@ -288,9 +287,8 @@ class RtspSession:
             hdrs.update(headers)
 
         # A caller can suppress one of the defaults above by passing it as
-        # None. AirPlay 2 screen mirroring needs this: DACP-ID/Active-Remote/
-        # Client-Instance are RAOP remote-control headers and a real mirroring
-        # sender does not send them.
+        # None. AirPlay 2 screen mirroring does this for the RAOP
+        # remote-control headers (DACP-ID/Active-Remote/Client-Instance).
         hdrs = {k: v for k, v in hdrs.items() if v is not None}
 
         # If body is a dict, assume that payload should be sent as a binary plist

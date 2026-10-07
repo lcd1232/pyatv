@@ -1,23 +1,24 @@
-"""TCP-dialect mirror video transport (reverse-engineered 2026-08-23).
+"""Mirror video transport over the raw TCP media-data channel.
 
-A real tvOS 26 receiver driven by the reference sender takes screen video over
-a **raw TCP** media-data channel with this framing (verified by decrypting
-the reference sender's live stream, see
-docs/superpowers/specs/2026-08-23-mirror-video-key-handoff.md SESSION 3):
+The receiver takes screen video on a plain TCP connection to the ``dataPort``
+returned by the type-110 SETUP. Each video message is one H.264 access unit::
 
-    per message (one H.264 access unit):
-        128-byte header:
-            [0:4]   payload length      uint32 LE  (bytes after the header)
-            [4:8]   0x00 0x00 0x06 0x00 (video-data type/flags)
-            [8:16]  presentation timestamp uint64 LE (monotonic)
-            [16:128] zero
-        payload:
-            AES-128-CTR ciphertext, ONE CONTINUOUS keystream for the whole
-            stream (no per-frame reset). Plaintext = the access unit in AVCC
-            form: for each NAL, 4-byte big-endian length prefix + NAL bytes.
+    128-byte header:
+        [0:4]    payload length          uint32 LE (bytes after the header)
+        [4:8]    message type            00 00 06 00 = encrypted video frame
+                                         01 00 06 00 = plaintext avcC config
+        [8:16]   presentation timestamp  uint64 LE (monotonic)
+        [16:24]  config only: width, height as float32 LE
+        [40:64]  display geometry (see build_geometry)
+        rest     zero
+    payload:
+        AES-128-CTR ciphertext, ONE CONTINUOUS keystream for the whole
+        stream (no per-frame reset). Plaintext = the access unit in AVCC
+        form: for each NAL, 4-byte big-endian length prefix + NAL bytes.
 
-The key/iv are the SQAirPlayClientSessionDeriveKeyAndIV-derived values (see
-session.py PROVEN block): key = sha512("AirPlayStreamKey"+id || secret16)[:16].
+The first message is the plaintext avcC config; it does not advance the
+keystream. The key/iv come from
+:func:`~pyatv.protocols.airplay.mirror.framing.derive_tcp_stream_key_iv`.
 """
 
 from __future__ import annotations
@@ -35,23 +36,16 @@ _CONFIG_TYPE = b"\x01\x00\x06\x00"  # PLAINTEXT avcC decoder config (first)
 _HEADER_LEN = 128
 
 #: VCL NAL types (a coded slice) — used to group NALs into access units.
-#:
-#: There is a SECOND definition of "is this NAL a coded slice" in
-#: ``session.py``'s live-encoder path, which tests only ``t in (1, 5)``. The two
-#: agree on every stream that exists in practice: 2/3/4 are data partitions A/B/C,
-#: which only the Extended profile may emit and Baseline/Main/High forbid, so no
-#: encoder feeding either path produces one. They are therefore NOT a bug today —
-#: but they are two definitions of one concept, and only this note keeps the next
-#: reader from having to rediscover that. Change one and check the other.
+#: ``session.py``'s live path tests only (1, 5); 2-4 are Extended-profile data
+#: partitions that Baseline/Main/High never emit. Keep the two in step.
 _VCL_TYPES = frozenset(range(1, 6))
 
 
 class RawVideoTCPChannel(asyncio.Protocol):
     """Plain TCP connection to the receiver's video ``dataPort``.
 
-    No HAP/ChaCha layer (unlike :class:`AbstractHAPChannel`) — the reference sender
-    media-data channel is raw TCP; the only encryption is the AES-CTR applied
-    to each frame payload before it is queued here.
+    No HAP/ChaCha layer: the only encryption is the AES-CTR applied to each
+    frame payload before it is queued here.
     """
 
     def __init__(self) -> None:
@@ -68,7 +62,6 @@ class RawVideoTCPChannel(asyncio.Protocol):
 
     def data_received(self, data: bytes) -> None:
         """Log anything the receiver pushes back; nothing is expected."""
-        # The receiver may push a greeting/control byte back; log it.
         _LOGGER.info(
             "raw video channel got %d inbound bytes: %s",
             len(data),
@@ -78,11 +71,8 @@ class RawVideoTCPChannel(asyncio.Protocol):
     def eof_received(self) -> Optional[bool]:  # pylint: disable=useless-return
         """Warn on a half-close and let the transport close."""
         _LOGGER.warning("raw video channel: receiver sent EOF (half-close)")
-        # A false-y return tells asyncio to close the transport.  This is
-        # spelled out rather than falling off the end because mypy reads
-        # `-> Optional[bool]` as requiring a return statement; pylint then
-        # calls that return useless, so exactly one of the two gates has to
-        # be told.  mypy is the one whose complaint is about the signature.
+        # A false-y return tells asyncio to close the transport. Explicit
+        # because mypy requires a return for ``-> Optional[bool]``.
         return None
 
     def send(self, data: bytes) -> None:
@@ -119,10 +109,9 @@ def build_geometry(
 ) -> bytes:
     """Pack the 6-float display-geometry field that lives at header offset 40.
 
-    Observed in the reference sender's stream as a constant per-session block, e.g.
-    surface 3324x2160, origin 337x51, content 3164.7x2056.1. The receiver
-    appears to require a non-zero rect (a zeroed field gets the stream closed
-    after the first frame).
+    Six float32 LE: surface w/h, content origin x/y, content w/h; constant for
+    a session. The receiver requires a non-zero rect: a zeroed field gets the
+    stream closed after the first frame.
     """
     return struct.pack(
         "<ffffff",
@@ -144,11 +133,10 @@ def build_data_header(
 ) -> bytes:
     """Build the 128-byte TCP-dialect media-data header for a payload.
 
-    ``dims`` = (width, height) floats written at offset 16 (two little-endian
-    float32). The reference sender's CONFIG frame (type 0x01000600) carries the source
-    surface dimensions there so the receiver can size its decoder/display;
-    video frames leave [16:24] zero. Omitting it leaves the receiver unable to
-    configure the mirror surface (black screen).
+    ``dims`` = (width, height), written at offset 16 as two float32 LE. The
+    config message must carry the source dimensions there or the receiver
+    cannot configure the mirror surface (black screen); video frames leave
+    [16:24] zero.
     """
     header = bytearray(_HEADER_LEN)
     struct.pack_into("<I", header, 0, payload_len & 0xFFFFFFFF)
@@ -164,9 +152,9 @@ def build_data_header(
 def build_avcc_config(sps: bytes, pps: bytes) -> bytes:
     """Build an AVCDecoderConfigurationRecord (avcC) from raw SPS/PPS NALs.
 
-    The reference sender sends this PLAINTEXT as the first data-channel message (header
-    type 0x01000600) so the receiver can initialise its H.264 decoder before
-    any encrypted frame arrives. NALs are without start codes.
+    Sent in plaintext as the first data-channel message (type 0x01000600) so
+    the receiver can initialise its H.264 decoder before any encrypted frame
+    arrives. NALs are without start codes.
     """
     out = bytearray()
     out.append(0x01)  # configurationVersion
@@ -196,8 +184,8 @@ def group_access_units(nalus: List[bytes], nal_type) -> List[List[bytes]]:
     """Group a flat NAL list into access units.
 
     Non-VCL NALs (SPS/PPS/SEI/AUD) attach to the following VCL NAL; each VCL
-    NAL (coded slice) closes an access unit. Mirrors the reference sender's per-frame
-    message grouping (e.g. SEI+IDR in one message, a lone slice in the next).
+    NAL (coded slice) closes an access unit, so e.g. SEI+IDR travel in one
+    message.
     """
     units: List[List[bytes]] = []
     pending: List[bytes] = []

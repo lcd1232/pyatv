@@ -1,4 +1,4 @@
-"""Tests for TCP-dialect screen-audio packetization (RTP + AES-CBC)."""
+"""Tests for screen-audio packetization (RTP + AES-CBC)."""
 
 import struct
 import time
@@ -104,11 +104,9 @@ def test_sync_packet_layout():
 
 
 def test_sync_packet_now_without_latency_wraps_at_32_bits():
-    """``timestamp - latency`` is a 32-bit RTP clock and may go negative.
+    """``timestamp - latency`` wraps mod 2**32 when latency exceeds timestamp.
 
-    Nothing clamps the subtraction, so a session whose latency exceeds the
-    timestamp -- every session, for the first ~50 ms at 44.1 kHz -- relies on
-    the wrap being taken mod 2**32 rather than packing a negative int.
+    That is the case for the first ~50 ms of every session.
     """
     pkt = a.build_audio_sync_packet(False, timestamp=0, latency=2205, ntp=0)
     (nowl,) = struct.unpack(">I", pkt[4:8])
@@ -116,13 +114,10 @@ def test_sync_packet_now_without_latency_wraps_at_32_bits():
 
 
 def test_sync_packet_carries_the_ntp_epoch_not_the_unix_one():
-    """The sync clock must be the TimingServer's, seconds since 1900.
+    """The sync clock is the TimingServer's NTP time (seconds since 1900).
 
-    This is the bug the code comment describes: feed the builder a Unix-epoch
-    time and the receiver correlates two epochs about 2.2e9 seconds apart,
-    re-syncing on every sync packet -- roughly one audible glitch a second,
-    with every test still green.  Only a check on the *epoch* catches it,
-    because both values are plausible 32-bit seconds counts.
+    A Unix-epoch time would make the receiver re-sync on every sync packet,
+    causing audible glitches.
     """
     ntp = timing.ntp_now()
     pkt = a.build_audio_sync_packet(False, timestamp=0, latency=0, ntp=ntp)

@@ -12,26 +12,23 @@ from pyatv.protocols.airplay.mirror.framing import MirrorEncryptor
 class MirrorContext:
     """Parameters and derived crypto state for one mirror session."""
 
-    # From the test asset
+    # Source video geometry and frame rate.
     width: int = 1280
     height: int = 720
     fps: int = 30
 
-    # Continuous-keystream AES-CTR encryptor returned by the MFiSAP
-    # handshake. Same instance encrypts the M3 sig AND every subsequent
-    # mirror frame payload.
+    # Continuous-keystream AES-CTR encryptor from the MFiSAP handshake; the
+    # fallback video cipher when no stream key can be derived.
     stream_encryptor: Optional[MirrorEncryptor] = None
 
-    # Sender identity advertised in the stream SETUPs. Real senders pass
-    # their hardware values; these defaults mirror the shape captured from a
-    # macOS 15.7.4 sender (Phase 28) so the receiver's mirror path accepts us.
+    # Sender identity advertised in the stream SETUPs. The defaults have the
+    # shape of a macOS sender, which the receiver's mirror path accepts.
     name: str = "pyatv"
     model: str = "Mac15,6"
     os_build_version: str = "24G517"
     source_version: str = "870.14.1"
-    # Hardware identifiers sent in the stream SETUPs. Real senders pass
-    # their actual AirPlay device ID / WiFi MAC; when left as None a random
-    # pseudo-MAC is synthesized per session.
+    # Device ID / MAC sent in the stream SETUPs; None synthesizes a
+    # pseudo-MAC per session.
     device_id: Optional[str] = None
     mac_address: Optional[str] = None
 
@@ -48,14 +45,12 @@ class MirrorContext:
     # above rather than by the raw FairPlay key.
     video_encryptor: Optional[MirrorEncryptor] = None
 
-    # The FPLY emulator's SAP context after M3 (ctx[8:44] holds the FairPlay
-    # keybuf). The video key falls back to ctx[8:24] as raw16 when no
-    # ``stream_raw16`` was chosen.
+    # FairPlay SAP context after M3. The video key falls back to ctx[8:24]
+    # as raw16 when no ``stream_raw16`` is set.
     sap_context: bytes = b""
 
-    # TCP-dialect key transport: the 16-byte raw16 (SAP secret) we CHOSE
-    # and packaged into ``ekey`` (the receiver unwraps ekey -> raw16 and derives
-    # the video key from it, so we derive/encrypt with this same raw16).
+    # The 16-byte secret wrapped into ``ekey``. The receiver unwraps ekey to
+    # this value and derives the stream keys from it, so the sender must too.
     stream_raw16: bytes = b""
     ekey: bytes = b""
     audio_ekey: bytes = b""

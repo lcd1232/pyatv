@@ -12,10 +12,6 @@ def find_start_codes(data: bytes) -> List[Tuple[int, int]]:
 
     Handles both 3-byte (00 00 01) and 4-byte (00 00 00 01) forms, and skips
     past each one it finds, so the codes returned never overlap.
-
-    Split out because ``session.py``'s live-encoder path needs the offsets
-    themselves rather than the NAL payloads, and had its own copy of this
-    scan nested inside an I/O-bound function -- where no test could reach it.
     """
     codes: List[Tuple[int, int]] = []
     i = 0
@@ -53,7 +49,7 @@ def nal_type(nalu: bytes) -> int:
     return nalu[0] & 0x1F
 
 
-# H.264 NAL unit types we care about
+# H.264 NAL unit types
 NAL_SPS = 7
 NAL_PPS = 8
 NAL_IDR = 5

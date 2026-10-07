@@ -1,16 +1,11 @@
-"""MD5's own round constants, from the definition rather than from Apple.
+"""MD5's round constants, as defined in RFC 1321.
 
 FairPlay's hash is MD5 with one shuffled step (see :mod:`.fply_md5` and
-:mod:`.saphash_fold`); its constants are the textbook ones.  The
-derivation that proved that -- reading the constants back out of the
-binary's ARX block and matching them against ``sin`` -- is
-``examples/mirror_pyfply/devirt/md5probe.py``, which needs the
-disassembler and stays there.
+:mod:`.saphash_fold`); its constants are the textbook ones.
 """
 
-# The two tables are laid out as RFC 1321 presents them -- T four to a
-# line, the shifts a row per round -- and black would give each of the
-# 128 entries a line of its own.
+# Laid out as RFC 1321 presents them; black would put each entry on its
+# own line.
 # fmt: off
 
 # T[i] = floor(2**32 * abs(sin(i + 1)))

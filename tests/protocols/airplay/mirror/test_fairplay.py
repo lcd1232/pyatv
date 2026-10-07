@@ -29,12 +29,8 @@ def test_build_m1_is_33_bytes_with_header_byte():
 def test_build_m1_carries_a_usable_x25519_public_key():
     """M1 is a mode byte plus this handshake's own X25519 public key.
 
-    `from_public_bytes` validates length and nothing else -- X25519 has no
-    point validation, so all-zeros and all-0xff parse happily.  Checking it
-    loads therefore only proves the field is 32 bytes.  What makes it the
-    RIGHT key is that it agrees with the private half this handshake kept:
-    a peer's shared secret against the key M1 advertises must equal ours
-    against the peer's.
+    X25519 has no point validation, so parsing the key proves only its length;
+    a peer's shared secret against it must also equal ours against the peer's.
     """
     h = fairplay.MFiSAPHandshake()
     m1 = h.build_m1()
@@ -85,8 +81,8 @@ def test_consume_m2_truncated_body_raises():
 def test_full_handshake_derives_correct_keys_and_returns_m3():
     """Drive the handshake against a synthetic server we control.
 
-    Verifies that the derived AES key/IV match the SHA1 derivation rule
-    the reference sender uses, and that M3 = cert || AES-CTR(sig).
+    Verifies that the AES key/IV follow the SHA1 derivation rule and that
+    M3 = cert || AES-CTR(sig).
     """
     h = fairplay.MFiSAPHandshake(header_byte=0x01)
     m1 = h.build_m1()
@@ -171,7 +167,7 @@ async def test_run_handshake_posts_m1_and_m3_to_correct_endpoints():
     cert = b"CERT" * 4
     sig = b"SIG-" * 4
     m2 = server_pk + struct.pack(">II", len(cert), len(sig)) + cert + sig
-    m4 = b""  # spec says M4 unparsed; receiver typically returns empty
+    m4 = b""  # M4 is not parsed; receivers typically return it empty
 
     conn = _FakeConnection(
         [

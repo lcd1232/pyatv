@@ -1,12 +1,7 @@
-"""FPLY wire layout against a captured (M1, M2, M3, M4) handshake.
+"""FPLY wire layout against a captured M2/M3 pair from a real session.
 
-The bytes come from a live mirroring session between a third-party sender
-and an Apple TV; they are protocol data, embedded as constants.  pyatv does
-not reproduce this capture's M3 -- the sender's session block and device
-tag came from its own randomness, while pyatv's FairPlay path is
-deterministic -- but it must parse M2 and lay out M3 exactly as the wire
-does.  Known-answer tests for pyatv's own values live in
-``test_fairplay_sap.py``.
+The captured M3 used random session material, so pyatv cannot reproduce it,
+but it must parse M2 and lay out M3 exactly as on the wire.
 """
 
 from __future__ import annotations
@@ -47,12 +42,10 @@ def test_parse_m2_against_capture():
 
 
 def test_build_m3_layout_matches_capture_with_known_pieces():
-    """Assembling M3 from known cipher output, aux header, and device tag
-    reproduces the captured M3 byte-for-byte.
+    """build_m3 reproduces the captured M3 from its captured parts.
 
-    Validates the M3 layout (mode at 12, aux header at 13:16, cipher
-    output at 16:144, device tag at 144:164) regardless of whether we can
-    *generate* the cipher output ourselves yet.
+    Checks the layout: mode at 12, aux header at 13:16, cipher output at
+    16:144, device tag at 144:164.
     """
     rebuilt = fply.build_m3(
         mode=0x01,
@@ -63,18 +56,11 @@ def test_build_m3_layout_matches_capture_with_known_pieces():
     assert rebuilt == _CAP_M3_P1
 
 
-# ---------------------------------------------------------------------------
-# What pyatv sends against what the reference sender sent
-# ---------------------------------------------------------------------------
-
-
 def test_pyatv_agrees_with_the_capture_on_everything_but_the_session():
-    """Same framing, same aux header, different session material.
+    """pyatv's M3 matches the capture except for the session material.
 
-    pyatv's session block is the constant :data:`fply.M3_CIPHER_BLOCK` (the
-    sender randomness is pinned), the reference sender's was random, so M3[16:144] and
-    the device tag after it differ by construction.  Everything the wire
-    format fixes must still agree.
+    pyatv uses the fixed :data:`fply.M3_CIPHER_BLOCK` where the captured
+    sender used random bytes, so only M3[16:144] and the tag may differ.
     """
     ours = fply.build_m3(
         mode=0x01,

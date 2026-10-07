@@ -1,29 +1,21 @@
-"""FPLY's hashing in pure Python: MD5 with one modification.
+"""FPLY's hashing: MD5 with one modification.
 
-This closes task 6.  The 144-byte schedule that drives VM-17's cipher --
-forwards over a constant block, then backwards to produce the device_tag
--- is nine MD5 compressions of the 20-byte SAP secret, differing only in
-a round counter:
+The 144-byte key schedule of the device_tag cipher (see ``fply_pure``) is
+nine MD5 compressions of the 20-byte SAP secret tail, differing only in a
+round counter:
 
     secret(20)  ->  A(144)  ->  device_tag
 
-Everything here is MD5 by the book except one thing: after step 31 the
-compression **shuffles its own message block**, swapping word i with a
-word chosen from the state, for i in 0..7:
+Everything is MD5 by the book except that after step 31 the compression
+shuffles its own message block, swapping word i with a word chosen from
+the state, for i in 0..7:
 
     j = ([A, B, C, D][i & 3] >> (4 * (i >> 2))) & 15
     m[i], m[j] = m[j], m[i]
 
-That is the whole modification, and without it nothing reproduces.  (It
-is the same family as the swap in airplay2-receiver's fairplay3.py, but
-not the same rule: there both indices come from the state, here the left
-one is a plain counter.)
-
-The same compression, with a different chaining value and salt, also
-joins the cipher's two passes -- see ``link``.
-
-No blob, no emulator, no tables -- this half of the device_tag is 60
-lines of arithmetic.
+(airplay2-receiver's fairplay3.py has a swap of the same family, but there
+both indices come from the state.)  The same compression, with a different
+chaining value and salt, also joins the cipher's two passes; see ``link``.
 """
 
 import struct
@@ -54,7 +46,7 @@ KEY_BASE = (0x1D4A4587, 0x92F39FCC, 0x1D87D836, 0xCDC86697)
 # the 16 bytes that follow the secret in the message; the top byte of the
 # first word is the round counter
 SALT = (0x0057D8EE, 0xCBDEFBCF, 0x591C27A2, 0xCFBEB089)
-# the slice stages the secret XORed with this before hashing it
+# the secret is XORed with this before it is hashed
 SECRET_MASK = 0x0D
 # MD5's length field: 0x320 bits = 100 bytes, the whole two-block message
 LENGTH_WORD = 0x20030000
@@ -125,7 +117,7 @@ def round_keys(secret):
     return schedule[::-1] + [bytes(16)]
 
 
-# The two passes of VM-17's cipher are joined by one more compression of
+# The two passes of the tag cipher are joined by one more compression of
 # the same kind: the forward pass's 16-byte output, salted and padded,
 # hashed from its own constant chaining value.  Without something here
 # the backward pass would simply undo the forward one and the tag would
@@ -145,9 +137,8 @@ def link(ciphertext):
 
 
 # The backward pass ends with one more addition the substitution steps do
-# not carry: sixteen plain byte stores of a fixed constant, XORed in.
-# (recover_round_keys reports the tenth round key as zero because the
-# substitutions really do take no key; this is applied separately.)
+# not carry: a fixed constant XORed over all sixteen bytes.  (The tenth
+# round key is zero; this is applied separately.)
 FINAL_XOR = bytes.fromhex("67bc54c08e32851b50d2125f68b740a5")
 
 

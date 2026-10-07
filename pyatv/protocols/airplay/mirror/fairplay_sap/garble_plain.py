@@ -48,8 +48,7 @@ The other words, and the stores no word reads back, matter only that way.
 
 The published playfair `hand_garble.c` (copied into shairplay, RPiPlay,
 UxPlay and others) computes the same b0, b1 and b2.  Its output words are
-numbered differently from 13 onward, and the ones that do not feed
-playfair's key were never checked there.
+numbered differently from 13 onward.
 """
 
 
@@ -86,9 +85,9 @@ def _rotl8(value, count):
 def _rotl8_or_zero(value, count):
     """Rotate a byte left by `count & 7` -- but a count of 0 gives 0.
 
-    The original spells this as two shifts xored together, and at a count
-    of 0 the two copies coincide and cancel.  The hole is reached at every
-    call site, so it is part of the function, not a quirk to smooth over.
+    The algorithm is two shifts xored together, and at a count of 0 the
+    two copies coincide and cancel.  Every call site can hit that case, so
+    it is part of the function.
     """
     count &= 7
     return _rotl8(value, count) if count else 0
@@ -125,9 +124,7 @@ def _tap(cursor, back):
 
     The subtraction is unsigned 32-bit and happens before the modulo:
     cursor 0, back 155 is 101, because 0xffffff65 % 210 is 101, where
-    Python's own `%` would give 55.  A real call starts at cursor 789 and
-    never gets near that; the cursor is a parameter so other starting
-    points behave as the original does.
+    Python's own `%` would give 55.
     """
     return (cursor - back & 0xFFFFFFFF) % 210
 
@@ -135,8 +132,8 @@ def _tap(cursor, back):
 def _finish_scramble(b1, cursor):
     """Run the last 51 of the round's 840 scramble passes over the b1 ring.
 
-    Each pass is `saphash.scramble`'s step.  The cursor arrives at 789 in
-    every recorded call and the loop stops at 840, `saphash.STEPS`.
+    Each pass is `saphash.scramble`'s step.  The cursor arrives at 789 and
+    the loop stops at 840, `saphash.STEPS`.
     """
     for head in range(cursor, cursor + 51):
         at = _tap(head, 0)
@@ -149,11 +146,10 @@ def _finish_scramble(b1, cursor):
 def garble(b0, b1, b2, b3, b4, cursor=789):
     """Fill the 34 output words of b3, stirring b0, b1 and b2, in place.
 
-    *cursor* is where the round's scramble has got to; every real call
-    passes 789.
+    *cursor* is where the round's scramble has got to (789).
     """
-    # One straight-line pass, as the original is: splitting it would only
-    # hide the order of the stores, which is the point.
+    # One straight-line pass: the order of the stores matters, and
+    # splitting it up would hide that.
     # pylint: disable=too-many-locals,too-many-statements
     b0, b1, b2, b4 = _Ring(b0), _Ring(b1), _Ring(b2), _Ring(b4)
     out = _Words(b3)

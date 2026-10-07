@@ -48,7 +48,7 @@ def _ok(body=b""):
 
 
 async def test_session_never_sends_announce():
-    """The modern mirror flow has no ANNOUNCE/SDP at all (Phase 28 capture)."""
+    """The mirror flow sends no ANNOUNCE/SDP."""
     import plistlib
 
     session_ok = _ok(plistlib.dumps({"eventPort": 1}, fmt=plistlib.FMT_BINARY))
@@ -96,45 +96,26 @@ async def test_session_run_requires_stream_encryptor():
         ctx=ctx,
         h264_path=TEST_FILE,
     )
-    # Call the streaming phase directly with no channels — it must check
-    # the encryptor before doing anything that would NPE later.
     s._video_channel = MagicMock()
     with pytest.raises(RuntimeError):
-        # Wrap with timeout so a stuck producer doesn't hang the test
         await asyncio.wait_for(s._stream_until_done(), timeout=1.0)
 
 
-# --- Keying and timing constants that only exist on the wire ----------------
+# --- Keying and timing values that are only observable on the wire ----------
 #
-# Each test below pins a value that lives and dies as a local inside a
-# streaming coroutine -- a session key, a slice of the SAP context, a latency
-# offset. None of them reach the context or any return value, so none can be
-# read back afterwards. Two of the three therefore assert on the bytes that
-# actually left the sender, and the third watches the derivation being called,
-# which is the same seam ``test_mvp_integration`` uses for its half of it.
-#
-# All three were written against mutants that the rest of the suite could not
-# tell apart from the original.
+# These values are locals inside streaming coroutines, so the tests check the
+# bytes that left the sender or spy on the key derivation.
 
 
 async def test_video_key_falls_back_to_a_16_byte_sap_context_slice(monkeypatch):
-    """Without an ekey raw16, the video key comes from 16 bytes of SAP context.
+    """Without raw16, the video key comes from SAP context bytes ``[8:24]``.
 
-    ``stream_raw16`` is the value the sender packaged into ``ekey``, and is
-    what a real session keys from; the slice is the fallback for the no-ekey
-    experiments. Its length is load-bearing rather than cosmetic: the
-    derivation sits behind a ``len(raw16) == 16`` guard, so a slice of any
-    other length does not produce a different key -- it produces no key at
-    all, and the session silently drops back to an unrelated cipher.
-
-    ``test_mvp_integration`` covers the ``stream_raw16`` branch and asserts
-    the context holds the secret at ``[8:24]``; this covers the branch that
-    actually does that indexing.
+    The derivation only accepts 16 bytes, so a wrong-length slice would yield
+    no key at all rather than a different one.
     """
     expected_off = 8
 
-    # Distinctive bytes, so "the right 16" is a real claim and not satisfied
-    # by any slice of the same length.
+    # Distinctive bytes, so only the right slice matches.
     sap_context = bytes((i * 7 + 3) & 0xFF for i in range(276))
     pair32 = bytes.fromhex("66" * 32)
 
@@ -152,9 +133,6 @@ async def test_video_key_falls_back_to_a_16_byte_sap_context_slice(monkeypatch):
         sess._ctx.sap_context = sap_context
         await stream_then_stop(receiver, sess)
 
-    # With a slice of any length but 16 the guard rejects it and this list is
-    # empty -- the session logs "PROVEN video key unavailable" and streams
-    # under a different key instead.
     assert derivations, "the video key was never derived from the SAP context"
     (used_raw16, used_pair32, used_sid), kwargs, (key, _iv) = derivations[0]
 
@@ -163,9 +141,7 @@ async def test_video_key_falls_back_to_a_16_byte_sap_context_slice(monkeypatch):
     assert used_pair32 == pair32
     assert used_sid == sess._ctx.stream_connection_id
     assert key == real_derive(used_raw16, pair32, used_sid, **kwargs)[0]
-    # A slice one byte longer is not a near-miss key, it is not a key at all:
-    # the derivation refuses it outright, which is why the caller's length
-    # guard is what stands between a wrong slice and a dead video stream.
+    # The derivation itself rejects any other length.
     with pytest.raises(ValueError, match="16 bytes"):
         real_derive(
             sap_context[expected_off : expected_off + 17], pair32, used_sid, **kwargs
@@ -173,16 +149,10 @@ async def test_video_key_falls_back_to_a_16_byte_sap_context_slice(monkeypatch):
 
 
 async def test_audio_sync_packet_reports_a_50ms_latency(monkeypatch, tmp_path):
-    """The screen-audio sync must offset ``now`` by exactly 50 ms of audio.
+    """The screen-audio sync packet advertises 50 ms of latency.
 
-    The receiver locks its audio clock from the gap between the sync packet's
-    ``now`` and ``now_without_latency``: that difference *is* the latency it
-    schedules playback against, so the constant is not decorative -- it goes
-    out on the wire ~1/s and a wrong value skews playback by the error.
-
-    2205 is a sample count at the 44.1 kHz audio clock, and asserting what it
-    means (50 ms) rather than its digits is what makes the test able to say a
-    changed value is wrong.
+    The receiver schedules playback against the gap between ``now`` and
+    ``now_without_latency``, so a wrong value skews audio timing.
     """
     loop = asyncio.get_event_loop()
     received: asyncio.Queue = asyncio.Queue()
@@ -220,9 +190,8 @@ async def test_audio_sync_packet_reports_a_50ms_latency(monkeypatch, tmp_path):
         eld_path=eld_file,
         pair_secret=b"\x66" * 32,
     )
-    # The first sync is sent before the send loop's first stop check, so a
-    # session that is already stopped still emits exactly one and then
-    # returns -- no pacing, no spinning, nothing to cancel.
+    # The first sync goes out before the first stop check, so an already
+    # stopped session emits exactly one and returns.
     sess._stopped = True
     try:
         await asyncio.wait_for(sess._stream_screen_audio(), timeout=5.0)
@@ -242,17 +211,10 @@ async def test_audio_sync_packet_reports_a_50ms_latency(monkeypatch, tmp_path):
 
 @pytest.mark.asyncio
 async def test_a_wrong_length_raw16_falls_back_instead_of_being_used(monkeypatch):
-    """``stream_raw16 and len(stream_raw16) == 16``, not ``or``.
+    """A raw16 that is present but not 16 bytes is ignored, not used.
 
-    The proven video key prefers the raw16 the sender packaged into ekey and
-    falls back to a slice of the SAP context when it does not have one. The
-    guard has to mean "present AND the right length": written ``or`` a
-    present-but-short raw16 satisfies it, and an 8-byte key goes into the
-    derivation where 16 belong.
-
-    Only a value that is truthy and the wrong size tells the two apart, and
-    nothing produced one -- the fixture's raw16 is always 16 bytes and the
-    absent case is empty, which both spellings reject.
+    The video key then falls back to the SAP context slice instead of
+    feeding a short key into the derivation.
     """
     context = bytes(range(0x40, 0x80))
     seen: list = []
@@ -278,17 +240,10 @@ async def test_a_wrong_length_raw16_falls_back_instead_of_being_used(monkeypatch
 
 @pytest.mark.asyncio
 async def test_the_screen_audio_key_hashes_raw16_before_pair32(monkeypatch, tmp_path):
-    """The order of the two halves, checked by decrypting what was sent.
+    """Screen audio is keyed with ``sha512(raw16 || pair32)[:16]``.
 
-    The audio key is ``sha512(raw16 || pair32)[:16]``. Swapping the halves
-    produces a perfectly good 16-byte key that the receiver does not share,
-    and every assertion the suite had about screen audio -- that packets
-    arrive, that their payload lengths match the source frames, that the
-    sync cadence is right -- holds exactly as well under the wrong key,
-    because none of them looks at the bytes.
-
-    So this one looks at the bytes. AES-CBC over whole blocks with the tail
-    passed through, which is what the sender does, run backwards.
+    Checked by decrypting a sent packet (AES-CBC over whole blocks, tail
+    passed through), since swapped halves still give a valid-looking key.
     """
     frames = [bytes([0x51 + i]) * 48 for i in range(2)]
     eld = tmp_path / "keyed.eld"
@@ -320,18 +275,10 @@ async def test_the_screen_audio_key_hashes_raw16_before_pair32(monkeypatch, tmp_
 
 @pytest.mark.asyncio
 async def test_a_full_live_audio_queue_drops_the_oldest_frame(monkeypatch, tmp_path):
-    """The audio queue's copy of the bounded-latency rule.
+    """A full live audio queue drops its oldest frame to bound latency.
 
-    Same branch as the video one, same failure if it goes: ``put_nowait``
-    raises ``QueueFull``, the handler logs, the reader ends, and the stream
-    plays whatever was queued first -- the stale frames -- instead of
-    discarding them for the fresh ones.
-
-    The reader's head start here is the sender's pre-buffer loop, which
-    sleeps in 50ms steps until the queue reaches ``AUDIO_PREBUFFER``.
-    That is long enough for a reader with the whole source already in hand.
-    Which frame arrives first is the question, so the packet is decrypted:
-    dropping keeps the tail, dying keeps the head.
+    The reader fills the queue during the sender's pre-buffer wait. The first
+    packet is decrypted: it must be one of the later frames, not the first.
     """
     frames = [bytes([0x61 + i]) * 48 for i in range(6)]
     eld = tmp_path / "many.eld"
@@ -383,26 +330,13 @@ async def test_a_full_live_audio_queue_drops_the_oldest_frame(monkeypatch, tmp_p
 async def test_the_live_audio_reader_accepts_a_frame_of_exactly_the_cap(
     monkeypatch, tmp_path
 ):
-    """8192 is a length, not a length limit to fall short of.
+    """The live audio reader accepts 8192-byte frames and rejects 8193.
 
-    The reader treats a prefix over 8192 as a lost sync and walks forward a
-    byte at a time. That makes the number a boundary in both directions:
-    8192 has to be accepted, because an AAC frame may be that long, and
-    8193 has to be refused, because a run of data misread as a length
-    usually is enormous.
-
-    Every audio fixture in this package is a few dozen bytes, so the cap
-    could be moved either way without a test noticing. This one sends a
-    frame of exactly 8192 between two small ones and requires all three
-    back, in order: lowering the cap turns the middle frame's prefix into a
-    resync, and everything after it is read from the wrong offset.
+    A larger length prefix is treated as lost sync and skipped byte by byte,
+    so all three real frames must come back intact and in order.
     """
     frames = [b"\x71" * 48, b"\x72" * 8192, b"\x73" * 64]
-    # ...and one byte over the cap, as a bare prefix with nothing behind it.
-    # Accepted, the reader waits for 8193 bytes that never come and the frame
-    # after it never ships; refused, it walks forward until the lengths make
-    # sense again and delivers it. Four shifts, because the bogus prefix is
-    # four bytes.
+    # A bare 8193 prefix that the reader must resync past.
     body = b"".join(struct.pack(">I", len(f)) + f for f in frames[:2])
     body += struct.pack(">I", 8193)
     body += struct.pack(">I", len(frames[2])) + frames[2]
