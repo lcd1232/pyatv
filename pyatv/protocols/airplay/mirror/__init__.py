@@ -13,13 +13,12 @@ reached only by driving these classes directly, which is what
 
 Integrating it would mean at least: a public interface method and its
 ``FeatureName``, wiring in ``pyatv/protocols/airplay/__init__.py`` so the
-relevant service reports the feature, a source of frames (the example shells
-out to an encoder), and a decision about the two dialects below. That is a
-design question, not a missing import.
+relevant service reports the feature, and a source of frames (the example
+shells out to an encoder). That is a design question, not a missing import.
 
 One thing to settle at that point: the state-machine guards here raise bare
 ``RuntimeError`` -- "handshake not complete", "called in state X", "not
-connected" -- fourteen of them, where the rest of pyatv raises
+connected" -- thirteen of them, where the rest of pyatv raises
 ``exceptions.InvalidStateError`` for exactly that. Nothing catches either today, so
 it costs nothing to leave; a public caller would want the pyatv type.
 
@@ -29,25 +28,12 @@ is an invariant a caller cannot provoke -- "no service (bug)", "missing
 implementation for", "no response was saved for". ``InvalidStateError`` is
 documented as "an action not possible in the current state" and is raised
 for things a caller does: "already connected", "not connected". By that
-split the fourteen here are the second kind and the fifteenth raise --
+split the thirteen here are the second kind and the fourteenth raise --
 ``_stream_until_done`` on an unset ``stream_encryptor`` -- is the first, and
-should stay. ``auth/hap_channel`` raises ``InvalidStateError("not
-connected")`` for the same condition ``streams.send`` raises
-``RuntimeError`` for, which is the sharpest instance of the mismatch.
+should stay.
 
-TWO DIALECTS, and the default is not the obvious one. ``MIRROR_TCP``
-selects between them and defaults to on:
-
-* TCP -- a simple type-110 video stream with a FairPlay-wrapped key in
-  ``ekey``/``eiv`` over TCP. This is the one that renders on tvOS 26.
-* AVConference -- the macOS sender's dialect: a session-init SETUP, Viceroy
-  negotiation blobs, SRTP over UDP. Exercised by the tests, but it is not
-  what a current Apple TV was observed to accept.
-
-Much of :mod:`~pyatv.protocols.airplay.mirror.session` is switched by
-``MIRROR_*`` environment variables left from working the protocol out. They
-are research controls, not configuration; the defaults are the verified
-path.
+The dialect spoken is the one that renders on tvOS 26: a simple type-110
+video stream with a FairPlay-wrapped key in ``ekey``/``eiv``, sent over TCP.
 """
 
 from pyatv.protocols.airplay.mirror.context import MirrorContext

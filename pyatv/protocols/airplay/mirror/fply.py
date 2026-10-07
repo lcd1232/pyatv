@@ -721,8 +721,8 @@ class FPLYHandshake:
         Returns the ekey.  Also sets :attr:`chosen_raw16`, :attr:`ekey` and
         :attr:`sap_context`.  The receiver unwraps the ekey back to *raw16*
         and derives the video key from it, so any 16-byte *raw16* works as
-        long as we encrypt with the same one.  ``MIRROR_FIXED_RAW16`` (hex)
-        pins it for debugging.
+        long as we encrypt with the same one.  A random one is chosen unless
+        *raw16* is given.
 
         *m4* carries nothing we need — it echoes M3's device tag back for
         verification — so it is only checked, not consumed.
@@ -738,8 +738,7 @@ class FPLYHandshake:
                     echoed.hex(),
                     ours.hex(),
                 )
-        env_raw = os.environ.get("MIRROR_FIXED_RAW16")
-        raw16 = raw16 or (bytes.fromhex(env_raw) if env_raw else os.urandom(16))
+        raw16 = raw16 or os.urandom(16)
         if len(raw16) != 16:
             raise ValueError(f"raw16 must be 16 bytes, got {len(raw16)}")
 

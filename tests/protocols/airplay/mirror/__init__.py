@@ -29,31 +29,32 @@ mutations across the transport modules, 76% killed, and a separate sample of
 the useful part.  The recovered handshake is pinned tightly because 256
 recorded handshakes must reproduce byte-exactly, so no mutation of it can
 hide; the transport survivors are all in the live-encoder and screen-audio
-paths named below, the disproven ``pairverify`` arm, logging arguments, or
-``frozen=True`` on dataclasses nothing hashes.
+paths named below, logging arguments, or ``frozen=True`` on dataclasses
+nothing hashes.
 
 A third campaign redid the comparison operators once the harness itself was
 trustworthy -- see the note at the end of this file for what it had been
 reporting wrongly.  95 sites: `pacer` 9, the transport four 16, the handshake
 and helper modules 29, ``session`` 41.  Four were real and are now pinned --
-where the pacer's sleeps land, the fragment-count edge at 255, the SRTP
+where the pacer's sleeps land, the fragment-count edge at 255, the
 roll-over boundary at exactly half a sequence space, and the audio sync
-cadence that a five-frame test never reaches.  A second pass shifted the
+cadence that a five-frame test never reaches (only the last of these is
+still in the package).  A second pass shifted the
 numeric threshold in each comparison instead of the operator, which is a
 sharper instrument than it sounds: RAISING a guard is caught every time,
 because something valid stops being accepted, while LOWERING one only
 admits inputs no test sends.  Three more came out of that, all of them a
 guard protecting a slice on the next line -- ``parse_header`` at 20 bytes,
-``build_avcc`` at four, ``parse_m2`` at 142.
+``build_avcc`` at four, ``parse_m2`` at 142 (the first two have since been
+removed with the code they guarded).
 
-The rest were read one at a time rather than counted.  Most sat behind
-``MIRROR_LIVE_CMD``, ``MIRROR_AUDIO_LIVE_CMD`` or the ``MIRROR_KEYBUF_*``
-switches, and the conclusion drawn here at first -- that research controls
-cannot be mutation-tested at all -- was too strong.  They can, and now are;
-see the section below on what that took.  What genuinely resists is
-narrower: two drop-oldest branches that need the reader to outrun the
-sender, an 8192-byte frame cap, the disproven ``pairverify`` arm, and a
-handful of equivalent mutants where both spellings compute the same thing.
+The rest were read one at a time rather than counted.  Most sat behind the
+live video and audio commands, and the conclusion drawn here at first --
+that those paths cannot be mutation-tested at all -- was too strong.  They
+can, and now are; see the section below on what that took.  What genuinely
+resists is narrower: two drop-oldest branches that need the reader to
+outrun the sender, an 8192-byte frame cap, and a handful of equivalent
+mutants where both spellings compute the same thing.
 
 A fourth pass shifted each constant bound of every byte slice, on the
 theory that a wire protocol's bugs live in its offsets.  About 110 of them,
@@ -65,9 +66,9 @@ equivalent: ``m2[14:142]`` and ``m2[14:143]`` are the same 128 bytes when
 the message is 142 long, so half that class is dead on arrival.  And a
 slice inside a logging call cannot be observed at all -- ``ekey[:24].hex()``
 in a debug line, ``body[:200].hex()`` in another.  The one real find was
-not a slice of data but of derived key material: ``okm[:16], okm[16:30]``
-splitting an HMAC output into an SRTP key and salt, where a short slice
-still looks like a key to everything downstream.
+not a slice of data but of derived key material: an HMAC output split into
+a key and salt, where a short slice still looks like a key to everything
+downstream (that derivation has since been removed).
 
 A fifth pass swapped the operands of every byte concatenation, on the
 grounds that ``sha512(a + b)`` for ``sha512(b + a)`` is easy to write and
@@ -85,21 +86,17 @@ share.
 
 Two of those survivors were real, and neither was a missing assertion:
 ``tcp_video_producer`` selected the SPS by NAL type with nothing
-checking the resulting avcC, and ``MIRROR_STRIP_SPSPPS`` guarded a filter
-that could never fire because the parameter sets had already been removed
-twenty lines earlier.  A third pointed at dead code rather than a test gap --
+checking the resulting avcC, and a switch guarded a filter that could never
+fire because the parameter sets had already been removed twenty lines
+earlier (the switch is gone).  A third pointed at dead code rather than a test gap --
 ``getattr(self, name, default)`` on attributes ``__init__`` always sets.
 
-Four real defects came out of the original campaign, and the tests that
+Real defects came out of the original campaign, and the tests that
 killed them are deliberately shaped around the mutant rather than around the
 happy path.
 Do not "simplify" these into something more obvious -- the obvious
 version is what was there before, and it passed:
 
-* ``test_rtp.py::test_extension_flag_reads_its_own_bit_not_the_whole_byte``
-  -- ``(byte0 >> 4) | 1`` is never zero, so the header byte must have a
-  bit set ABOVE X while X itself is clear.  Every packet this package
-  builds has X set, which is why nothing caught it.
 * ``test_tcp_stream.py``'s
   ``test_group_access_units_does_not_split_on_an_sei_nal``
   -- a TRAILING SEI is flushed by the tail either way; only an SEI
@@ -108,27 +105,12 @@ version is what was there before, and it passed:
   ``test_avcc_config_follows_the_decoder_configuration_record_layout``
   -- asserts the record's LAYOUT, not a captured blob; a blob regenerated
   from mutated code would launder the bug.
-* ``test_session.py::test_srtp_kdf_env_selects_the_derivation_that_encrypts_the_wire``
-  -- decrypts the first datagram off the wire under each candidate
-  derivation.  That line had never executed at all: it sits behind an
-  encryptor carrying a key and iv, and the fake handshake's carries
-  neither.
 
 WHAT IS STILL UNTESTED, DELIBERATELY.  Less than this section used to
-claim.  The ``MIRROR_KEYBUF_*`` sweeps were listed here because they need a
-receiver that decrypts -- true for saying whether a derivation is RIGHT, and
-not for saying which one the session picked, which is the part a switch can
-get wrong.  ``test_session.py`` now pins both: ``MIRROR_KEYBUF_DERIV``
-decides whether the window is run through ``stream_key_iv_from_secret`` or
-taken verbatim, and ``MIRROR_KEYBUF_MODE`` decides whether it becomes a
-cipher or an SRTP pair the TCP dialect never reaches.  Both spy on the
-argument rather than the call, because the proven key path reaches the same
-two functions and is called either way.
+claim.  What is genuinely out of reach is whether the key derivations
+produce the key a real receiver expects.
 
-What that leaves genuinely out of reach is narrower: whether these
-derivations produce the key a real receiver expects.
-
-The live-encoder path (``MIRROR_LIVE_CMD``) and the audio subprocess reader
+The live-encoder path (``video_command``) and the audio subprocess reader
 were on that list too, on the grounds that they need an external encoder.
 That was true of end-to-end fidelity and not of the parsing, which is most
 of what those branches are: both take a shell command, and a few lines of
@@ -138,8 +120,8 @@ length-prefixed frames for the audio.  What that reaches is the NAL
 classification, the access-unit grouping, and the audio's resync after a
 malformed length.  Both drop-oldest branches are reached too, and neither
 needed a race to do it. Each sender pauses before its first send -- the
-video one sleeps ``MIRROR_LIVE_PREBUFFER``, the audio one loops on
-``MIRROR_AUDIO_PREBUFFER`` in 50ms steps -- and that pause is the reader's
+video one sleeps ``LIVE_VIDEO_PREBUFFER``, the audio one loops on
+``AUDIO_PREBUFFER`` in 50ms steps -- and that pause is the reader's
 head start. Both were recorded here as out of reach before anyone tried,
 and so was the 8192-byte audio frame cap, which needed nothing more than a
 frame of exactly that length and a bogus prefix one byte over it.  All three
@@ -158,8 +140,7 @@ real defects rather than just missing assertions:
 
 * an explicit ``ctx.video_encryptor`` was silently dropped in the shipping
   configuration -- the keybuf arm reassigned over the top of it, so the
-  caller's encryptor encrypted zero frames in the TCP dialect with a
-  raw16 present, and worked in the other three combinations;
+  caller's encryptor encrypted zero frames with a raw16 present;
 * ``audio_stream_connection_id`` was written and never read, by symmetry
   with a video field that genuinely is the single source of truth.
 
@@ -182,8 +163,6 @@ with its source, and the suite run:
   the fake's message claims to check boundness and only checks the range.
 * ``streamConnectionID`` (video) -- announced vs the id folded into the key.
   Was unguarded in the direction that matters, and guarded in the other.
-* ``networkInfo.Port`` -- announced vs the source port datagrams leave from.
-  Was unguarded.
 * ``controlPort`` (audio) -- announced vs the socket the sync is sent from.
 * ``eiv`` (audio and video) -- announced vs the iv used to encrypt.
 
@@ -202,11 +181,9 @@ sites, ten killed.
 The fourteen survivors are not fourteen gaps.  Three were dead: the
 ``MirrorVideo-*`` HKDF labels had no reader at all, because the video key
 turned out to be FairPlay-derived rather than HAP-derived, and they have been
-removed.  The rest are the HKDF salt and info strings on the AVConference and
-event-channel paths, and ``session.py`` says plainly above them that the
-exact strings a receiver expects are unconfirmed.  Pinning a provisional
-value would freeze a guess and make the eventual correction look like a
-regression.
+removed.  The rest were HKDF salt and info strings on a dialect that has
+since been removed, whose exact values a receiver expects were unconfirmed.
+Pinning a provisional value would have frozen a guess.
 
 That is the honest reading of a survivor list on a protocol reimplementation:
 some entries are missing tests, some are dead code, and some are work that is
@@ -219,11 +196,9 @@ equally well:
 
 * audio ``dataPort`` and the sync's ``controlPort`` -- caught in 0.3s.
 * ``eventPort`` -- caught; TCP, so a wrong port is refused at connect.
-* video ``dataPort``, TCP dialect -- caught; TCP again.
-* video ``dataPort``, AVConference -- caught only by every frame-waiting test
-  hitting its guard timeout, which cost ten minutes and named nothing.  UDP
-  from an already-bound socket: no refusal, no ICMP, frames simply vanish.
-  Now asserted directly, and fails in under a second.
+* video ``dataPort`` -- caught; TCP again.  (A UDP video path, since
+  removed, was caught only by every frame-waiting test hitting its guard
+  timeout, which cost ten minutes and named nothing.)
 
 The lesson is that "is it caught" and "how long does it take to say so" are
 different questions, and only the second one distinguishes a usable failure
@@ -247,21 +222,17 @@ suite with the new test *deselected*.  If it dies there, the new test is
 redundant for that mutation.  It costs one extra run and it is the difference
 between "this test is sensitive" and "this test is needed".
 
-ON TEST DOUBLES THAT HIDE THE BUG.  ``driven_session``'s verifier is a
-MagicMock whose ``encryption_keys`` returns one fixed pair whatever it is
-asked for.  A real HKDF is argument-sensitive, and the difference is not
-cosmetic: deriving the DataStream key from the wrong streamConnectionID
-changes only the salt, so under the fixed double that mutant is *equivalent*
-and no assertion can catch it.  ``test_session.py``'s
-``test_srtp_secret_datastream_keys_the_wire_from_the_setup_time_key``
-gives the double a salt-dependent side_effect for that reason.  When a
-mutation survives, check whether a double flattened the thing it mutated
-before concluding the test is at fault.
+ON TEST DOUBLES THAT HIDE THE BUG.  A MagicMock that returns one fixed
+value whatever it is asked for can make a mutant *equivalent*: a real HKDF
+is argument-sensitive, and deriving from the wrong input under a fixed
+double changes nothing observable.  When a mutation survives, check whether
+a double flattened the thing it mutated before concluding the test is at
+fault.
 
 RUNNING THIS SUITE ON LINUX FROM A MAC.  CI covers ubuntu, macos and
-windows; a developer on one of them covers one.  That gap hid a real bug --
-the ``cc`` derivation case calls Apple's CommonCrypto SPI and would have
-failed on two of the three -- so it is worth the ten minutes occasionally.
+windows; a developer on one of them covers one.  That gap once hid a real
+bug -- a case calling Apple's CommonCrypto SPI would have failed on two of
+the three -- so it is worth the ten minutes occasionally.
 The recipe, which took several attempts:
 
 * Install from ``requirements/requirements.txt`` and
@@ -276,10 +247,6 @@ The recipe, which took several attempts:
   sync test reads the devirt sources, and ``out/`` is 464MB of oracle.
   Without it, thirteen tests fail for a reason that is not about the code;
   that noise is easy to mistake for a platform problem.
-
-Skips differ by design: 1 here, 7 on Linux, and the six extra are the
-darwin-only ``CCKeyDerivationHMac`` cases.  A Linux run showing the same
-skip count as a Mac one means the guards stopped working.
 
 RUN THIS SUITE IN A RANDOM ORDER OCCASIONALLY.  ``-p no:randomly`` is passed
 almost everywhere here out of habit, and ``pytest-randomly`` is not a declared
@@ -303,7 +270,7 @@ includes a commit gate that runs pytest.  Fine in a scratch environment,
 disruptive in the one used to decide whether a commit is good.
 
 ON THE BROAD EXCEPT HANDLERS, WHICH ARE NOT A BLIND SPOT.  ``session.py``
-has ten ``except Exception`` handlers that only log or pass, and a mutation
+has seven ``except Exception`` handlers that only log or pass, and a mutation
 sweep cannot see past one: an error the handler swallows is an error no
 assertion hears.  So they were tested the other way round -- by injecting a
 fault inside each ``try`` rather than mutating it.

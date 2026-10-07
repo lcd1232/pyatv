@@ -4,8 +4,6 @@ import asyncio
 import contextlib
 import hashlib
 from pathlib import Path
-import re
-import socket
 import struct
 import sys
 from unittest.mock import AsyncMock, MagicMock
@@ -13,15 +11,7 @@ from unittest.mock import AsyncMock, MagicMock
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 import pytest
 
-from pyatv.protocols.airplay.mirror import (
-    context,
-    framing,
-    rtp,
-    screen_audio,
-    session,
-    srtp,
-    streams,
-)
+from pyatv.protocols.airplay.mirror import context, framing, screen_audio, session
 from pyatv.protocols.raop.packets import SyncPacket
 
 from tests.protocols.airplay.mirror.test_session_error_paths import (
@@ -57,123 +47,6 @@ def _ok(body=b""):
     return r
 
 
-async def test_session_init_setup_matches_captured_shape(monkeypatch):
-    """Session-init SETUP must match the real macOS sender captured in Phase 28.
-
-    Ground truth: docs/superpowers/specs/airplay_capture/proxy_captures/
-    capture-20260822-091057.jsonl (seq 35). The receiver drops the connection
-    outright if ekey/eiv/et appear here, and 400s if the mirror marker is
-    missing, so both are asserted.
-    """
-    import plistlib
-
-    # These assert the macOS-AVConference dialect (non-default). TCP mode
-    # skips the session-init SETUP, so force the AVConference path here.
-    monkeypatch.setenv("MIRROR_TCP", "0")
-
-    session_ok = _ok(plistlib.dumps({"eventPort": 49641}, fmt=plistlib.FMT_BINARY))
-    rtsp = _fake_rtsp([session_ok], _ok())
-
-    ctx = context.MirrorContext(
-        stream_encryptor=framing.MirrorEncryptor.from_key_iv(b"\x00" * 16, b"\x01" * 16)
-    )
-    s = session.MirrorSession(
-        rtsp=rtsp,
-        verifier=MagicMock(),
-        ctx=ctx,
-        h264_path=TEST_FILE,
-        channel_opener=AsyncMock(return_value=(MagicMock(), MagicMock())),
-    )
-
-    await s._setup_session()
-
-    body = rtsp.setup.call_args.kwargs["body"]
-    assert body["isScreenMirroringSession"] is True
-    assert body["timingProtocol"] == "NTP"
-    assert body["isMultiSelectAirPlay"] is False
-    assert body["statsCollectionEnabled"] is False
-    assert body["updateSessionRequest"] is False
-    assert isinstance(body["timingPort"], int) and body["timingPort"] > 0
-    assert "streams" not in body
-
-    # Both identifiers are fresh upper-case UUIDs. Shape only: whether
-    # sessionCorrelationUUID is meant to equal sessionUUID, or to correlate
-    # something else entirely, is not established by any capture we have --
-    # so this pins that it is a well-formed UUID and not, say, None or
-    # lower-cased, without asserting a relationship nobody has verified.
-    for key in ("sessionUUID", "sessionCorrelationUUID"):
-        assert re.fullmatch(r"[0-9A-F]{8}(-[0-9A-F]{4}){3}-[0-9A-F]{12}", body[key]), (
-            key,
-            body[key],
-        )
-    # These caused a silent connection drop in Phase 27 — FPLY v3 already
-    # established keying and the receiver treats a re-send as a downgrade.
-    for forbidden in ("ekey", "eiv", "et"):
-        assert forbidden not in body
-
-    assert ctx.event_port == 49641
-
-
-async def test_session_stream_setup_matches_captured_shape(monkeypatch):
-    """Stream SETUP must carry the AVConf/Viceroy fields, not AirPlay-1 ones."""
-    import plistlib
-
-    # AVConference dialect (non-default); TCP mode uses the type-110
-    # simple body, so force the AVConference path for this shape assertion.
-    monkeypatch.setenv("MIRROR_TCP", "0")
-
-    stream_ok = _ok(
-        plistlib.dumps(
-            {
-                "streams": [
-                    {
-                        "type": 110,
-                        "dataPort": 54595,
-                        "streamConnections": {
-                            "streamConnectionTypeMediaDataControl": {
-                                "streamConnectionKeyPort": 49642
-                            }
-                        },
-                    }
-                ]
-            },
-            fmt=plistlib.FMT_BINARY,
-        )
-    )
-    rtsp = _fake_rtsp([stream_ok], _ok())
-
-    ctx = context.MirrorContext(
-        stream_encryptor=framing.MirrorEncryptor.from_key_iv(b"\x00" * 16, b"\x01" * 16)
-    )
-    # The screen-video key is derived via verifier.encryption_keys (DataStream
-    # HKDF over the pair-verify secret); it must return a pair of 32-byte keys.
-    verifier = MagicMock()
-    verifier.encryption_keys.return_value = (b"\x11" * 32, b"\x22" * 32)
-    s = session.MirrorSession(
-        rtsp=rtsp,
-        verifier=verifier,
-        ctx=ctx,
-        h264_path=TEST_FILE,
-        channel_opener=AsyncMock(return_value=(MagicMock(), MagicMock())),
-    )
-
-    await s._setup_streams()
-
-    stream = rtsp.setup.call_args.kwargs["body"]["streams"][0]
-    assert stream["type"] == 110
-    assert stream["useAVConfMirroring"] is True
-    assert isinstance(stream["encryptionSeed"], int)
-    assert isinstance(stream["negotiationData"], bytes)
-    control = stream["streamConnections"]["streamConnectionTypeMediaDataControl"]
-    assert isinstance(control["streamConnectionKeyEncryptionSeed"], int)
-    # AirPlay-1 fields the modern receiver rejects.
-    for forbidden in ("latencyMs", "wantsDedicatedSocket", "ekey", "eiv"):
-        assert forbidden not in stream
-
-    assert ctx.video_data_port == 54595
-    assert ctx.stream_control_port == 49642
-
-
 async def test_session_never_sends_announce():
     """The modern mirror flow has no ANNOUNCE/SDP at all (Phase 28 capture)."""
     import plistlib
@@ -189,7 +62,6 @@ async def test_session_never_sends_announce():
         verifier=MagicMock(),
         ctx=ctx,
         h264_path=TEST_FILE,
-        channel_opener=AsyncMock(return_value=(MagicMock(), MagicMock())),
     )
 
     await s._setup_session()
@@ -209,7 +81,6 @@ async def test_session_stop_calls_teardown():
         verifier=MagicMock(),
         ctx=context.MirrorContext(),
         h264_path=TEST_FILE,
-        channel_opener=AsyncMock(),
     )
     await s.stop()
     rtsp.teardown.assert_awaited_once_with(999)
@@ -224,12 +95,10 @@ async def test_session_run_requires_stream_encryptor():
         verifier=MagicMock(),
         ctx=ctx,
         h264_path=TEST_FILE,
-        channel_opener=AsyncMock(),
     )
     # Call the streaming phase directly with no channels — it must check
     # the encryptor before doing anything that would NPE later.
     s._video_channel = MagicMock()
-    s._audio_channel = MagicMock()
     with pytest.raises(RuntimeError):
         # Wrap with timeout so a stuck producer doesn't hang the test
         await asyncio.wait_for(s._stream_until_done(), timeout=1.0)
@@ -248,120 +117,7 @@ async def test_session_run_requires_stream_encryptor():
 # tell apart from the original.
 
 
-def _srtp_decrypt(datagram: bytes, session_key: bytes, session_salt: bytes) -> bytes:
-    """Decrypt one mirror RTP datagram's payload as the receiver would.
-
-    ``roc`` is 0 because only the first datagram of a session is ever passed
-    here, and the roll-over counter cannot have advanced by then.
-    """
-    parsed = rtp.parse_header(datagram)
-    iv = srtp.srtp_iv(session_salt, parsed["ssrc"], 0, parsed["sequence"])
-    return (
-        Cipher(algorithms.AES(session_key), modes.CTR(iv))
-        .decryptor()
-        .update(parsed["payload"])
-    )
-
-
-def _is_avcc_access_unit(plaintext: bytes) -> bool:
-    """True if *plaintext* is a well-formed AVCC unit (4-byte BE length + NAL).
-
-    This is the decrypt oracle. The sender packetizes ``len(nal)`` big-endian
-    followed by the NAL itself, so a correct key yields a length prefix that
-    agrees with the payload it precedes and a NAL header in range. A wrong key
-    yields uniformly random bytes, which satisfy that by chance with
-    probability ~2**-32.
-    """
-    if len(plaintext) < 5:
-        return False
-    if int.from_bytes(plaintext[:4], "big") != len(plaintext) - 4:
-        return False
-    return 1 <= (plaintext[4] & 0x1F) <= 12
-
-
-@pytest.mark.parametrize(
-    "kdf_env,expect_kdf",
-    [(None, True), ("1", True), ("2", True), ("0", False)],
-    ids=["unset", "one", "two", "zero"],
-)
-async def test_srtp_kdf_env_selects_the_derivation_that_encrypts_the_wire(
-    monkeypatch, kdf_env, expect_kdf
-):
-    """``MIRROR_SRTP_KDF`` must pick the session key the sender really uses.
-
-    The switch chooses between two *different* derivations of the SRTP session
-    key from the same master material -- the SP800-108 counter-mode KDF, and
-    the master key/salt taken verbatim. ``test_srtp.py`` pins both derivations
-    at the ``srtp`` layer, where they are arguments; what nothing pinned was
-    that session.py reads the flag the right way round. Inverting the
-    comparison therefore swapped one derivation for the other with the whole
-    suite still green, which is a silently unplayable stream.
-
-    Only "0" disables the KDF ("1" is the default and any other value is not
-    "0"), so the parametrization covers both sides of that comparison.
-
-    session.py reads this variable in two places; this covers the one on the
-    default ``MIRROR_SRTP_SECRET="fply"`` path. The other guards the
-    ``"pairverify"`` A/B path, whose derivation is macOS-only.
-    """
-    if kdf_env is None:
-        monkeypatch.delenv("MIRROR_SRTP_KDF", raising=False)
-    else:
-        monkeypatch.setenv("MIRROR_SRTP_KDF", kdf_env)
-
-    # The AVConference dialect is the one whose UDP producer encrypts through
-    # the SRTP encryptors; the TCP dialect uses a continuous keystream
-    # instead and would never exercise this switch.
-    async with driven_session(monkeypatch, tcp=False) as (receiver, sess):
-        # The default MIRROR_SRTP_SECRET="fply" path builds the SRTP master
-        # material out of the FairPlay stream key/iv, and only when both are
-        # long enough. The handshake against the fake yields an encryptor that
-        # remembers neither, so give it a key and iv -- without them the
-        # session never reaches the switch under test at all.
-        sess._ctx.stream_encryptor = framing.MirrorEncryptor.from_key_iv(
-            bytes(range(0x10, 0x20)), bytes(range(0x30, 0x40))
-        )
-        await stream_then_stop(receiver, sess)
-
-    datagrams = receiver.video_server.datagrams
-    assert datagrams, "no video datagram reached the receiver"
-    first = datagrams[0]
-    assert rtp.parse_header(first)["fragment_count"] == 1, "frame was fragmented"
-
-    # The master material is the FairPlay stream key/iv, which the session
-    # reached by the default MIRROR_SRTP_SECRET="fply" path.
-    stream_encryptor = sess._ctx.stream_encryptor
-    master_key, master_salt = srtp.derive_master_key_salt(
-        stream_encryptor.key[:16] + stream_encryptor.iv[:14]
-    )
-    ssrc = rtp.parse_header(first)["ssrc"]
-
-    with_kdf = srtp.derive_session_key_salt(master_key, master_salt, ssrc, use_kdf=True)
-    without_kdf = (master_key[:16], master_salt[:14])
-    # If these agreed the test below could not tell the settings apart.
-    assert with_kdf != without_kdf, "the two derivations produced the same key"
-
-    decrypts_with_kdf = _is_avcc_access_unit(_srtp_decrypt(first, *with_kdf))
-    decrypts_without_kdf = _is_avcc_access_unit(_srtp_decrypt(first, *without_kdf))
-
-    assert decrypts_with_kdf is expect_kdf, (
-        f"MIRROR_SRTP_KDF={kdf_env!r}: the wire "
-        f"{'did not decrypt' if expect_kdf else 'decrypted'} under the "
-        "SP800-108 session KDF"
-    )
-    assert decrypts_without_kdf is (not expect_kdf), (
-        f"MIRROR_SRTP_KDF={kdf_env!r}: the wire "
-        f"{'decrypted' if expect_kdf else 'did not decrypt'} under the raw "
-        "master material"
-    )
-
-
-@pytest.mark.parametrize(
-    "raw16_off_env,expected_off", [(None, 8), ("12", 12)], ids=["default", "override"]
-)
-async def test_video_key_falls_back_to_a_16_byte_sap_context_slice(
-    monkeypatch, raw16_off_env, expected_off
-):
+async def test_video_key_falls_back_to_a_16_byte_sap_context_slice(monkeypatch):
     """Without an ekey raw16, the video key comes from 16 bytes of SAP context.
 
     ``stream_raw16`` is the value the sender packaged into ``ekey``, and is
@@ -375,10 +131,7 @@ async def test_video_key_falls_back_to_a_16_byte_sap_context_slice(
     the context holds the secret at ``[8:24]``; this covers the branch that
     actually does that indexing.
     """
-    if raw16_off_env is None:
-        monkeypatch.delenv("MIRROR_RAW16_OFF", raising=False)
-    else:
-        monkeypatch.setenv("MIRROR_RAW16_OFF", raw16_off_env)
+    expected_off = 8
 
     # Distinctive bytes, so "the right 16" is a real claim and not satisfied
     # by any slice of the same length.
@@ -448,8 +201,6 @@ async def test_audio_sync_packet_reports_a_50ms_latency(monkeypatch, tmp_path):
     eld_file = tmp_path / "audio.eld"
     frame = b"\xde\xad\xbe\xef"
     eld_file.write_bytes(len(frame).to_bytes(4, "big") + frame)
-    monkeypatch.setenv("MIRROR_AUDIO_ELD_FILE", str(eld_file))
-    monkeypatch.setenv("MIRROR_PAIR32", "66" * 32)
 
     rtsp = _fake_rtsp([], _ok())
     rtsp.connection.remote_ip = "127.0.0.1"
@@ -466,7 +217,8 @@ async def test_audio_sync_packet_reports_a_50ms_latency(monkeypatch, tmp_path):
         verifier=MagicMock(),
         ctx=ctx,
         h264_path=TEST_FILE,
-        channel_opener=AsyncMock(),
+        eld_path=eld_file,
+        pair_secret=b"\x66" * 32,
     )
     # The first sync is sent before the send loop's first stop check, so a
     # session that is already stopped still emits exactly one and then
@@ -486,275 +238,6 @@ async def test_audio_sync_packet_reports_a_50ms_latency(monkeypatch, tmp_path):
     assert latency_samples / screen_audio.AUDIO_SAMPLE_RATE == pytest.approx(
         0.050
     ), f"sync advertised {latency_samples} samples of latency"
-
-
-async def test_srtp_secret_datastream_keys_the_wire_from_the_setup_time_key(
-    monkeypatch,
-):
-    """``MIRROR_SRTP_SECRET="datastream"`` streams under the DataStream HKDF key.
-
-    ``ctx.datastream_video_key`` is derived once, at SETUP time, from the
-    pair-verify HKDF that the AVConference receiver uses
-    (``derive_datastream_video_key``).  It is read back in exactly one place:
-    the last arm of the SRTP master-material chain.
-
-    That arm never executed.  The default ``MIRROR_SRTP_SECRET="fply"`` arm
-    sits directly above it and wins whenever a stream encryptor carries a key
-    and iv, so the whole write/read pair -- a key derived in one method and
-    consumed in another, several hundred lines apart -- was unverified: the
-    field could have been derived from the wrong arguments, or never read.
-
-    Selecting the datastream source and decrypting the wire under it proves
-    both halves agree.  The negative half matters just as much: if the stream
-    still decrypted under the fply material, the switch would not have
-    selected anything.
-    """
-    monkeypatch.setenv("MIRROR_SRTP_SECRET", "datastream")
-
-    async with driven_session(monkeypatch, tcp=False) as (receiver, sess):
-        # Give the fply arm above the material it needs, so this test fails if
-        # the chain ever prefers it again rather than passing by default.
-        sess._ctx.stream_encryptor = framing.MirrorEncryptor.from_key_iv(
-            bytes(range(0x10, 0x20)), bytes(range(0x30, 0x40))
-        )
-        # The shared verifier double returns one fixed pair whatever it is
-        # asked for, which makes the salt -- and so the streamConnectionID
-        # inside it -- invisible: deriving the key from the wrong id would
-        # produce the same bytes. A real HKDF is argument-sensitive, so make
-        # this one depend on the salt it is given.
-        sess._verifier.encryption_keys.side_effect = lambda salt, out, inp: (
-            hashlib.sha512(f"{salt}|{out}".encode()).digest()[:32],
-            hashlib.sha512(f"{salt}|{inp}".encode()).digest()[:32],
-        )
-        await stream_then_stop(receiver, sess)
-        datastream_key = sess._ctx.datastream_video_key
-        fply = sess._ctx.stream_encryptor
-        verifier = sess._verifier
-        stream_id = sess._ctx.stream_connection_id
-
-    assert datastream_key is not None, "the DataStream key was never derived"
-
-    # Recomputed independently rather than read back off the context: taking
-    # the session's own value would verify only that the write and the read
-    # agree, and would still pass if the key were derived from the wrong
-    # stream id.
-    assert datastream_key == framing.derive_datastream_video_key(
-        verifier, stream_id
-    ), "the DataStream key was not derived from this session's stream id"
-
-    # ...and the salt it asked for, spelled out. The comparison above calls
-    # the same function the session did, so anything wrong INSIDE that
-    # function cancels on both sides -- swapping the two halves of
-    # "DataStream-Salt" + str(id) changes every key it derives and leaves
-    # that assertion true. The id is formatted unsigned (%llu).
-    salts = [
-        call.args[0]
-        for call in verifier.encryption_keys.call_args_list
-        if call.args and str(call.args[0]).startswith("DataStream")
-    ]
-    assert salts, "the DataStream key was never asked of the verifier"
-    wanted = "DataStream-Salt" + str(stream_id & 0xFFFFFFFFFFFFFFFF)
-    assert salts[0] == wanted, "asked for salt %r, wanted %r" % (salts[0], wanted)
-
-    datagrams = receiver.video_server.datagrams
-    assert datagrams, "no video datagram reached the receiver"
-    first = datagrams[0]
-    ssrc = rtp.parse_header(first)["ssrc"]
-
-    def session_keys(material: bytes):
-        master_key, master_salt = srtp.derive_master_key_salt(material)
-        return srtp.derive_session_key_salt(master_key, master_salt, ssrc, use_kdf=True)
-
-    from_datastream = session_keys(datastream_key)
-    from_fply = session_keys(fply.key[:16] + fply.iv[:14])
-    assert from_datastream != from_fply, "the two sources produced the same key"
-
-    assert _is_avcc_access_unit(
-        _srtp_decrypt(first, *from_datastream)
-    ), "the wire did not decrypt under the DataStream HKDF key"
-    assert not _is_avcc_access_unit(
-        _srtp_decrypt(first, *from_fply)
-    ), "the wire decrypted under the fply material, so the switch selected nothing"
-
-
-@pytest.mark.parametrize("deriv", [None, "direct"])
-@pytest.mark.asyncio
-async def test_keybuf_deriv_chooses_where_the_window_key_comes_from(monkeypatch, deriv):
-    """``MIRROR_KEYBUF_DERIV``, in the arm the note called untested.
-
-    The reason recorded there was that these sweeps need a receiver that
-    decrypts. They do, to say whether a derivation is *right*; they do not
-    to say which one the session picked, and picking the wrong one is what
-    the switch can get wrong. ``"direct"`` takes the window's first 16 bytes
-    as the key verbatim; anything else runs them through
-    ``stream_key_iv_from_secret``. Inverting the comparison swaps the two.
-
-    The spy has to look at the argument rather than the call. The proven
-    key path reaches the same function through
-    ``derive_tcp_stream_key_iv``, so it is called either way -- what
-    only happens on the non-direct branch is being called with the window.
-    """
-    context = bytes(range(64))
-    window = context[8:24]
-
-    seen: list = []
-    real = framing.stream_key_iv_from_secret
-
-    def spy(secret, stream_id, *args, **kwargs):
-        seen.append(bytes(secret))
-        return real(secret, stream_id, *args, **kwargs)
-
-    monkeypatch.setattr(framing, "stream_key_iv_from_secret", spy)
-    monkeypatch.setenv("MIRROR_KEYBUF_WINDOW", "8:24")
-    if deriv is not None:
-        monkeypatch.setenv("MIRROR_KEYBUF_DERIV", deriv)
-
-    async with driven_session(monkeypatch, tcp=True) as (receiver, sess):
-        sess._ctx.sap_context = context  # noqa: SLF001
-        await stream_then_stop(receiver, sess)
-
-    if deriv == "direct":
-        assert window not in seen, "direct should not derive from the window"
-    else:
-        assert window in seen, "the window was never run through the derivation"
-
-
-@pytest.mark.parametrize("mode, expect_used", [("continuous", True), ("srtp", False)])
-@pytest.mark.asyncio
-async def test_keybuf_mode_decides_whether_the_window_key_becomes_a_cipher(
-    monkeypatch, mode, expect_used
-):
-    """``MIRROR_KEYBUF_MODE``, and with it the width of the direct slice.
-
-    ``"continuous"`` turns the window key into a ``MirrorEncryptor``;
-    anything else parks it as an SRTP key/salt pair that the TCP
-    dialect never reaches. So the same wrong key is inert under the default
-    and live under the switch, which is why the slice width is checked here
-    rather than alongside the derivation: taking 15 bytes instead of 16
-    leaves an unusable key that nothing objects to until it has to encrypt.
-
-    As before the spy reads its argument. The proven key path builds an
-    encryptor of its own, so ``from_key_iv`` is called whichever way the
-    switch goes; only one of them passes the window.
-    """
-    context = bytes(range(64))
-    window = context[8:24]
-
-    keys: list = []
-    real = framing.MirrorEncryptor.from_key_iv
-
-    def spy(key, iv, *args, **kwargs):
-        keys.append(bytes(key))
-        return real(key, iv, *args, **kwargs)
-
-    monkeypatch.setattr(framing.MirrorEncryptor, "from_key_iv", spy)
-    monkeypatch.setenv("MIRROR_KEYBUF_WINDOW", "8:24")
-    monkeypatch.setenv("MIRROR_KEYBUF_DERIV", "direct")
-    monkeypatch.setenv("MIRROR_KEYBUF_MODE", mode)
-
-    async with driven_session(monkeypatch, tcp=True) as (receiver, sess):
-        sess._ctx.sap_context = context  # noqa: SLF001
-        await stream_then_stop(receiver, sess)
-
-    if expect_used:
-        assert (
-            window in keys
-        ), "continuous mode should encrypt with the window's 16 bytes; got %s" % [
-            k.hex() for k in keys
-        ]
-    else:
-        assert window not in keys, "srtp mode should not build a cipher from it"
-
-
-@pytest.mark.parametrize(
-    "kdf",
-    [
-        "direct",
-        "aescm",
-        # AVConference's KDF is CommonCrypto, loaded from
-        # /usr/lib/system/libcommonCrypto.dylib, so the branch that calls it
-        # cannot run anywhere else -- `test_srtp` guards its own cc cases the
-        # same way. Without this the case fails on two of CI's three
-        # platforms, which is how it was found: in a Linux container.
-        pytest.param(
-            "cc",
-            marks=pytest.mark.skipif(
-                sys.platform != "darwin",
-                reason="CCKeyDerivationHMac is macOS-only",
-            ),
-        ),
-    ],
-)
-@pytest.mark.asyncio
-async def test_keybuf_srtp_kdf_picks_one_of_three_session_derivations(monkeypatch, kdf):
-    """``MIRROR_KEYBUF_SRTP_KDF``, in the ``srtp`` half of the keybuf path.
-
-    Three derivations of a session key from the same keybuf pair: taken
-    verbatim, through the RFC 3711 AES-CM KDF, or through AVConference's
-    HMAC construction. Each is pinned at the ``srtp`` layer already; what
-    was not pinned is that session.py dispatches on the name correctly, and
-    two of the three comparisons could be inverted without a failure.
-
-    Exactly one of the two derivations runs, and "direct" runs neither --
-    which is the whole content of the switch, and is visible without
-    knowing what any of them should produce.
-    """
-    context = bytes(range(64))
-    called: list = []
-
-    real_aescm = srtp.derive_srtp_session_aescm
-    real_cc = srtp._cc_key_derivation_hmac  # noqa: SLF001
-
-    def spy_aescm(*args, **kwargs):
-        called.append("aescm")
-        return real_aescm(*args, **kwargs)
-
-    contexts: list = []
-
-    def spy_cc(*args, **kwargs):
-        called.append("cc")
-        contexts.append(bytes(args[3]) if len(args) > 3 else b"")
-        return real_cc(*args, **kwargs)
-
-    built: list = []
-    real_enc = srtp.SrtpVideoEncryptor
-
-    def spy_enc(key, salt, *args, **kwargs):
-        built.append((len(key), len(salt)))
-        return real_enc(key, salt, *args, **kwargs)
-
-    monkeypatch.setattr(srtp, "derive_srtp_session_aescm", spy_aescm)
-    monkeypatch.setattr(srtp, "_cc_key_derivation_hmac", spy_cc)
-    monkeypatch.setattr(srtp, "SrtpVideoEncryptor", spy_enc)
-    monkeypatch.setenv("MIRROR_KEYBUF_WINDOW", "8:24")
-    monkeypatch.setenv("MIRROR_KEYBUF_DERIV", "direct")
-    monkeypatch.setenv("MIRROR_KEYBUF_MODE", "srtp")
-    monkeypatch.setenv("MIRROR_KEYBUF_SRTP_KDF", kdf)
-
-    async with driven_session(monkeypatch, tcp=True) as (receiver, sess):
-        sess._ctx.sap_context = context  # noqa: SLF001
-        await stream_then_stop(receiver, sess)
-
-    if kdf == "direct":
-        assert not called, "direct should derive nothing, ran %s" % called
-    else:
-        assert kdf in called, "%s was selected but %s ran" % (kdf, called or "nothing")
-        assert set(called) == {kdf}, "both derivations ran: %s" % called
-
-    if kdf == "cc":
-        # MIRROR_KEYBUF_CC_CONTEXT defaults to "derived", which feeds the
-        # first four bytes of the media key as the derivation context. The
-        # alternative is no context at all, and the two produce different
-        # session keys from identical inputs.
-        assert contexts and all(
-            len(c) == 4 for c in contexts
-        ), "derived context should be 4 bytes, got %s" % [c.hex() for c in contexts]
-        # The 30-byte output splits 16/14 into key and salt, both sliced out
-        # by hand. A slice that runs short still looks like a key to SRTP and
-        # nothing downstream objects, so the widths are asserted here.
-        assert built and set(built) == {(16, 14)}, (
-            "cc derivation produced key/salt widths %s, wanted (16, 14)" % built
-        )
 
 
 @pytest.mark.asyncio
@@ -781,7 +264,7 @@ async def test_a_wrong_length_raw16_falls_back_instead_of_being_used(monkeypatch
 
     monkeypatch.setattr(framing, "derive_tcp_stream_key_iv", spy)
 
-    async with driven_session(monkeypatch, tcp=True) as (receiver, sess):
+    async with driven_session(monkeypatch) as (receiver, sess):
         sess._ctx.stream_raw16 = b"\xc0" * 8  # noqa: SLF001  truthy, too short
         sess._ctx.sap_context = context  # noqa: SLF001
         await stream_then_stop(receiver, sess)
@@ -810,10 +293,11 @@ async def test_the_screen_audio_key_hashes_raw16_before_pair32(monkeypatch, tmp_
     frames = [bytes([0x51 + i]) * 48 for i in range(2)]
     eld = tmp_path / "keyed.eld"
     eld.write_bytes(b"".join(struct.pack(">I", len(f)) + f for f in frames))
-    monkeypatch.setenv("MIRROR_AUDIO_SEND", "1")
-    monkeypatch.setenv("MIRROR_AUDIO_ELD_FILE", str(eld))
 
-    async with driven_session(monkeypatch, tcp=True) as (receiver, sess):
+    async with driven_session(monkeypatch, session_kwargs={"eld_path": eld}) as (
+        receiver,
+        sess,
+    ):
         await stream_then_stop(receiver, sess, video_frames=3)
         packets = list(receiver.audio_data_server.datagrams)
         raw16 = sess._ctx.stream_raw16  # noqa: SLF001
@@ -835,53 +319,6 @@ async def test_the_screen_audio_key_hashes_raw16_before_pair32(monkeypatch, tmp_
 
 
 @pytest.mark.asyncio
-async def test_the_control_channel_salt_names_the_encryption_seed(monkeypatch):
-    """``MIRROR_CONTROL_SALT + str(seed)``, in that order.
-
-    The control channel's HAP keys come from a salt the receiver builds the
-    same way. Swapping the halves, or reading a different field for the
-    seed, yields a salt of the same shape and a channel neither side can
-    decrypt -- and the opener is a double in every test that reaches this
-    line, so nothing was looking at what it was handed.
-
-    ``_open_channels`` is driven directly rather than through a session run:
-    the argument is the whole subject, and a mock records it.
-    """
-    monkeypatch.setenv("MIRROR_TCP", "0")
-    opener = AsyncMock(return_value=(MagicMock(), MagicMock()))
-
-    ctx = context.MirrorContext(
-        stream_encryptor=framing.MirrorEncryptor.from_key_iv(b"\x00" * 16, b"\x01" * 16)
-    )
-    ctx.control_encryption_seed = 1234567890123456789
-    ctx.stream_control_port = 7001
-    ctx.audio_data_port = 0  # keep the audio channel out of this
-
-    sess = session.MirrorSession(
-        rtsp=_fake_rtsp([_ok()], _ok()),
-        verifier=MagicMock(),
-        ctx=ctx,
-        h264_path=TEST_FILE,
-        channel_opener=opener,
-    )
-
-    # The control channel is opened first; what follows it builds a real
-    # datagram endpoint to a port this session has not negotiated, and fails.
-    # That is past the subject -- the assertion below fails if the control
-    # channel was never opened at all, which is the only ordering that matters.
-    with contextlib.suppress(Exception):
-        await sess._open_channels()  # noqa: SLF001
-
-    salts = [
-        call.args[3]
-        for call in opener.call_args_list
-        if len(call.args) > 3 and isinstance(call.args[3], str)
-    ]
-    assert salts, "no channel was opened with a salt"
-    assert salts[0] == "DataStream-Salt1234567890123456789", salts[0]
-
-
-@pytest.mark.asyncio
 async def test_a_full_live_audio_queue_drops_the_oldest_frame(monkeypatch, tmp_path):
     """The audio queue's copy of the bounded-latency rule.
 
@@ -891,7 +328,7 @@ async def test_a_full_live_audio_queue_drops_the_oldest_frame(monkeypatch, tmp_p
     discarding them for the fresh ones.
 
     The reader's head start here is the sender's pre-buffer loop, which
-    sleeps in 50ms steps until the queue reaches ``MIRROR_AUDIO_PREBUFFER``.
+    sleeps in 50ms steps until the queue reaches ``AUDIO_PREBUFFER``.
     That is long enough for a reader with the whole source already in hand.
     Which frame arrives first is the question, so the packet is decrypted:
     dropping keeps the tail, dying keeps the head.
@@ -905,12 +342,13 @@ async def test_a_full_live_audio_queue_drops_the_oldest_frame(monkeypatch, tmp_p
         encoding="utf-8",
     )
 
-    monkeypatch.setenv("MIRROR_AUDIO_SEND", "1")
-    monkeypatch.setenv("MIRROR_AUDIO_LIVE_CMD", '"%s" "%s"' % (sys.executable, feeder))
-    monkeypatch.setenv("MIRROR_AUDIO_LIVE_BUFFER", "2")
-    monkeypatch.setenv("MIRROR_AUDIO_PREBUFFER", "2")
+    monkeypatch.setattr(session, "AUDIO_LIVE_BUFFER", 2)
+    monkeypatch.setattr(session, "AUDIO_PREBUFFER", 2)
+    audio_cmd = '"%s" "%s"' % (sys.executable, feeder)
 
-    async with driven_session(monkeypatch, tcp=True) as (receiver, sess):
+    async with driven_session(
+        monkeypatch, session_kwargs={"audio_command": audio_cmd}
+    ) as (receiver, sess):
         task = asyncio.ensure_future(sess.run())
         try:
             deadline = asyncio.get_event_loop().time() + GUARD_TIMEOUT
@@ -976,11 +414,12 @@ async def test_the_live_audio_reader_accepts_a_frame_of_exactly_the_cap(
         encoding="utf-8",
     )
 
-    monkeypatch.setenv("MIRROR_AUDIO_SEND", "1")
-    monkeypatch.setenv("MIRROR_AUDIO_LIVE_CMD", '"%s" "%s"' % (sys.executable, feeder))
-    monkeypatch.setenv("MIRROR_AUDIO_PREBUFFER", "3")
+    monkeypatch.setattr(session, "AUDIO_PREBUFFER", 3)
+    audio_cmd = '"%s" "%s"' % (sys.executable, feeder)
 
-    async with driven_session(monkeypatch, tcp=True) as (receiver, sess):
+    async with driven_session(
+        monkeypatch, session_kwargs={"audio_command": audio_cmd}
+    ) as (receiver, sess):
         task = asyncio.ensure_future(sess.run())
         try:
             deadline = asyncio.get_event_loop().time() + GUARD_TIMEOUT
@@ -1014,64 +453,3 @@ async def test_the_live_audio_reader_accepts_a_frame_of_exactly_the_cap(
 
     assert [len(g) for g in got] == [len(f) for f in frames], [len(g) for g in got]
     assert got == frames, "frames came back altered or out of order"
-
-
-@pytest.mark.asyncio
-async def test_the_avconference_audio_channel_uses_the_audio_salt(monkeypatch):
-    """The one media channel the suite never opened.
-
-    Audio is not part of the modern mirror SETUP, so this branch wants both
-    a negotiated ``audioDataPort`` and the AVConference dialect. Every test
-    has had one or the other and none has had both, which left the body
-    unexecuted: opening it, and which salt and channel class it opens with.
-
-    Those are worth pinning because they are a copy-paste apart from the
-    control channel's, three lines up, and getting them wrong yields a
-    channel that opens, encrypts under keys the receiver did not derive,
-    and carries audio nobody can decode. ``MirrorAudio-Salt`` is a bare
-    constant -- no stream id appended, unlike the control channel's -- so
-    it is the pairing of salt, info strings and channel class that matters.
-    """
-    monkeypatch.setenv("MIRROR_TCP", "0")
-    opener = AsyncMock(return_value=(MagicMock(), MagicMock()))
-
-    ctx = context.MirrorContext(
-        stream_encryptor=framing.MirrorEncryptor.from_key_iv(b"\x00" * 16, b"\x01" * 16)
-    )
-    ctx.stream_control_port = 7001
-    ctx.audio_data_port = 7002
-    ctx.video_data_port = 7003
-
-    sess = session.MirrorSession(
-        rtsp=_fake_rtsp([_ok()], _ok()),
-        verifier=MagicMock(),
-        ctx=ctx,
-        h264_path=TEST_FILE,
-        channel_opener=opener,
-    )
-
-    # `_setup_streams` normally binds this, and the datagram endpoint is
-    # handed the socket rather than an address so the announced
-    # networkInfo.Port is the one datagrams leave from. Without it the video
-    # step raises and the audio channel below is never reached.
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.bind(("127.0.0.1", 0))
-    sess._video_sock = sock  # noqa: SLF001
-    try:
-        await sess._open_channels()  # noqa: SLF001
-    finally:
-        await sess.stop()
-
-    audio_calls = [
-        call
-        for call in opener.call_args_list
-        if call.args and call.args[0] is streams.AudioStreamChannel
-    ]
-    assert audio_calls, "the audio channel was never opened: %s" % [
-        c.args[0].__name__ for c in opener.call_args_list if c.args
-    ]
-    _cls, _addr, port, salt, out_info, in_info = audio_calls[0].args[:6]
-    assert port == 7002, "opened on port %s, not the negotiated audioDataPort" % port
-    assert salt == "MirrorAudio-Salt", salt
-    assert out_info == "MirrorAudio-Output-Encryption-Key", out_info
-    assert in_info == "MirrorAudio-Input-Encryption-Key", in_info

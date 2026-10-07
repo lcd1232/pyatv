@@ -3,7 +3,7 @@
 ``session.py`` builds two SETUP plists whose values came off the wire from a
 real sender talking to a real tvOS 26 receiver -- ``latencyMin``/``Max``
 3750, ``redundantAudio`` 2, ``ct`` 8, ``audioFormat`` 0x1000000, ``et`` 32,
-the five ``timestampInfo`` probe names, and the AVConference display flags.
+and the five ``timestampInfo`` probe names.
 The receiver *interprets* every one of them, but
 :class:`~tests.protocols.airplay.mirror.fake_receiver.FakeMirrorReceiver`
 only dispatches on ``streams[0]["type"]`` and answers 200 to whatever else
@@ -35,7 +35,6 @@ import copy
 import pathlib
 import plistlib
 import struct
-import zlib
 
 import pytest
 
@@ -50,7 +49,6 @@ from pyatv.protocols.airplay.mirror import (
     tcp_stream,
 )
 from pyatv.protocols.airplay.mirror import session as session_mod
-from pyatv.protocols.airplay.mirror.context import MirrorContext
 from pyatv.protocols.raop.packets import TimingPacket
 from pyatv.support import http
 
@@ -64,36 +62,25 @@ from tests.protocols.airplay.mirror.test_session_error_paths import (
 pytestmark = pytest.mark.asyncio
 
 
-async def _captured_bodies(monkeypatch, *, tcp: bool):
+async def _captured_bodies(monkeypatch):
     """Run one real session to steady state and return its SETUP bodies."""
-    async with driven_session(monkeypatch, tcp=tcp) as (receiver, sess):
+    async with driven_session(monkeypatch) as (receiver, sess):
         await stream_then_stop(receiver, sess)
         return receiver.audio_setup_body, receiver.video_setup_body
 
 
 async def test_the_checks_run_against_a_live_session(monkeypatch):
-    """A real TCP-dialect session's SETUPs reach the checks and satisfy them.
+    """A real session's SETUPs reach the checks and satisfy them.
 
     Recording the bodies is what proves the checks were reached at all: an
     empty ``protocol_violations`` list is equally consistent with the checks
     having been dropped from ``_dispatch_setup``.
     """
-    async with driven_session(monkeypatch, tcp=True) as (receiver, sess):
+    async with driven_session(monkeypatch) as (receiver, sess):
         await stream_then_stop(receiver, sess)
 
         assert receiver.audio_setup_body is not None, "audio SETUP never checked"
         assert receiver.video_setup_body is not None, "video SETUP never checked"
-        assert receiver.protocol_violations == []
-
-
-async def test_the_checks_run_against_a_live_avconference_session(monkeypatch):
-    """The same, for the AVConference dialect, which has no audio SETUP."""
-    async with driven_session(monkeypatch, tcp=False) as (receiver, sess):
-        await stream_then_stop(receiver, sess)
-
-        assert receiver.session_setup_body is not None
-        assert receiver.video_setup_body is not None, "video SETUP never checked"
-        assert receiver.audio_setup_body is None, "AVConference sends no audio SETUP"
         assert receiver.protocol_violations == []
 
 
@@ -174,7 +161,7 @@ async def test_audio_setup_check_rejects_each_field(monkeypatch, path, bad):
     the sender still sends every field the check looks for -- a field renamed
     in ``session.py`` would make the unmutated body fail first.
     """
-    audio_body, _ = await _captured_bodies(monkeypatch, tcp=True)
+    audio_body, _ = await _captured_bodies(monkeypatch)
 
     assert fake_receiver.check_audio_setup(audio_body) == []
 
@@ -183,7 +170,7 @@ async def test_audio_setup_check_rejects_each_field(monkeypatch, path, bad):
     assert path[-1] in " ".join(problems), problems
 
 
-#: The type-110 video SETUP, TCP dialect.
+#: The type-110 video SETUP.
 VIDEO_TCP_MUTATIONS = [
     (["streams", 0, "type"], 111),
     # FairPlay SAP v3 keying for the screen video.
@@ -192,45 +179,20 @@ VIDEO_TCP_MUTATIONS = [
     (["sessionUUID"], "not-a-uuid"),
 ]
 
-#: The type-110 video SETUP, AVConference dialect.
-VIDEO_AVCONF_MUTATIONS = [
-    (["streams", 0, "type"], 111),
-    # Selects the AVConference pipeline; without it the receiver takes the
-    # legacy AirPlay-1 path and never renders.
-    (["streams", 0, "useAVConfMirroring"], False),
-    # The sender advertises an SDR pipeline and no HDR support; claiming HDR
-    # commits it to colour metadata it does not send.
-    (["streams", 0, "displayHDRMode"], "HDR"),
-    (["streams", 0, "hdrMirroringSupported"], True),
-    # 0 is plain mirroring, as opposed to the extended-display modes.
-    (["streams", 0, "streamMode"], 1),
-    # Receiver-side debug switches, off in the capture.
-    (["streams", 0, "remoteLogLevel"], 1),
-    (["streams", 0, "remoteShouldShowHUD"], True),
-    # The UDP source port the receiver filters our media on.
-    (["streams", 0, "networkInfo", "Port"], 0),
-    (["streams", 0, "encryptionSeed"], "not-an-int"),
-]
 
-
-@pytest.mark.parametrize(
-    "tcp,mutations",
-    [(True, VIDEO_TCP_MUTATIONS), (False, VIDEO_AVCONF_MUTATIONS)],
-    ids=["tcp", "avconference"],
-)
-async def test_video_setup_check_rejects_each_field(monkeypatch, tcp, mutations):
+async def test_video_setup_check_rejects_each_field(monkeypatch):
     """Changing any one checked field of a real video SETUP is reported.
 
-    Both dialects in one test: each needs its own live session, and running
-    one per parametrized field would pay for a full handshake per assertion.
+    One live session for all of them: running one per parametrized field
+    would pay for a full handshake per assertion.
     """
-    _, video_body = await _captured_bodies(monkeypatch, tcp=tcp)
+    _, video_body = await _captured_bodies(monkeypatch)
 
-    assert fake_receiver.check_video_setup(video_body, tcp) == []
+    assert fake_receiver.check_video_setup(video_body) == []
 
-    for path, bad in mutations:
+    for path, bad in VIDEO_TCP_MUTATIONS:
         mutated = _with(video_body, path, bad)
-        problems = fake_receiver.check_video_setup(mutated, tcp)
+        problems = fake_receiver.check_video_setup(mutated)
         assert problems, f"changing {'.'.join(str(s) for s in path)} was not noticed"
         assert path[-1] in " ".join(problems), (path, problems)
 
@@ -241,83 +203,29 @@ async def test_video_setup_check_rejects_a_changed_timestamp_probe(monkeypatch):
     They label the latency timestamps the receiver reports back, so a renamed
     or reordered probe is a protocol change, not a cosmetic one.
     """
-    _, video_body = await _captured_bodies(monkeypatch, tcp=True)
+    _, video_body = await _captured_bodies(monkeypatch)
 
     names = [entry["name"] for entry in video_body["streams"][0]["timestampInfo"]]
     assert names == fake_receiver.CAPTURED_TIMESTAMP_NAMES
 
     renamed = copy.deepcopy(video_body)
     renamed["streams"][0]["timestampInfo"][-1]["name"] = "XXXXX"
-    assert fake_receiver.check_video_setup(renamed, True)
+    assert fake_receiver.check_video_setup(renamed)
 
     reordered = copy.deepcopy(video_body)
     reordered["streams"][0]["timestampInfo"].reverse()
-    assert fake_receiver.check_video_setup(reordered, True)
-
-
-async def test_spf_follows_the_environment_rather_than_a_pinned_literal(monkeypatch):
-    """``spf`` is tunable via MIRROR_AUDIO_SPF, so it is checked against it.
-
-    Pinning 480 outright would make the override untestable and would fail
-    every run that sets it. The check instead asks for "the override, or the
-    captured default", which still catches the default being changed.
-    """
-    monkeypatch.setenv("MIRROR_AUDIO_SPF", "960")
-
-    audio_body, _ = await _captured_bodies(monkeypatch, tcp=True)
-
-    assert audio_body["streams"][0]["spf"] == 960
-    # Checked while the override is still set: the sender followed it.
-    assert fake_receiver.check_audio_setup(audio_body) == []
-    # And the captured default is what is expected once it is gone.
-    monkeypatch.delenv("MIRROR_AUDIO_SPF")
-    assert "spf" in " ".join(fake_receiver.check_audio_setup(audio_body))
-
-
-async def test_video_et_follows_the_environment_rather_than_a_pinned_literal(
-    monkeypatch,
-):
-    """``et`` is tunable via MIRROR_ET; 0 selects an unencrypted stream.
-
-    Same reasoning as ``spf``: pinned to the override when one is set, to the
-    captured 32 when there is not.
-    """
-    monkeypatch.setenv("MIRROR_ET", "0")
-
-    _, video_body = await _captured_bodies(monkeypatch, tcp=True)
-
-    assert video_body["et"] == 0
-    assert fake_receiver.check_video_setup(video_body, True) == []
-    monkeypatch.delenv("MIRROR_ET")
-    assert "et" in " ".join(fake_receiver.check_video_setup(video_body, True))
+    assert fake_receiver.check_video_setup(reordered)
 
 
 async def test_a_missing_captured_constant_is_reported_as_missing(monkeypatch):
     """A dropped key must not read as "nothing to compare, so fine"."""
-    audio_body, _ = await _captured_bodies(monkeypatch, tcp=True)
+    audio_body, _ = await _captured_bodies(monkeypatch)
 
     without_ct = copy.deepcopy(audio_body)
     del without_ct["streams"][0]["ct"]
 
     problems = fake_receiver.check_audio_setup(without_ct)
     assert any("ct missing" in problem for problem in problems), problems
-
-
-async def test_a_bool_is_not_accepted_where_an_int_was_captured(monkeypatch):
-    """``True == 1`` in Python, so the checks compare types as well.
-
-    ``streamMode: True`` would otherwise satisfy a captured ``0``... and more
-    to the point ``remoteLogLevel: 1`` would satisfy a captured ``True``.
-    plistlib encodes bool and int differently, so the receiver sees the
-    difference even when Python does not.
-    """
-    _, video_body = await _captured_bodies(monkeypatch, tcp=False)
-
-    as_bool = _with(video_body, ["streams", 0, "streamMode"], False)
-    assert fake_receiver.check_video_setup(as_bool, False)
-
-    as_int = _with(video_body, ["streams", 0, "hdrMirroringSupported"], 0)
-    assert fake_receiver.check_video_setup(as_int, False)
 
 
 async def test_the_inlined_audio_constants_still_match_the_tested_helper(monkeypatch):
@@ -335,7 +243,7 @@ async def test_the_inlined_audio_constants_still_match_the_tested_helper(monkeyp
     fails whichever of the two moves.  `controlPort` is per-session and
     rightly absent from a constants helper, so it is excluded.
     """
-    audio_body, _ = await _captured_bodies(monkeypatch, tcp=True)
+    audio_body, _ = await _captured_bodies(monkeypatch)
     sent = dict(audio_body["streams"][0])
     expected = screen_audio.audio_setup_stream_params(sent["streamConnectionID"])
 
@@ -344,111 +252,6 @@ async def test_the_inlined_audio_constants_still_match_the_tested_helper(monkeyp
     for name, value in expected.items():
         assert sent[name] == value, name
         assert type(sent[name]) is type(value), name  # noqa: E721 - bool vs int
-
-
-async def test_the_negotiation_blob_announces_the_geometry_being_streamed(monkeypatch):
-    """The blob must describe this session, not the capture machine.
-
-    Before `e56a640f` the geometry was patched as digits inside the already
-    compressed blob, and the patch was skipped unless the replacement was
-    exactly as wide as `756/491`.  `session.py` passes the real stream size,
-    so pyatv announced 756x491 while streaming 1920x1080.
-
-    `negotiation.py` is unit-tested and `session.py` passes the value, but
-    nothing joined the two: the fake only checked `negotiationData` was
-    present and was bytes.  This drives a real AVConference session -- the
-    only dialect that sends the blob at all -- and reads the geometry back
-    out of the bytes that reached the receiver.
-    """
-    _, video_body = await _captured_bodies(monkeypatch, tcp=False)
-    blob = video_body["streams"][0]["negotiationData"]
-    assert isinstance(blob, bytes)
-
-    media = plistlib.loads(blob)["avcMediaStreamNegotiatorMediaBlob"]
-    inflated = zlib.decompress(media)
-
-    # driven_session leaves MirrorContext at its defaults, so the blob must
-    # carry those -- and must NOT carry the capture machine's panel.
-    expected = f"{MirrorContext().width}/{MirrorContext().height}".encode()
-    assert expected in inflated, inflated[:64]
-    assert b"756/491" not in inflated
-
-
-async def test_the_endpoint_info_carries_this_sessions_identity(monkeypatch):
-    """model, endpoint_version and os_build_version must reach the wire.
-
-    `session.py` passes all three into `build_negotiation_data`, and they
-    are substituted into `avcMediaStreamOptionRemoteEndpointInfo` -- unlike
-    the media blob, which does not vary with them.  I checked that the
-    substitution works; what nothing checked is that the values arriving
-    there are this session's, which is the same seam the geometry bug ran
-    through: both halves tested, the join not.
-
-    Asserted against `MirrorContext`'s own defaults so the test follows the
-    context rather than pinning a copy of it.
-    """
-    _, video_body = await _captured_bodies(monkeypatch, tcp=False)
-    endpoint = plistlib.loads(video_body["streams"][0]["negotiationData"])[
-        "avcMediaStreamOptionRemoteEndpointInfo"
-    ]
-
-    ctx = MirrorContext()
-    for value in (ctx.model, ctx.endpoint_version, ctx.os_build_version):
-        assert value.encode() in endpoint, (value, endpoint)
-
-
-async def test_the_session_init_body_carries_this_sessions_identity(monkeypatch):
-    """Six identity fields go into the session-init SETUP; read them back.
-
-    `check_*_setup` deliberately does not pin these -- they are configurable
-    sender identity, not protocol, and pinning them would break any run that
-    changes them.  But "not pinned" was implemented as "not looked at", so
-    `session.py` could stop consulting the context for any of them and the
-    fake would still answer 200.  That is the seam the geometry bug ran
-    through, and this is the third place it exists.
-
-    Checking they EQUAL the context's values follows the context instead of
-    freezing it, so it costs nothing to a run that changes them.
-    """
-    async with driven_session(monkeypatch, tcp=False) as (receiver, sess):
-        await stream_then_stop(receiver, sess)
-        body = receiver.session_setup_body
-
-    assert body is not None, "no session-init SETUP was captured"
-    ctx = MirrorContext()
-    for key, expected in (
-        ("osName", ctx.os_name),
-        ("osVersion", ctx.os_version),
-        ("osBuildVersion", ctx.os_build_version),
-        ("sourceVersion", ctx.source_version),
-        ("model", ctx.model),
-        ("name", ctx.name),
-    ):
-        assert body[key] == expected, (key, body[key], expected)
-
-
-async def test_the_two_encryption_seeds_are_the_contexts_and_are_distinct(monkeypatch):
-    """Two independent 64-bit seeds; the wire must carry both, unmixed.
-
-    `session.py` draws `encryption_seed` and `control_encryption_seed` on
-    consecutive lines and puts one in the video stream and the other in its
-    media-data-control connection.  Everything checks only that each is an
-    int -- so sending the same seed for both, or sending something other
-    than what the context holds, passes today.
-
-    Reusing one seed across the media and control channels is the kind of
-    mistake a copy-paste makes and nothing here would have noticed.
-    """
-    async with driven_session(monkeypatch, tcp=False) as (receiver, sess):
-        await stream_then_stop(receiver, sess)
-        body, ctx = receiver.video_setup_body, sess._ctx  # noqa: SLF001
-
-    stream = body["streams"][0]
-    control = stream["streamConnections"]["streamConnectionTypeMediaDataControl"]
-
-    assert stream["encryptionSeed"] == ctx.encryption_seed
-    assert control["streamConnectionKeyEncryptionSeed"] == ctx.control_encryption_seed
-    assert ctx.encryption_seed != ctx.control_encryption_seed
 
 
 async def test_both_tcp_setups_agree_on_who_this_session_is(monkeypatch):
@@ -464,11 +267,8 @@ async def test_both_tcp_setups_agree_on_who_this_session_is(monkeypatch):
     ``_session_uuid`` is ever unset, each SETUP mints a *different* identity
     and the two streams claim to belong to different sessions.  That shared
     fallback is what this test is aimed at.
-
-    AVConference sends the triple once (in the session init) and its video
-    SETUP carries no identity at all, so there is no second copy to check.
     """
-    async with driven_session(monkeypatch, tcp=True) as (receiver, sess):
+    async with driven_session(monkeypatch) as (receiver, sess):
         await stream_then_stop(receiver, sess)
         audio, video = receiver.audio_setup_body, receiver.video_setup_body
 
@@ -495,7 +295,6 @@ async def test_a_caller_supplied_device_identity_is_what_goes_on_the_wire(monkey
     device_id, mac_address = "AA:BB:CC:DD:EE:01", "AA:BB:CC:DD:EE:02"
     async with driven_session(
         monkeypatch,
-        tcp=True,
         ctx_overrides={"device_id": device_id, "mac_address": mac_address},
     ) as (receiver, sess):
         await stream_then_stop(receiver, sess)
@@ -519,30 +318,24 @@ class _RecordingEncryptor:
         self.calls += 1
         return bytes(b ^ 0xFF for b in data)
 
-    def start_fresh_block(self) -> None:
-        """No-op: the stand-in has no block state to reset."""
 
-
-@pytest.mark.parametrize("tcp", [True, False])
 @pytest.mark.parametrize("with_raw16", [True, False])
 async def test_a_caller_supplied_video_encryptor_is_the_one_used(
-    monkeypatch, tcp, with_raw16
+    monkeypatch, with_raw16
 ):
     """``ctx.video_encryptor`` outranks the derived encryptor in every path.
 
     ``_stream_until_done`` promises ``self._ctx.video_encryptor or encryptor``
     and then, when a FairPlay keybuf encryptor could be built, reassigned over
-    the top of it -- so in the *shipping* configuration (TCP dialect,
-    raw16 present) a caller-supplied encryptor was silently dropped while the
-    other three combinations honoured it.
+    the top of it -- so in the *shipping* configuration (raw16 present) a
+    caller-supplied encryptor was silently dropped.
 
-    Both parametrisations run because the bug lived in exactly one of the
-    four; a test that happened to pick another would have passed against it.
+    Both parametrisations run because the bug lived in exactly one of them; a
+    test that happened to pick the other would have passed against it.
     """
     encryptor = _RecordingEncryptor()
     async with driven_session(
         monkeypatch,
-        tcp=tcp,
         with_raw16=with_raw16,
         ctx_overrides={"video_encryptor": encryptor},
     ) as (receiver, sess):
@@ -586,7 +379,7 @@ async def test_one_session_presents_exactly_two_airplay_versions(monkeypatch):
         return await real(self, method, uri, *args, **kwargs)
 
     monkeypatch.setattr(http.HttpConnection, "send_and_receive", spy)
-    async with driven_session(monkeypatch, tcp=True) as (receiver, sess):
+    async with driven_session(monkeypatch) as (receiver, sess):
         await stream_then_stop(receiver, sess)
 
     handshake = {ua for uri, ua in seen if not uri.startswith("rtsp://")}
@@ -598,7 +391,7 @@ async def test_one_session_presents_exactly_two_airplay_versions(monkeypatch):
     assert rtsp == {session_mod.MIRROR_USER_AGENT}, rtsp
 
 
-async def _sockets_at_stop(monkeypatch, *, tcp):
+async def _sockets_at_stop(monkeypatch):
     """Run a session and return the raw sockets it held when stop() ran.
 
     stop() drops the references as it closes them, and it is called twice --
@@ -617,18 +410,13 @@ async def _sockets_at_stop(monkeypatch, *, tcp):
     """
     captured = {}
 
-    async with driven_session(monkeypatch, tcp=tcp) as (receiver, sess):
+    async with driven_session(monkeypatch) as (receiver, sess):
         real_stop = sess.stop
 
         async def capturing_stop():
             if not captured:
-                captured["_video_sock"] = sess._video_sock  # noqa: SLF001
                 captured["_audio_control_sock"] = (
                     sess._audio_control_sock  # noqa: SLF001
-                )
-                transport = sess._video_transport  # noqa: SLF001
-                captured["adopted"] = (
-                    transport.get_extra_info("socket") if transport else None
                 )
             await real_stop()
 
@@ -640,52 +428,26 @@ async def _sockets_at_stop(monkeypatch, *, tcp):
 
 
 async def test_stop_closes_the_raw_sockets_it_opened(monkeypatch):
-    """No file descriptor outlives a TCP-dialect session.
+    """No file descriptor outlives a session.
 
-    Two of the session's sockets are not transports. ``_video_sock`` is bound
-    in ``_setup_streams`` so the port announced as ``networkInfo.Port`` is the
-    one datagrams leave from -- but in this dialect the video goes over TCP,
-    so nothing ever adopts it. ``_audio_control_sock`` is never wrapped at
-    all; it is used for bare ``sendto``. ``stop()`` closed neither.
+    One of the session's sockets is not a transport: ``_audio_control_sock``
+    is never wrapped at all; it is used for bare ``sendto``.
 
     A leaked UDP descriptor per session only shows up after a long-running
     process has mirrored a few thousand times.
     """
-    captured = await _sockets_at_stop(monkeypatch, tcp=True)
+    captured = await _sockets_at_stop(monkeypatch)
 
-    raw = {k: captured[k] for k in ("_video_sock", "_audio_control_sock")}
+    raw = {k: captured[k] for k in ("_audio_control_sock",)}
     assert all(
         sock is not None for sock in raw.values()
-    ), f"expected both raw sockets to be open at stop(): {raw}"
+    ), f"expected the raw socket to be open at stop(): {raw}"
 
     still_open = [name for name, sock in raw.items() if sock.fileno() != -1]
     assert not still_open, f"still open after stop(): {still_open}"
 
 
-async def test_the_video_datagram_endpoint_owns_the_socket_it_was_given(monkeypatch):
-    """In the AVConference dialect the transport adopts ``_video_sock``.
-
-    ``create_datagram_endpoint(sock=...)`` takes ownership, so the session
-    must *not* also close it -- closing an fd out from under a live transport
-    is how you get the event loop polling a descriptor that has been reused.
-    Clearing the reference at adoption is what tells ``stop()`` to leave it
-    alone, so this asserts the reference is gone and the socket is shut
-    anyway, by the transport.
-    """
-    captured = await _sockets_at_stop(monkeypatch, tcp=False)
-
-    assert captured["_video_sock"] is None, (
-        "the datagram endpoint adopted this socket; keeping the reference "
-        "would have stop() close it a second time"
-    )
-
-    adopted = captured["adopted"]
-    assert adopted is not None, "the video transport had no socket to adopt"
-    assert adopted.fileno() == -1, "the transport left its socket open"
-
-
-@pytest.mark.parametrize("tcp", [True, False])
-async def test_stop_returns_only_once_every_task_is_finished(monkeypatch, tcp):
+async def test_stop_returns_only_once_every_task_is_finished(monkeypatch):
     """``stop()`` must not return while a task it started is still running.
 
     ``stop()`` cancels and awaits ``self._tasks``.  ``_stream_until_done``
@@ -712,7 +474,7 @@ async def test_stop_returns_only_once_every_task_is_finished(monkeypatch, tcp):
     before = set(asyncio.all_tasks())
     outcome = {}
 
-    async with driven_session(monkeypatch, tcp=tcp) as (receiver, sess):
+    async with driven_session(monkeypatch) as (receiver, sess):
         real_stop = sess.stop
 
         def _is_the_sessions(task):
@@ -746,9 +508,8 @@ async def test_stop_returns_only_once_every_task_is_finished(monkeypatch, tcp):
     )
 
 
-@pytest.mark.parametrize("tcp", [True, False])
 async def test_which_requests_still_carry_the_raop_remote_control_headers(
-    monkeypatch, tcp
+    monkeypatch,
 ):
     """``_SUPPRESS_RAOP_HEADERS`` is applied to SETUP but not RECORD/TEARDOWN.
 
@@ -757,7 +518,7 @@ async def test_which_requests_still_carry_the_raop_remote_control_headers(
     ``None``.  The constant's comment says why: *the macOS sender captured in
     Phase 28 sends none of them on a mirroring session*.
 
-    It is passed to all three SETUPs and to neither RECORD nor TEARDOWN, so
+    It is passed to both SETUPs and to neither RECORD nor TEARDOWN, so
     those two still carry all three -- narrower than the stated ground truth.
     Mirroring works on tvOS 26 regardless, so this pins what is actually sent
     rather than asserting what ought to be; closing the gap changes what a
@@ -767,10 +528,6 @@ async def test_which_requests_still_carry_the_raop_remote_control_headers(
     ``teardown()`` hardcodes ``{"Session": ...}`` and would need an
     ``rtsp.py`` signature change.  If either is fixed, this test is where to
     say so.
-
-    Both dialects run because they use different SETUP call sites -- the
-    session-init SETUP is AVConference-only, and dropping the suppression
-    there passes an TCP-only test.
     """
     raop_headers = {"DACP-ID", "Active-Remote", "Client-Instance"}
     seen: dict = {}
@@ -783,7 +540,7 @@ async def test_which_requests_still_carry_the_raop_remote_control_headers(
         return await real(self, method, uri, *args, **kwargs)
 
     monkeypatch.setattr(http.HttpConnection, "send_and_receive", spy)
-    async with driven_session(monkeypatch, tcp=tcp) as (receiver, sess):
+    async with driven_session(monkeypatch) as (receiver, sess):
         await stream_then_stop(receiver, sess)
 
     assert seen.get("SETUP") == set(), f"SETUP leaked RAOP headers: {seen.get('SETUP')}"
@@ -811,7 +568,7 @@ async def test_the_config_frame_carries_the_sources_own_sps_and_pps(monkeypatch)
     picked some other NAL and no test noticed, because the fake counted the
     bytes on the data port without keeping them.
     """
-    async with driven_session(monkeypatch, tcp=True) as (receiver, sess):
+    async with driven_session(monkeypatch) as (receiver, sess):
         await stream_then_stop(receiver, sess)
         head = receiver.video_server.head
         source = pathlib.Path(sess._h264_path).read_bytes()  # noqa: SLF001
@@ -843,10 +600,9 @@ async def test_encrypted_frames_carry_no_sps_or_pps(monkeypatch):
 
     ``tcp_video_producer`` strips NAL types 7 and 8 from every frame
     because the reference sender transports them only once, plaintext, in the avcC
-    config -- ``MIRROR_STRIP_SPSPPS`` exists to turn that off for
-    experiments, and defaults to on.  Inverting the default sends the
-    parameter sets inside the encrypted frames too, giving the receiver's
-    decoder a structure no real sender produces, and nothing noticed.
+    config.  Not stripping them sends the parameter sets inside the encrypted
+    frames too, giving the receiver's decoder a structure no real sender
+    produces, and nothing noticed.
 
     The frames are encrypted, but AES-CTR preserves length, so the payload
     size on the wire settles it without needing the key: a stripped access
@@ -854,7 +610,7 @@ async def test_encrypted_frames_carry_no_sps_or_pps(monkeypatch):
     unstripped one.  Asserting both -- equal to one, different from the other
     -- is what makes it a real check rather than an arithmetic coincidence.
     """
-    async with driven_session(monkeypatch, tcp=True) as (receiver, sess):
+    async with driven_session(monkeypatch) as (receiver, sess):
         await stream_then_stop(receiver, sess, video_frames=3)
         head = receiver.video_server.head
         source = pathlib.Path(sess._h264_path).read_bytes()  # noqa: SLF001
@@ -908,7 +664,7 @@ async def test_frame_timestamps_advance_at_the_frame_rate(monkeypatch, fps):
     Two rates run because the default is 30: a hard-coded 30 in place of
     ``self._ctx.fps`` is indistinguishable at the default and obvious at 15.
     """
-    async with driven_session(monkeypatch, tcp=True, ctx_overrides={"fps": fps}) as (
+    async with driven_session(monkeypatch, ctx_overrides={"fps": fps}) as (
         receiver,
         sess,
     ):
@@ -959,10 +715,10 @@ async def test_screen_audio_sends_rtp_packets_for_each_eld_frame(monkeypatch, tm
     eld = tmp_path / "frames.eld"
     eld.write_bytes(b"".join(struct.pack(">I", len(f)) + f for f in frames))
 
-    monkeypatch.setenv("MIRROR_AUDIO_SEND", "1")
-    monkeypatch.setenv("MIRROR_AUDIO_ELD_FILE", str(eld))
-
-    async with driven_session(monkeypatch, tcp=True) as (receiver, sess):
+    async with driven_session(monkeypatch, session_kwargs={"eld_path": eld}) as (
+        receiver,
+        sess,
+    ):
         await stream_then_stop(receiver, sess, video_frames=3)
         packets = list(receiver.audio_data_server.datagrams)
         syncs = list(receiver.audio_control_server.datagrams)
@@ -1019,7 +775,7 @@ async def test_the_announced_timing_port_is_actually_served(monkeypatch):
     stops answering. It runs against a live session because ``stop()`` closes
     the timing server; querying afterwards raises instead of failing.
     """
-    async with driven_session(monkeypatch, tcp=True) as (receiver, sess):
+    async with driven_session(monkeypatch) as (receiver, sess):
         task = asyncio.ensure_future(sess.run())
         try:
             await asyncio.wait_for(
@@ -1082,7 +838,7 @@ async def test_the_announced_stream_id_is_the_one_the_key_is_derived_from(monkey
 
     monkeypatch.setattr(framing, "derive_tcp_stream_key_iv", spy)
 
-    async with driven_session(monkeypatch, tcp=True) as (receiver, sess):
+    async with driven_session(monkeypatch) as (receiver, sess):
         await stream_then_stop(receiver, sess)
         announced = receiver.video_setup_body["streams"][0]["streamConnectionID"]
 
@@ -1091,82 +847,6 @@ async def test_the_announced_stream_id_is_the_one_the_key_is_derived_from(monkey
         f"SETUP announced streamConnectionID {announced}, but the key was "
         f"derived from {sorted(set(used))}"
     )
-
-
-async def test_video_datagrams_leave_from_the_announced_network_port(monkeypatch):
-    """AVConference video must be sent from the port it advertised.
-
-    ``session.py`` says why, at the socket it binds for this: a receiver
-    filtering on the announced 5-tuple accepts the datagrams at the socket
-    layer -- no ICMP, nothing rejected -- and then ignores them because the
-    source port disagrees.  Another silent black screen with a healthy-looking
-    session.
-
-    Announcing a port other than the socket's own passed the whole suite, so
-    nothing tied ``networkInfo.Port`` to where the frames actually come from.
-    The fake records each datagram's source address, which is the only way to
-    tell: the packets arrive either way.
-
-    AVConference only -- the TCP dialect sends video over TCP and
-    announces no ``networkInfo``.
-    """
-    async with driven_session(monkeypatch, tcp=False) as (receiver, sess):
-        await stream_then_stop(receiver, sess, video_frames=3)
-        announced = receiver.video_setup_body["streams"][0]["networkInfo"]["Port"]
-        sources = list(receiver.video_server.sources)
-
-    assert sources, "no video datagrams arrived, so nothing was compared"
-    ports = {port for _host, port in sources}
-    assert ports == {announced}, (
-        f"video left from {sorted(ports)} but networkInfo.Port announced "
-        f"{announced}; a real receiver drops those silently"
-    )
-
-
-async def test_avconference_video_is_addressed_to_the_announced_data_port(monkeypatch):
-    """Video must be sent to the ``dataPort`` the receiver asked for.
-
-    In this dialect the frames go out as UDP from an already-bound socket, so
-    the destination is carried per-send in the channel's ``remote_addr``
-    rather than by connecting.  Sending to the wrong port is therefore silent:
-    no refusal, no ICMP the sender acts on, just frames that never arrive.
-
-    That failure is detected today only by every test that waits for a frame
-    timing out -- minutes of guard timeouts pointing at nothing in particular.
-    This asserts the address as soon as the channel exists, without waiting
-    for a frame, so the same mistake fails in well under a second and names
-    the wrong port.
-
-    The TCP dialect needs no equivalent: it connects a TCP socket, and a
-    wrong port is refused at connect.
-    """
-    async with driven_session(monkeypatch, tcp=False) as (receiver, sess):
-        task = asyncio.ensure_future(sess.run())
-        try:
-            # Wait for the channel, not for a frame. Waiting for a frame is
-            # what makes this slow to fail: with the wrong destination none
-            # ever arrives, so the check would sit out the guard timeout
-            # before reaching its own assertion.
-            for _ in range(500):
-                if getattr(sess, "_video_channel", None) is not None:
-                    break
-                await asyncio.sleep(0.002)
-
-            announced = sess._ctx.video_data_port  # noqa: SLF001
-            channel = sess._video_channel  # noqa: SLF001
-            assert channel is not None, "the video channel was never opened"
-            assert announced, "the receiver announced no dataPort"
-            assert (
-                channel.remote_addr is not None
-            ), "the datagram channel has no destination; frames would go nowhere"
-            assert channel.remote_addr[1] == announced, (
-                f"video addressed to port {channel.remote_addr[1]}, but the "
-                f"receiver announced dataPort {announced}"
-            )
-        finally:
-            task.cancel()
-            with contextlib.suppress(BaseException):
-                await task
 
 
 async def test_the_tcp_request_order_is_the_captured_one(monkeypatch):
@@ -1210,7 +890,7 @@ async def test_the_tcp_request_order_is_the_captured_one(monkeypatch):
         return await real(self, method, uri, *args, **kwargs)
 
     monkeypatch.setattr(http.HttpConnection, "send_and_receive", spy)
-    async with driven_session(monkeypatch, tcp=True) as (receiver, sess):
+    async with driven_session(monkeypatch) as (receiver, sess):
         await stream_then_stop(receiver, sess)
 
     rtsp = [label for label in seen if label != "POST"]
@@ -1218,50 +898,6 @@ async def test_the_tcp_request_order_is_the_captured_one(monkeypatch):
 
     # The FairPlay handshake precedes all of it, on the same connection.
     assert seen[:2] == ["POST", "POST"], seen[:4]
-
-
-async def test_the_avconference_request_order_is_the_captured_one(monkeypatch):
-    """The other dialect has its own captured sequence, including a /info.
-
-    Phase 28 put a real macOS mirroring session through atvproxy and found no
-    ANNOUNCE at all: a metadata-only SETUP that returns ``eventPort``, the
-    event channel, then -- at capture sequence 37 -- a second ``GET /info``
-    before RECORD, then the stream SETUP.
-
-    That ``/info`` is the interesting one.  It asks for nothing this code
-    uses; it is there because the captured sender sends it, and a receiver
-    that counts on it would fail in the silent way everything else in this
-    protocol fails.  Dropping it changes no behaviour any other test observes.
-
-    The two SETUPs are told apart by whether they carry ``streams``: the
-    session-init one is metadata only.
-    """
-    seen: list = []
-    real = http.HttpConnection.send_and_receive
-
-    async def spy(self, method, uri, *args, **kwargs):
-        body = kwargs.get("body")
-        if isinstance(body, (bytes, bytearray)):
-            with contextlib.suppress(Exception):
-                body = plistlib.loads(bytes(body))
-        label = method
-        if method == "SETUP":
-            label = "SETUP(streams)" if (body or {}).get("streams") else "SETUP(init)"
-        seen.append(label)
-        return await real(self, method, uri, *args, **kwargs)
-
-    monkeypatch.setattr(http.HttpConnection, "send_and_receive", spy)
-    async with driven_session(monkeypatch, tcp=False) as (receiver, sess):
-        await stream_then_stop(receiver, sess)
-
-    rtsp = [label for label in seen if label != "POST"]
-    assert rtsp == [
-        "SETUP(init)",
-        "GET",
-        "RECORD",
-        "SETUP(streams)",
-        "TEARDOWN",
-    ], rtsp
 
 
 async def test_the_handshake_requests_carry_the_apple_headers(monkeypatch):
@@ -1286,7 +922,7 @@ async def test_the_handshake_requests_carry_the_apple_headers(monkeypatch):
         return await real(self, method, uri, *args, **kwargs)
 
     monkeypatch.setattr(http.HttpConnection, "send_and_receive", spy)
-    async with driven_session(monkeypatch, tcp=True) as (receiver, sess):
+    async with driven_session(monkeypatch) as (receiver, sess):
         await stream_then_stop(receiver, sess)
 
     assert set(seen) == {"/fp-setup", "/auth-setup"}, sorted(seen)
@@ -1306,8 +942,8 @@ async def test_the_periodic_audio_sync_goes_out_once_every_sync_every_frames(
     Inverting that branch makes a sync follow nearly every frame instead of
     every 46th, roughly fortyfold the control traffic, and nothing failed.
 
-    ``MIRROR_AUDIO_SYNC_EVERY`` is the knob for exactly this, so the cadence
-    is checked at three rather than by sending fifty frames. The count is
+    ``AUDIO_SYNC_EVERY`` is patched for exactly this, so the cadence
+    is checked at three rather than by sending a hundred frames. The count is
     exact rather than approximate: ``idx`` advances once per audio packet and
     the sync fires when it divides, so a run that emitted *n* packets must
     show ``n // 3`` periodic syncs, on top of the opening one.
@@ -1316,11 +952,12 @@ async def test_the_periodic_audio_sync_goes_out_once_every_sync_every_frames(
     eld = tmp_path / "frames.eld"
     eld.write_bytes(b"".join(struct.pack(">I", len(f)) + f for f in frames))
 
-    monkeypatch.setenv("MIRROR_AUDIO_SEND", "1")
-    monkeypatch.setenv("MIRROR_AUDIO_ELD_FILE", str(eld))
-    monkeypatch.setenv("MIRROR_AUDIO_SYNC_EVERY", "3")
+    monkeypatch.setattr(session_mod, "AUDIO_SYNC_EVERY", 3)
 
-    async with driven_session(monkeypatch, tcp=True) as (receiver, sess):
+    async with driven_session(monkeypatch, session_kwargs={"eld_path": eld}) as (
+        receiver,
+        sess,
+    ):
         await stream_then_stop(receiver, sess, video_frames=3)
         packets = list(receiver.audio_data_server.datagrams)
         syncs = list(receiver.audio_control_server.datagrams)
@@ -1344,7 +981,7 @@ async def test_screen_audio_stays_silent_when_half_its_key_is_missing(
     """Both halves, or nothing. Not either half.
 
     The audio key is ``sha512(raw16 || pair32)[:16]`` and the guard is
-    ``len(raw16) == 16 and _pair32_hex``. Written ``or`` it accepts a raw16
+    ``len(raw16) == 16 and pair32``. Written ``or`` it accepts a raw16
     with no pair32 and hashes ``raw16 + b""``, which is a perfectly
     well-formed 16-byte key -- long enough to clear the length check below
     it, and wrong. The receiver would decrypt noise and play it.
@@ -1357,10 +994,9 @@ async def test_screen_audio_stays_silent_when_half_its_key_is_missing(
     eld = tmp_path / "half.eld"
     eld.write_bytes(b"".join(struct.pack(">I", len(f)) + f for f in frames))
 
-    monkeypatch.setenv("MIRROR_AUDIO_SEND", "1")
-    monkeypatch.setenv("MIRROR_AUDIO_ELD_FILE", str(eld))
-
-    async with driven_session(monkeypatch, tcp=True, with_pair32=False) as (
+    async with driven_session(
+        monkeypatch, with_pair32=False, session_kwargs={"eld_path": eld}
+    ) as (
         receiver,
         sess,
     ):

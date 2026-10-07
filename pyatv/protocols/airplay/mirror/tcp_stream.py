@@ -1,9 +1,9 @@
 """TCP-dialect mirror video transport (reverse-engineered 2026-08-23).
 
-Unlike the macOS-AVConference / Viceroy path (UDP RTP + SRTP), a real tvOS 26
-receiver driven by the reference sender takes screen video over a **raw TCP** media-data
-channel with this framing (verified by decrypting the reference sender's live stream,
-see docs/superpowers/specs/2026-08-23-mirror-video-key-handoff.md SESSION 3):
+A real tvOS 26 receiver driven by the reference sender takes screen video over
+a **raw TCP** media-data channel with this framing (verified by decrypting
+the reference sender's live stream, see
+docs/superpowers/specs/2026-08-23-mirror-video-key-handoff.md SESSION 3):
 
     per message (one H.264 access unit):
         128-byte header:

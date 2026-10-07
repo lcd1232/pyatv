@@ -8,15 +8,10 @@ finish without requiring a real Apple TV:
   - ANNOUNCE / SETUP / RECORD / TEARDOWN: respond 200 (with bplist body for SETUP)
   - Data sockets that count received bytes / "frames"
 
-Both mirror dialects are modelled, selected by the ``tcp`` flag:
-
-  - AVConference: metadata-only session-init SETUP returning ``eventPort``,
-    then a stream SETUP whose ``dataPort`` is UDP-only and which also
-    negotiates a TCP media-data-control channel.
-  - TCP (the dialect that renders on tvOS 26): no session init; a
-    type-96 audio SETUP carries the ``eventPort``, RECORD follows, and the
-    type-110 video SETUP returns a plain TCP ``dataPort``. The event channel
-    is bidirectional RTSP driven by the receiver.
+The modelled flow is the one that renders on tvOS 26: no session init; a
+type-96 audio SETUP carries the ``eventPort``, RECORD follows, and the
+type-110 video SETUP returns a plain TCP ``dataPort``. The event channel is
+bidirectional RTSP driven by the receiver.
 
 The fake is symmetric enough with the real receiver that a real
 MirrorSession run against it derives the same AES-CTR keystream. It does
@@ -28,12 +23,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import plistlib
 import re
 import struct
 from typing import Any, Dict, List, Optional, Tuple
-from unittest.mock import MagicMock
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import x25519
@@ -65,14 +58,12 @@ _REASONS = {
 # deliberately *not* imported from the production module: the whole point is
 # that the sender and the expectation can disagree.
 #
-# Three kinds of field live in a SETUP body and only the first is pinned:
+# Two kinds of field live in a SETUP body and only the first is pinned:
 #
 #   * captured protocol constants -- the receiver interprets them, they came
 #     off the wire from a real sender, and any other value is a bug. Pinned.
 #   * per-session values -- IDs, ports, UUIDs. Checked for presence and shape
 #     only; pinning them would pin randomness.
-#   * environment-tunable values -- ``spf``/``et`` have MIRROR_* overrides, so
-#     they are checked against "the override, or the captured default".
 
 #: ``streams[0]`` of the TCP dialect's screen-audio SETUP. RE'd from the reference
 #: sender's negotiation callback (@0x10008e1a4) and seen on the wire in the Phase 28
@@ -107,48 +98,26 @@ CAPTURED_AUDIO_STREAM: Dict[str, Any] = {
 #: Top-level (outside ``streams``) constants of the audio SETUP.
 CAPTURED_AUDIO_TOP: Dict[str, Any] = {
     # Encryption type 32 == FairPlay SAP v3, the keying the ekey/eiv beside it
-    # belong to. Unlike the video SETUP's ``et`` this one has no MIRROR_ET
-    # override -- the audio stream is always FairPlay-keyed.
+    # belong to.
     "et": 32,
 }
 
 #: ``streams[0]`` of the TCP dialect's screen-video SETUP.
 CAPTURED_VIDEO_STREAM_TCP: Dict[str, Any] = {
-    # The reference sender's screen-video stream type. The AVConference dialect uses the
-    # same number, reached via framing.STREAM_TYPE_VIDEO.
+    # The reference sender's screen-video stream type.
     "type": 110,
-}
-
-#: ``streams[0]`` of the AVConference (macOS-sender) screen-video SETUP.
-CAPTURED_VIDEO_STREAM_AVCONF: Dict[str, Any] = {
-    "type": 110,
-    # Selects the AVConference mirroring pipeline. Without it the receiver
-    # falls back to the legacy AirPlay-1 path and never renders.
-    "useAVConfMirroring": True,
-    # The captured macOS sender advertises an SDR pipeline and no HDR support;
-    # claiming HDR commits the sender to colour metadata it does not send.
-    "displayHDRMode": "SDR",
-    "hdrMirroringSupported": False,
-    # 0 == plain mirroring (as opposed to the extended-display modes).
-    "streamMode": 0,
-    # Receiver-side logging/HUD debug switches. The capture has them off, and
-    # turning either on changes what the receiver does with the stream.
-    "remoteLogLevel": 0,
-    "remoteShouldShowHUD": False,
 }
 
 #: The ``timestampInfo`` probe names, in order, as the capture sends them.
 #: They label the timestamps the receiver reports back for latency
 #: accounting: submission, before/after pixel transfer, before encode, and
-#: encode-emitted. Both dialects send the same five.
+#: encode-emitted.
 CAPTURED_TIMESTAMP_NAMES = ["SubSu", "BePxT", "AfPxT", "BefEn", "EmEnc"]
 
-#: Captured default for ``spf`` -- samples per AAC-ELD frame. Overridable via
-#: MIRROR_AUDIO_SPF, so it is checked against the override when one is set.
+#: Captured ``spf`` -- samples per AAC-ELD frame.
 CAPTURED_AUDIO_SPF = 480
 
-#: Captured default for the video SETUP's ``et``. Overridable via MIRROR_ET
-#: (0 selects an unencrypted stream for experiments).
+#: Captured ``et`` of the video SETUP.
 CAPTURED_VIDEO_ET = 32
 
 #: A synthesized MAC-shaped device ID, e.g. ``0A:1B:2C:3D:4E:5F``.
@@ -196,9 +165,7 @@ def _check_stream_connection_id(where: str, stream: dict, bits: int) -> List[str
     """``streamConnectionID`` is per-session but must fit the receiver's field.
 
     The receiver rebuilds the key-derivation label from this id, so it has to
-    fit whatever width that dialect's receiver stores it in: the reference sender's
-    receiver uses a 32-bit field, while the AVConference one takes the 63-bit
-    value the macOS sender generates.
+    fit the 32-bit field the receiver stores it in.
     """
     sid = stream.get("streamConnectionID")
     if not isinstance(sid, int) or not 0 < sid < 2**bits:
@@ -212,14 +179,12 @@ def check_audio_setup(body: dict) -> List[str]:
     problems = _check_constants("audio stream", stream, CAPTURED_AUDIO_STREAM)
     problems += _check_constants("audio SETUP", body, CAPTURED_AUDIO_TOP)
     problems += _check_session_fields("audio SETUP", body)
-    # Screen audio is TCP-dialect only, so always the 32-bit form.
     problems += _check_stream_connection_id("audio stream", stream, 32)
 
-    want_spf = int(os.environ.get("MIRROR_AUDIO_SPF", str(CAPTURED_AUDIO_SPF)))
-    if stream.get("spf") != want_spf:
+    if stream.get("spf") != CAPTURED_AUDIO_SPF:
         problems.append(
             f"audio stream: spf is {stream.get('spf')!r}, "
-            f"expected {want_spf} (MIRROR_AUDIO_SPF or the captured default)"
+            f"captured is {CAPTURED_AUDIO_SPF}"
         )
     # The UDP port the sender will receive audio sync packets on. Per-session,
     # but the receiver sends to it, so it must be a real bound port.
@@ -234,12 +199,11 @@ def check_audio_setup(body: dict) -> List[str]:
     return problems
 
 
-def check_video_setup(body: dict, tcp: bool) -> List[str]:
+def check_video_setup(body: dict) -> List[str]:
     """Return every way this type-110 SETUP differs from the capture."""
     stream = body["streams"][0]
-    expected = CAPTURED_VIDEO_STREAM_TCP if tcp else CAPTURED_VIDEO_STREAM_AVCONF
-    problems = _check_constants("video stream", stream, expected)
-    problems += _check_stream_connection_id("video stream", stream, 32 if tcp else 63)
+    problems = _check_constants("video stream", stream, CAPTURED_VIDEO_STREAM_TCP)
+    problems += _check_stream_connection_id("video stream", stream, 32)
 
     names = [entry.get("name") for entry in stream.get("timestampInfo") or []]
     if names != CAPTURED_TIMESTAMP_NAMES:
@@ -248,30 +212,11 @@ def check_video_setup(body: dict, tcp: bool) -> List[str]:
             f"captured is {CAPTURED_TIMESTAMP_NAMES!r}"
         )
 
-    if tcp:
-        problems += _check_session_fields("video SETUP", body)
-        want_et = int(os.environ.get("MIRROR_ET", str(CAPTURED_VIDEO_ET)))
-        if body.get("et") != want_et:
-            problems.append(
-                f"video SETUP: et is {body.get('et')!r}, "
-                f"expected {want_et} (MIRROR_ET or the captured default)"
-            )
-    else:
-        # The AVConference dialect keys from seeds it generates per session
-        # rather than transporting a FairPlay ekey.
-        for key in ("encryptionSeed",):
-            if not isinstance(stream.get(key), int):
-                problems.append(f"video stream: {key} missing or not an int")
-        control = (stream.get("streamConnections") or {}).get(
-            "streamConnectionTypeMediaDataControl", {}
+    problems += _check_session_fields("video SETUP", body)
+    if body.get("et") != CAPTURED_VIDEO_ET:
+        problems.append(
+            f"video SETUP: et is {body.get('et')!r}, captured is {CAPTURED_VIDEO_ET}"
         )
-        if not isinstance(control.get("streamConnectionKeyEncryptionSeed"), int):
-            problems.append("video stream: control-channel encryption seed missing")
-        port = (stream.get("networkInfo") or {}).get("Port")
-        if not isinstance(port, int) or not 0 < port < 65536:
-            problems.append(f"video stream: networkInfo.Port {port!r} is not bound")
-        if not isinstance(stream.get("negotiationData"), bytes):
-            problems.append("video stream: negotiationData missing")
     return problems
 
 
@@ -283,45 +228,6 @@ def _abort_writers(writers: list[asyncio.StreamWriter]) -> None:
             writer.transport.abort()
         except Exception:  # pragma: no cover - best effort teardown
             pass
-
-
-class RawChannelOpener:
-    """Channel opener for tests: opens raw TCP and returns a fake channel.
-
-    Forwards ``send(bytes)`` to the writer and returns a fake transport whose
-    ``close()`` closes the writer. Bypasses HAP per-channel encryption -- the
-    fake receiver counts bytes on the wire directly.
-    """
-
-    def __init__(self):
-        self.connections = []  # (salt, writer, reader)
-
-    async def __call__(self, factory, addr, port, salt, out_info, in_info):
-        reader, writer = await asyncio.open_connection(addr, port)
-        self.connections.append((salt, writer, reader))
-
-        channel = MagicMock()
-        channel.send = writer.write
-
-        transport = MagicMock()
-
-        def _close() -> None:
-            try:
-                writer.transport.abort()
-            except Exception:
-                pass
-
-        transport.close = _close
-        return transport, channel
-
-    def close_all(self) -> None:
-        """Drop every connection we opened, so the fake's servers can close."""
-        for _salt, writer, _reader in self.connections:
-            try:
-                writer.transport.abort()
-            except Exception:
-                pass
-        self.connections.clear()
 
 
 class _FrameCounter:
@@ -506,12 +412,7 @@ class _MirrorEventServer(_MirrorDataServer):
 
 
 class _MirrorDatagramServer(_FrameCounter):
-    """Counts mirror video datagrams, as a real receiver's dataPort does.
-
-    The Apple TV's ``dataPort`` accepts UDP only in the AVConference dialect
-    (TCP to it is refused), so the video stream arrives here as datagrams
-    rather than a byte stream.
-    """
+    """Counts screen-audio datagrams (RTP data or sync packets)."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -519,7 +420,7 @@ class _MirrorDatagramServer(_FrameCounter):
         #: Every datagram received, in arrival order. Retained (not just
         #: counted) so a test can inspect the RTP framing and decrypt the
         #: payload -- the only way to see which key actually encrypted the
-        #: wire, since the sender's SRTP encryptors never leave ``session.py``.
+        #: wire.
         self.datagrams: list[bytes] = []
         #: Source ``(host, port)`` of each datagram, in the same order. The
         #: screen-audio sync must leave from the socket whose port was
@@ -556,20 +457,14 @@ class FakeMirrorReceiver:
 
     def __init__(
         self,
-        tcp: bool = False,
         status_overrides: dict | None = None,
         omit_event_port: bool = False,
         command_bodies: Optional[List[bytes]] = None,
         omit_audio_control_port: bool = False,
         split_event_request: bool = False,
-        dead_control_port: bool = False,
         dead_audio_data_port: bool = False,
         hang_up_event_channel: bool = False,
     ) -> None:
-        # Dialect split, taken from probing a real tvOS 26 receiver: the
-        # AVConference dataPort is UDP-only, while the TCP dialect's type-110
-        # dataPort is a plain TCP socket.
-        self.tcp = tcp
         # Misbehaviour knobs. A cooperative receiver is the default; these let
         # a test make the fake answer the way a confused or older receiver
         # does, so the sender's error handling runs on real wire bytes rather
@@ -583,20 +478,12 @@ class FakeMirrorReceiver:
         self.omit_event_port = omit_event_port
         #: Answer the type-96 audio SETUP without a ``controlPort``.
         self.omit_audio_control_port = omit_audio_control_port
-        #: Advertise a media-data-control port that nothing is listening on.
-        #: A receiver that answers SETUP before it opens the socket -- or that
-        #: never opens it -- looks exactly like this to the sender. Port 1 is
-        #: used because a connection there is refused immediately and
-        #: deterministically, with no bind/close race.
-        self.dead_control_port = dead_control_port
         #: Advertise a screen-audio dataPort nothing is bound to, so the
         #: sender's connected UDP socket gets ICMP port-unreachable back.
         self.dead_audio_data_port = dead_audio_data_port
-        self.video_server = _MirrorDataServer() if tcp else _MirrorDatagramServer()
-        # The AVConference media-data-control channel (TCP). No mirror media
-        # is ever written here, so its tally is expected to stay at zero.
-        self.control_server = _MirrorDataServer()
-        # TCP-dialect screen audio: RTP data and sync packets, both UDP.
+        # The type-110 dataPort is a plain TCP socket.
+        self.video_server = _MirrorDataServer()
+        # Screen audio: RTP data and sync packets, both UDP.
         self.audio_data_server = _MirrorDatagramServer()
         self.audio_control_server = _MirrorDatagramServer()
         # The sender connects to the eventPort we report from SETUP.
@@ -640,7 +527,6 @@ class FakeMirrorReceiver:
         self._server: asyncio.AbstractServer | None = None
         self._video_port = 0
         self._audio_port = 0
-        self._control_port = 0
         self._audio_control_port = 0
 
         # Ephemeral X25519 keypair for the fake server side
@@ -672,7 +558,6 @@ class FakeMirrorReceiver:
     async def start(self) -> Tuple[str, int]:
         """Start listening; return (host, port) for the control connection."""
         self._video_port = await self.video_server.start()
-        self._control_port = await self.control_server.start()
         self._audio_port = await self.audio_data_server.start()
         self._audio_control_port = await self.audio_control_server.start()
         self._event_port = await self.event_server.start()
@@ -742,12 +627,11 @@ class FakeMirrorReceiver:
     def _dispatch_setup(self, body: bytes) -> Tuple[bytes, str | None, int]:
         """Answer a SETUP, distinguishing session-init / audio / video.
 
-        Modern AirPlay 2 mirroring uses a two-phase SETUP (Phase 28 capture):
-        a metadata-only session init that answers with ``eventPort``, then a
-        ``streams`` request answered with the negotiated data/control ports.
-        The TCP dialect drops the session init and instead opens with a
-        type-96 audio stream SETUP (which carries the ``eventPort``), then
-        sends the type-110 video stream SETUP after RECORD.
+        The sender opens with a type-96 audio stream SETUP (which carries the
+        ``eventPort``), then sends the type-110 video stream SETUP after
+        RECORD. A metadata-only session-init SETUP (no ``streams``) is the
+        macOS sender's opening; it is recorded so a test can assert it is not
+        sent.
         """
         decoded = {}
         if body:
@@ -799,18 +683,8 @@ class FakeMirrorReceiver:
         self.video_setup_eiv = decoded.get("eiv")
         self.video_setup_et = decoded.get("et")
         self.video_setup_body = decoded
-        self.protocol_violations += check_video_setup(decoded, self.tcp)
+        self.protocol_violations += check_video_setup(decoded)
         video_stream = {"type": 110, "dataPort": self._video_port}
-        if not self.tcp:
-            # Only the AVConference dialect negotiates a separate HAP-encrypted
-            # media-data-control channel.
-            video_stream["streamConnections"] = {
-                "streamConnectionTypeMediaDataControl": {
-                    "streamConnectionKeyPort": (
-                        1 if self.dead_control_port else self._control_port
-                    ),
-                }
-            }
         return (
             plistlib.dumps({"streams": [video_stream]}, fmt=plistlib.FMT_BINARY),
             "application/x-apple-binary-plist",
@@ -874,7 +748,6 @@ class FakeMirrorReceiver:
             self._server.close()
             await self._server.wait_closed()
         await self.video_server.close()
-        await self.control_server.close()
         await self.audio_data_server.close()
         await self.audio_control_server.close()
         await self.event_server.close()

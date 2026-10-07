@@ -53,10 +53,7 @@ from pyatv.protocols.airplay.mirror import session as session_mod
 from pyatv.support.http import http_connect
 from pyatv.support.rtsp import RtspSession
 
-from tests.protocols.airplay.mirror.fake_receiver import (
-    FakeMirrorReceiver,
-    RawChannelOpener,
-)
+from tests.protocols.airplay.mirror.fake_receiver import FakeMirrorReceiver
 
 TEST_FILE = Path(__file__).parent / "test_pattern.h264"
 
@@ -74,13 +71,13 @@ pytestmark = pytest.mark.asyncio
 async def driven_session(
     monkeypatch,
     *,
-    tcp: bool = True,
     with_audio_ekey: bool = True,
     with_ekey: bool = True,
     with_raw16: bool = True,
     with_pair32: bool = True,
     stream_encryptor: bool = True,
     ctx_overrides: dict | None = None,
+    session_kwargs: dict | None = None,
     **receiver_kwargs,
 ):
     """Yield ``(receiver, session)`` wired together over real sockets.
@@ -92,15 +89,13 @@ async def driven_session(
 
     ``ctx_overrides`` sets fields on the MirrorContext before the session runs,
     for tests that need a caller-supplied value rather than a default.
+    ``session_kwargs`` are passed on to :class:`MirrorSession` (the video and
+    audio sources).
     """
-    monkeypatch.setenv("MIRROR_TCP", "1" if tcp else "0")
-    monkeypatch.setenv("MIRROR_CONFIG_DELAY", "0")
-
-    receiver = FakeMirrorReceiver(tcp=tcp, **receiver_kwargs)
+    receiver = FakeMirrorReceiver(**receiver_kwargs)
     host, port = await receiver.start()
 
     connection = None
-    opener = RawChannelOpener()
     sess = None
     try:
         connection = await http_connect(host, port)
@@ -109,15 +104,12 @@ async def driven_session(
         ctx = MirrorContext(
             stream_encryptor=handshake.stream_encryptor if stream_encryptor else None
         )
-        if tcp:
-            if with_audio_ekey:
-                ctx.audio_ekey = b"\x33" * 72
-            if with_ekey:
-                ctx.ekey = b"\x44" * 72
-            if with_raw16:
-                ctx.stream_raw16 = b"\x55" * 16
-        if with_pair32:
-            monkeypatch.setenv("MIRROR_PAIR32", "66" * 32)
+        if with_audio_ekey:
+            ctx.audio_ekey = b"\x33" * 72
+        if with_ekey:
+            ctx.ekey = b"\x44" * 72
+        if with_raw16:
+            ctx.stream_raw16 = b"\x55" * 16
         for _field, _value in (ctx_overrides or {}).items():
             assert hasattr(ctx, _field), f"MirrorContext has no {_field!r}"
             setattr(ctx, _field, _value)
@@ -131,7 +123,8 @@ async def driven_session(
             verifier=verifier,
             ctx=ctx,
             h264_path=TEST_FILE,
-            channel_opener=opener,
+            pair_secret=b"\x66" * 32 if with_pair32 else None,
+            **(session_kwargs or {}),
         )
         yield receiver, sess
         # Only on a clean exit: if the body raised, that failure is the
@@ -143,7 +136,6 @@ async def driven_session(
         if sess is not None:
             with contextlib.suppress(Exception):
                 await sess.stop()
-        opener.close_all()
         if connection is not None:
             with contextlib.suppress(Exception):
                 connection.close()
@@ -196,22 +188,6 @@ async def stream_then_stop(receiver, sess, *, video_frames: int = 1) -> None:
 # ---------------------------------------------------------------------------
 # ProtocolError guards on an unexpected status
 # ---------------------------------------------------------------------------
-
-
-async def test_session_init_setup_non_200_raises_protocol_error(monkeypatch):
-    """A 2xx-but-not-200 session-init SETUP must name SETUP and the status."""
-    async with driven_session(
-        monkeypatch,
-        tcp=False,
-        status_overrides={"setup_session": RTSP_LOW_ON_STORAGE},
-    ) as (receiver, sess):
-        error = await run_until_error(sess)
-
-    assert isinstance(error, exceptions.ProtocolError), repr(error)
-    assert "SETUP" in str(error)
-    assert "session init" in str(error)
-    assert str(RTSP_LOW_ON_STORAGE) in str(error)
-    assert receiver.session_setup_received
 
 
 async def test_audio_setup_non_200_raises_protocol_error(monkeypatch):
@@ -285,7 +261,7 @@ async def test_non_2xx_setup_never_reaches_protocol_error(monkeypatch):
 
 async def test_setup_session_without_stream_encryptor_raises(monkeypatch):
     """Without the FPLY handshake's encryptor, SETUP must refuse to proceed."""
-    async with driven_session(monkeypatch, tcp=False, stream_encryptor=False) as (
+    async with driven_session(monkeypatch, stream_encryptor=False) as (
         receiver,
         sess,
     ):
@@ -295,7 +271,7 @@ async def test_setup_session_without_stream_encryptor_raises(monkeypatch):
     assert "stream_encryptor" in str(error)
     assert "_setup_session" in str(error)
     # It must fail *before* talking to the receiver at all.
-    assert not receiver.session_setup_received
+    assert receiver.setup_count == 0
 
 
 # ---------------------------------------------------------------------------
@@ -306,7 +282,7 @@ async def test_setup_session_without_stream_encryptor_raises(monkeypatch):
 async def test_missing_event_port_skips_event_channel(monkeypatch, caplog):
     """A SETUP answer with no eventPort must be logged and skipped, not crash."""
     caplog.set_level(logging.DEBUG, logger="pyatv.protocols.airplay.mirror.session")
-    async with driven_session(monkeypatch, tcp=False, omit_event_port=True) as (
+    async with driven_session(monkeypatch, omit_event_port=True) as (
         receiver,
         sess,
     ):
@@ -331,11 +307,13 @@ async def test_audio_setup_without_control_port_skips_sync(monkeypatch, tmp_path
     eld_file.write_bytes(
         b"".join(len(frame).to_bytes(4, "big") + frame for _ in range(4))
     )
-    monkeypatch.setenv("MIRROR_AUDIO_SEND", "1")
-    monkeypatch.setenv("MIRROR_AUDIO_ELD_FILE", str(eld_file))
-    monkeypatch.setenv("MIRROR_AUDIO_SYNC_EVERY", "1")
+    monkeypatch.setattr(session_mod, "AUDIO_SYNC_EVERY", 1)
 
-    async with driven_session(monkeypatch, omit_audio_control_port=True) as (
+    async with driven_session(
+        monkeypatch,
+        omit_audio_control_port=True,
+        session_kwargs={"eld_path": eld_file},
+    ) as (
         receiver,
         sess,
     ):
@@ -378,7 +356,6 @@ async def test_missing_pair32_logs_proven_key_unavailable(monkeypatch, caplog):
     so an unexecuted version of it would raise rather than warn.
     """
     caplog.set_level(logging.WARNING, logger="pyatv.protocols.airplay.mirror.session")
-    monkeypatch.delenv("MIRROR_PAIR32", raising=False)
 
     async with driven_session(monkeypatch, with_pair32=False) as (receiver, sess):
         await stream_then_stop(receiver, sess)
@@ -408,52 +385,6 @@ async def test_audio_setup_skipped_without_audio_ekey(monkeypatch):
     assert receiver.stream_setup_received
 
 
-async def test_audio_setup_disabled_by_env(monkeypatch):
-    """MIRROR_AUDIO_STREAM=0 suppresses the type-96 SETUP even with an ekey."""
-    monkeypatch.setenv("MIRROR_AUDIO_STREAM", "0")
-    async with driven_session(monkeypatch) as (receiver, sess):
-        await stream_then_stop(receiver, sess)
-
-    assert not receiver.audio_setup_received
-    assert receiver.setup_count == 1
-
-
-async def test_ekey_eiv_pinned_from_environment(monkeypatch):
-    """MIRROR_EKEY/MIRROR_EIV must be used verbatim in the video SETUP body.
-
-    The video SETUP carries ``ekey``/``eiv`` at the *top level* of the plist
-    (the audio SETUP has its own pair, from ``ctx.audio_ekey``), so this also
-    pins which of the two streams the override applies to.
-    """
-    import plistlib
-
-    pinned_ekey = bytes(range(72))
-    pinned_eiv = bytes(range(16))
-    monkeypatch.setenv("MIRROR_EKEY", pinned_ekey.hex())
-    monkeypatch.setenv("MIRROR_EIV", pinned_eiv.hex())
-
-    bodies: list[dict] = []
-
-    async with driven_session(monkeypatch) as (receiver, sess):
-        original = receiver._dispatch_setup
-
-        def _capture(body: bytes):
-            if body:
-                with contextlib.suppress(Exception):
-                    bodies.append(plistlib.loads(bytes(body)))
-            return original(body)
-
-        receiver._dispatch_setup = _capture
-        await stream_then_stop(receiver, sess)
-
-    video = [
-        b for b in bodies if any(s.get("type") == 110 for s in b.get("streams", []))
-    ]
-    assert video, bodies
-    assert video[0]["ekey"] == pinned_ekey
-    assert video[0]["eiv"] == pinned_eiv
-
-
 async def test_malformed_eld_file_stops_at_bad_length(monkeypatch, tmp_path):
     """A truncated ELD length prefix must end frame parsing, not overrun.
 
@@ -466,10 +397,10 @@ async def test_malformed_eld_file_stops_at_bad_length(monkeypatch, tmp_path):
     eld_file = tmp_path / "truncated.eld"
     eld_file.write_bytes(good + truncated)
 
-    monkeypatch.setenv("MIRROR_AUDIO_SEND", "1")
-    monkeypatch.setenv("MIRROR_AUDIO_ELD_FILE", str(eld_file))
-
-    async with driven_session(monkeypatch) as (receiver, sess):
+    async with driven_session(monkeypatch, session_kwargs={"eld_path": eld_file}) as (
+        receiver,
+        sess,
+    ):
         await stream_then_stop(receiver, sess, video_frames=2)
 
     # The two readable frames were sent; the bad one contributed nothing.
@@ -482,10 +413,10 @@ async def test_empty_eld_file_warns_and_sends_no_audio(monkeypatch, tmp_path, ca
     eld_file = tmp_path / "empty.eld"
     eld_file.write_bytes((0).to_bytes(4, "big"))
 
-    monkeypatch.setenv("MIRROR_AUDIO_SEND", "1")
-    monkeypatch.setenv("MIRROR_AUDIO_ELD_FILE", str(eld_file))
-
-    async with driven_session(monkeypatch) as (receiver, sess):
+    async with driven_session(monkeypatch, session_kwargs={"eld_path": eld_file}) as (
+        receiver,
+        sess,
+    ):
         await stream_then_stop(receiver, sess)
 
     assert any(
@@ -501,11 +432,6 @@ async def test_no_ekey_omits_stream_keys_from_setup(monkeypatch):
     keys out rather than writing ``None`` into the plist, which plistlib would
     refuse to serialise.
     """
-    import plistlib
-
-    monkeypatch.delenv("MIRROR_EKEY", raising=False)
-    monkeypatch.delenv("MIRROR_EIV", raising=False)
-
     bodies: list[dict] = []
 
     async with driven_session(monkeypatch, with_ekey=False) as (receiver, sess):
@@ -526,35 +452,6 @@ async def test_no_ekey_omits_stream_keys_from_setup(monkeypatch):
     assert video, bodies
     assert "ekey" not in video[0], video[0]
     assert "eiv" not in video[0], video[0]
-
-
-async def test_dead_media_control_port_warns_and_continues(monkeypatch, caplog):
-    """A control port nothing listens on must warn, not raise.
-
-    The AVConference dialect negotiates a separate media-data-control channel.
-    A receiver that advertises the port but never opens it is a documented
-    real-world failure (it is why the receiver never opens its UDP data port),
-    so the sender retries, then warns and carries on rather than aborting.
-    """
-    caplog.set_level(logging.WARNING, logger="pyatv.protocols.airplay.mirror.session")
-
-    async with driven_session(monkeypatch, tcp=False, dead_control_port=True) as (
-        receiver,
-        sess,
-    ):
-        await stream_then_stop(receiver, sess)
-
-    matching = [
-        r.getMessage()
-        for r in caplog.records
-        if "Media-data-control channel unavailable" in r.getMessage()
-    ]
-    assert matching, [r.getMessage() for r in caplog.records]
-    # The warning must report the port and the attempt count it actually used.
-    assert "on port 1" in matching[0], matching[0]
-    assert f"after {session_mod.CONTROL_CHANNEL_ATTEMPTS} " in matching[0], matching[0]
-    # Nothing connected to the real control server.
-    assert receiver.control_server.frames_received == 0
 
 
 # ---------------------------------------------------------------------------
@@ -580,55 +477,6 @@ async def test_audio_stream_setup_is_idempotent(monkeypatch):
         assert receiver.setup_count == 1
 
 
-async def test_network_info_protocol_logs_connection_and_data(caplog):
-    """``_NetworkInfoProtocol`` is a diagnostic listener that nothing dials.
-
-    It is never instantiated in production (the receiver turned out not to
-    connect to ``networkInfo.Port``), so its two log calls can only be reached
-    by calling the ``asyncio.Protocol`` callbacks the way the event loop would.
-    """
-    caplog.set_level(logging.DEBUG, logger="pyatv.protocols.airplay.mirror.session")
-    proto = session_mod._NetworkInfoProtocol()
-
-    transport = MagicMock()
-    transport.get_extra_info.return_value = ("10.0.0.1", 7000)
-    proto.connection_made(transport)
-    proto.data_received(b"\xde\xad\xbe\xef")
-
-    messages = [r.getMessage() for r in caplog.records]
-    assert any(
-        "inbound connection from ('10.0.0.1', 7000)" in m for m in messages
-    ), messages
-    assert any("received 4 bytes: deadbeef" in m for m in messages), messages
-
-
-async def test_build_announce_sdp_shape():
-    """The ANNOUNCE SDP builder is dead in the modern flow but still exported.
-
-    Modern mirroring sends no ANNOUNCE at all (the MVP integration test
-    asserts it), so nothing else executes this. Pin its shape so it cannot rot
-    into a broken f-string unnoticed.
-    """
-    sdp = session_mod._build_announce_sdp(
-        session_id=12345,
-        local_ip="10.0.0.2",
-        remote_ip="10.0.0.1",
-        width=1920,
-        height=1080,
-        fps=60,
-        audio_sample_rate=44100,
-        audio_channels=2,
-    )
-    assert sdp.startswith("v=0\r\n")
-    assert "o=AirPlay 12345 0 IN IP4 10.0.0.2\r\n" in sdp
-    assert "c=IN IP4 10.0.0.1\r\n" in sdp
-    assert "m=video 0 RTP/AVP 96\r\n" in sdp
-    # It must NOT carry stream keys -- that is the whole point of the note on
-    # the function.
-    assert "fpaeskey" not in sdp
-    assert "aesiv" not in sdp
-
-
 async def test_dead_audio_data_port_logs_the_icmp_error(monkeypatch, tmp_path, caplog):
     """A screen-audio dataPort nothing listens on must surface the UDP error.
 
@@ -648,10 +496,11 @@ async def test_dead_audio_data_port_logs_the_icmp_error(monkeypatch, tmp_path, c
     eld_file.write_bytes(
         b"".join(len(frame).to_bytes(4, "big") + frame for _ in range(4))
     )
-    monkeypatch.setenv("MIRROR_AUDIO_SEND", "1")
-    monkeypatch.setenv("MIRROR_AUDIO_ELD_FILE", str(eld_file))
-
-    async with driven_session(monkeypatch, dead_audio_data_port=True) as (
+    async with driven_session(
+        monkeypatch,
+        dead_audio_data_port=True,
+        session_kwargs={"eld_path": eld_file},
+    ) as (
         receiver,
         sess,
     ):
@@ -677,7 +526,7 @@ async def test_a_stopped_session_refuses_to_run_again(monkeypatch):
     from whichever layer noticed the closed socket first, which does not tell
     the caller what they actually did.
     """
-    async with driven_session(monkeypatch, tcp=True) as (receiver, sess):
+    async with driven_session(monkeypatch) as (receiver, sess):
         await stream_then_stop(receiver, sess)
 
         with pytest.raises(RuntimeError, match="already stopped"):
@@ -707,7 +556,7 @@ async def test_a_dropped_receiver_does_not_end_the_session(monkeypatch, channel)
     Unlike the other tests in this file, it guards no defect; it makes a
     silent behaviour explicit.
     """
-    async with driven_session(monkeypatch, tcp=True) as (receiver, sess):
+    async with driven_session(monkeypatch) as (receiver, sess):
         task = asyncio.ensure_future(sess.run())
         try:
             await asyncio.wait_for(
@@ -754,9 +603,7 @@ async def test_stop_during_setup_leaves_no_task_registered_after_it(
     ``run()`` in this harness at all -- it needs repeated turns -- so a test
     that slept once would register nothing and pass against any behaviour.
     """
-    monkeypatch.setenv("MIRROR_AUDIO_SEND", "1")
-
-    async with driven_session(monkeypatch, tcp=True) as (receiver, sess):
+    async with driven_session(monkeypatch) as (receiver, sess):
         task = asyncio.ensure_future(sess.run())
         try:
             for _ in range(yields):
@@ -801,7 +648,7 @@ def _annexb(*nalus: bytes) -> bytes:
 async def test_the_live_encoder_path_parses_a_stream_off_a_subprocess(
     monkeypatch, tmp_path
 ):
-    """``MIRROR_LIVE_CMD``, which the package note calls deliberately untested.
+    """``video_command``, which the package note calls deliberately untested.
 
     The reason given there is that it "needs an external encoder", and that
     is true of end-to-end fidelity and not of the parsing. What the branch
@@ -831,9 +678,11 @@ async def test_the_live_encoder_path_parses_a_stream_off_a_subprocess(
         "import sys\n" "sys.stdout.buffer.write(open(%r, 'rb').read())\n" % str(source),
         encoding="utf-8",
     )
-    monkeypatch.setenv("MIRROR_LIVE_CMD", '"%s" "%s"' % (sys.executable, feeder))
+    live_cmd = '"%s" "%s"' % (sys.executable, feeder)
 
-    async with driven_session(monkeypatch, tcp=True) as (receiver, sess):
+    async with driven_session(
+        monkeypatch, session_kwargs={"video_command": live_cmd}
+    ) as (receiver, sess):
         # Three MESSAGES: the plaintext config frame, then one per access
         # unit. Waiting for only the config would pass even when nothing
         # classifies a slice as one -- the branch that misroutes every VCL
@@ -873,7 +722,7 @@ async def test_the_live_encoder_path_parses_a_stream_off_a_subprocess(
 async def test_the_live_audio_reader_parses_length_prefixed_frames(
     monkeypatch, tmp_path
 ):
-    """``MIRROR_AUDIO_LIVE_CMD``, the other arm the note calls untested.
+    """``audio_command``, the other arm the note calls untested.
 
     Same shape as the live video path and the same objection answered: the
     reader wants a subprocess writing 4-byte big-endian lengths followed by
@@ -908,11 +757,12 @@ async def test_the_live_audio_reader_parses_length_prefixed_frames(
         encoding="utf-8",
     )
 
-    monkeypatch.setenv("MIRROR_AUDIO_SEND", "1")
-    monkeypatch.setenv("MIRROR_AUDIO_LIVE_CMD", '"%s" "%s"' % (sys.executable, feeder))
-    monkeypatch.setenv("MIRROR_AUDIO_PREBUFFER", "1")
+    monkeypatch.setattr(session_mod, "AUDIO_PREBUFFER", 1)
+    audio_cmd = '"%s" "%s"' % (sys.executable, feeder)
 
-    async with driven_session(monkeypatch, tcp=True) as (receiver, sess):
+    async with driven_session(
+        monkeypatch, session_kwargs={"audio_command": audio_cmd}
+    ) as (receiver, sess):
         # Not `stream_then_stop`: that waits on VIDEO, which is ready almost
         # at once, and would stop the session while the audio subprocess is
         # still starting. Wait for audio itself.
@@ -970,7 +820,7 @@ async def test_the_event_channel_frames_on_content_length_not_on_a_blank_line(
     ]
     assert b"\r\n\r\n" in bodies[0], "the fixture must carry a blank line"
 
-    async with driven_session(monkeypatch, tcp=True, command_bodies=bodies) as (
+    async with driven_session(monkeypatch, command_bodies=bodies) as (
         receiver,
         sess,
     ):
@@ -1009,9 +859,11 @@ async def test_a_live_stream_missing_its_pps_sends_no_video(monkeypatch, tmp_pat
         "import sys\nsys.stdout.buffer.write(open(%r, 'rb').read())\n" % str(source),
         encoding="utf-8",
     )
-    monkeypatch.setenv("MIRROR_LIVE_CMD", '"%s" "%s"' % (sys.executable, feeder))
+    live_cmd = '"%s" "%s"' % (sys.executable, feeder)
 
-    async with driven_session(monkeypatch, tcp=True) as (receiver, sess):
+    async with driven_session(
+        monkeypatch, session_kwargs={"video_command": live_cmd}
+    ) as (receiver, sess):
         task = asyncio.ensure_future(sess.run())
         try:
             # Wait on the feeder exiting rather than on a clock: once the
@@ -1087,9 +939,11 @@ async def test_the_access_unit_keeps_its_sei_ahead_of_the_slice(monkeypatch, tmp
         "import sys\nsys.stdout.buffer.write(open(%r, 'rb').read())\n" % str(source),
         encoding="utf-8",
     )
-    monkeypatch.setenv("MIRROR_LIVE_CMD", '"%s" "%s"' % (sys.executable, feeder))
+    live_cmd = '"%s" "%s"' % (sys.executable, feeder)
 
-    async with driven_session(monkeypatch, tcp=True) as (receiver, sess):
+    async with driven_session(
+        monkeypatch, session_kwargs={"video_command": live_cmd}
+    ) as (receiver, sess):
         # NOT `wait_frames`: the counter it drives ticks once per TCP read,
         # so two "frames" can be one message arriving in two chunks, or two
         # messages arriving in one. Wait for what is actually being read --
@@ -1117,58 +971,11 @@ async def test_the_access_unit_keeps_its_sei_ahead_of_the_slice(monkeypatch, tmp
     assert len(messages) >= 2, "expected a config frame and an access unit"
 
     pair32 = bytes.fromhex("66" * 32)
-    key, iv = framing.derive_tcp_stream_key_iv(raw16, pair32, sid, flag=True)
+    key, iv = framing.derive_tcp_stream_key_iv(raw16, pair32, sid)
     plain = framing.MirrorEncryptor.from_key_iv(key, iv).encrypt(messages[1])
 
     assert plain == tcp_stream.to_avcc([sei, idr]), (
         "access unit came out as %s" % plain[:8].hex()
-    )
-
-
-@pytest.mark.asyncio
-async def test_a_live_source_is_killed_even_when_setup_fails_after_spawning_it(
-    monkeypatch, tmp_path
-):
-    """The subprocess outlives the session if nothing owns it.
-
-    ``_tcp_live_video`` spawns the source, records it, and only then
-    reads ``MIRROR_LIVE_BUFFER`` to size its queue. A non-numeric value
-    raises there -- after the process exists and before the ``try`` whose
-    ``finally`` kills it -- so the process is left running with nothing
-    holding a reference that anything acts on.
-
-    ``stop()`` is where that has to be caught, because ``stop()`` is the
-    only thing that runs no matter how the producer left. A real source is
-    ffmpeg or yt-dlp, so the leak is a pipeline that keeps encoding and
-    keeps downloading after the mirror session is gone.
-    """
-    feeder = tmp_path / "sleeper.py"
-    feeder.write_text("import time\ntime.sleep(300)\n", encoding="utf-8")
-    monkeypatch.setenv("MIRROR_LIVE_CMD", '"%s" "%s"' % (sys.executable, feeder))
-    monkeypatch.setenv("MIRROR_LIVE_BUFFER", "not-a-number")
-
-    async with driven_session(monkeypatch, tcp=True) as (receiver, sess):
-        task = asyncio.ensure_future(sess.run())
-        deadline = asyncio.get_event_loop().time() + GUARD_TIMEOUT
-        while sess._live_proc is None:  # noqa: SLF001
-            if asyncio.get_event_loop().time() > deadline:
-                break
-            await asyncio.sleep(0.01)
-        proc = sess._live_proc  # noqa: SLF001
-        assert proc is not None, "the live source was never spawned"
-
-        await sess.stop()
-        task.cancel()
-        with contextlib.suppress(BaseException):
-            await task
-
-        for _ in range(50):
-            if proc.returncode is not None:
-                break
-            await asyncio.sleep(0.02)
-
-    assert proc.returncode is not None, (
-        "the live source is still running after stop(); pid %d" % proc.pid
     )
 
 
@@ -1185,7 +992,7 @@ async def test_a_full_live_queue_drops_the_oldest_access_unit(monkeypatch, tmp_p
     Both spellings deliver "fewer access units than the source had", so a
     count cannot tell them apart. WHICH ones arrive can: dropping keeps the
     tail, dying keeps the head. The reader gets its head start from
-    ``MIRROR_LIVE_PREBUFFER``, which the sender sleeps through before its
+    ``LIVE_VIDEO_PREBUFFER``, which the sender sleeps through before its
     first send, so no race is being relied on.
     """
     sei_free = [b"\x41" + bytes([0xB0 + i]) * 24 for i in range(6)]
@@ -1197,10 +1004,12 @@ async def test_a_full_live_queue_drops_the_oldest_access_unit(monkeypatch, tmp_p
         "import sys\nsys.stdout.buffer.write(open(%r, 'rb').read())\n" % str(source),
         encoding="utf-8",
     )
-    monkeypatch.setenv("MIRROR_LIVE_CMD", '"%s" "%s"' % (sys.executable, feeder))
-    monkeypatch.setenv("MIRROR_LIVE_BUFFER", "2")
+    monkeypatch.setattr(session_mod, "LIVE_VIDEO_BUFFER", 2)
+    live_cmd = '"%s" "%s"' % (sys.executable, feeder)
 
-    async with driven_session(monkeypatch, tcp=True) as (receiver, sess):
+    async with driven_session(
+        monkeypatch, session_kwargs={"video_command": live_cmd}
+    ) as (receiver, sess):
         task = asyncio.ensure_future(sess.run())
         try:
             deadline = asyncio.get_event_loop().time() + GUARD_TIMEOUT
@@ -1224,7 +1033,7 @@ async def test_a_full_live_queue_drops_the_oldest_access_unit(monkeypatch, tmp_p
     assert len(messages) >= 2, "no access unit followed the config frame"
 
     pair32 = bytes.fromhex("66" * 32)
-    key, iv = framing.derive_tcp_stream_key_iv(raw16, pair32, sid, flag=True)
+    key, iv = framing.derive_tcp_stream_key_iv(raw16, pair32, sid)
     first_au = framing.MirrorEncryptor.from_key_iv(key, iv).encrypt(messages[1])
 
     assert first_au != tcp_stream.to_avcc([sei_free[0]]), (
@@ -1254,7 +1063,7 @@ async def test_the_receiver_closing_the_event_channel_does_not_end_the_session(
     of that reader the suite never reached -- the empty read itself, which
     no other test produces because the fake keeps its connection open.
     """
-    async with driven_session(monkeypatch, tcp=True, hang_up_event_channel=True) as (
+    async with driven_session(monkeypatch, hang_up_event_channel=True) as (
         receiver,
         sess,
     ):

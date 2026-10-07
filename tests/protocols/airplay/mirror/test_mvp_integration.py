@@ -16,13 +16,11 @@ from pyatv.protocols.airplay.mirror import (
     fairplay_sap,
     framing,
 )
+from pyatv.protocols.airplay.mirror import session as session_mod
 from pyatv.support.http import http_connect
 from pyatv.support.rtsp import RtspSession
 
-from tests.protocols.airplay.mirror.fake_receiver import (
-    FakeMirrorReceiver,
-    RawChannelOpener,
-)
+from tests.protocols.airplay.mirror.fake_receiver import FakeMirrorReceiver
 
 TEST_FILE = Path(__file__).parent / "test_pattern.h264"
 
@@ -45,15 +43,13 @@ GUARD_TIMEOUT = 60.0
 pytestmark = pytest.mark.asyncio
 
 
-@pytest.mark.parametrize("tcp", [False, True], ids=["avconference", "tcp"])
 async def test_mvp_streams_to_fake_receiver_after_mfisap_handshake(
-    monkeypatch, tmp_path, tcp
+    monkeypatch, tmp_path
 ):
     """A real MFiSAP handshake must feed a stream the receiver actually sees.
 
-    Both wire dialects are covered: the AVConference flow (session-init SETUP,
-    UDP ``dataPort``) and the TCP flow that renders on tvOS 26 (audio
-    SETUP first, RECORD, then a type-110 video SETUP over a TCP ``dataPort``).
+    The flow is the one that renders on tvOS 26: audio SETUP first, RECORD,
+    then a type-110 video SETUP over a TCP ``dataPort``.
 
     Scope, because there are two unrelated handshakes in this package and the
     name used to blur them: the *MFiSAP* handshake below is real, run over the
@@ -64,32 +60,22 @@ async def test_mvp_streams_to_fake_receiver_after_mfisap_handshake(
     is deliberate; ``test_real_fairplay_material_crosses_into_session`` is the
     one that puts genuine ``fairplay_sap`` output through the same session.
     """
-    monkeypatch.setenv("MIRROR_TCP", "1" if tcp else "0")
-    # The TCP-dialect video producer waits out a decoder-warmup delay before its
-    # first encrypted frame. asyncio.sleep is stubbed repo-wide, so the value
-    # costs no real time, but pin it so the test does not depend on the default.
-    monkeypatch.setenv("MIRROR_CONFIG_DELAY", "0")
-    if tcp:
-        # Screen audio: AAC-ELD frames over UDP/RTP, AES-128-CBC keyed from
-        # raw16 + the media pair-verify shared secret. Off by default in
-        # production, so it has to be switched on explicitly here.
-        eld_file = tmp_path / "silence.eld"
-        frame = bytes(range(64))
-        eld_file.write_bytes(
-            b"".join(len(frame).to_bytes(4, "big") + frame for _ in range(4))
-        )
-        monkeypatch.setenv("MIRROR_AUDIO_SEND", "1")
-        monkeypatch.setenv("MIRROR_AUDIO_ELD_FILE", str(eld_file))
-        monkeypatch.setenv("MIRROR_PAIR32", "66" * 32)
-        # One sync packet per audio frame, so the sync path is exercised
-        # by frame count rather than by elapsed time.
-        monkeypatch.setenv("MIRROR_AUDIO_SYNC_EVERY", "1")
+    # Screen audio: AAC-ELD frames over UDP/RTP, AES-128-CBC keyed from
+    # raw16 + the media pair-verify shared secret. Off by default in
+    # production, so it has to be switched on explicitly here.
+    eld_file = tmp_path / "silence.eld"
+    frame = bytes(range(64))
+    eld_file.write_bytes(
+        b"".join(len(frame).to_bytes(4, "big") + frame for _ in range(4))
+    )
+    # One sync packet per audio frame, so the sync path is exercised
+    # by frame count rather than by elapsed time.
+    monkeypatch.setattr(session_mod, "AUDIO_SYNC_EVERY", 1)
 
-    receiver = FakeMirrorReceiver(tcp=tcp)
+    receiver = FakeMirrorReceiver()
     host, port = await receiver.start()
 
     connection = None
-    opener = RawChannelOpener()
     sess = None
     run_task = None
     try:
@@ -104,16 +90,13 @@ async def test_mvp_streams_to_fake_receiver_after_mfisap_handshake(
         # Build the session context with the handshake's stream encryptor
         rtsp = RtspSession(connection)
         ctx = MirrorContext(stream_encryptor=sm.stream_encryptor)
-        if tcp:
-            # The TCP dialect transports a FairPlay-wrapped stream key in
-            # the SETUP body and keys the video from the raw16 it wraps. The
-            # fake receiver does not unwrap it, but supplying both exercises
-            # the real key-transport and key-derivation code paths.
-            ctx.audio_ekey = b"\x33" * 72
-            ctx.ekey = b"\x44" * 72
-            ctx.stream_raw16 = b"\x55" * 16
-        # The screen-video key is derived via verifier.encryption_keys
-        # (DataStream HKDF over the pair-verify secret) -> pair of 32-byte keys.
+        # A FairPlay-wrapped stream key is transported in the SETUP body and
+        # the video is keyed from the raw16 it wraps. The fake receiver does
+        # not unwrap it, but supplying both exercises the real key-transport
+        # and key-derivation code paths.
+        ctx.audio_ekey = b"\x33" * 72
+        ctx.ekey = b"\x44" * 72
+        ctx.stream_raw16 = b"\x55" * 16
         verifier = MagicMock()
         verifier.encryption_keys.return_value = (b"\x11" * 32, b"\x22" * 32)
         verifier.srp._shared = b"\x66" * 32
@@ -122,7 +105,8 @@ async def test_mvp_streams_to_fake_receiver_after_mfisap_handshake(
             verifier=verifier,
             ctx=ctx,
             h264_path=TEST_FILE,
-            channel_opener=opener,
+            eld_path=eld_file,
+            pair_secret=b"\x66" * 32,
         )
 
         # Drive the session until the receiver has counted enough video writes.
@@ -148,15 +132,14 @@ async def test_mvp_streams_to_fake_receiver_after_mfisap_handshake(
             run_task.result()  # re-raise whatever killed the session
             pytest.fail("MirrorSession.run() returned before streaming started")
         await wait_frames
-        if tcp:
-            await asyncio.wait_for(
-                receiver.event_server.command_answered.wait(),
-                timeout=GUARD_TIMEOUT,
-            )
-            await receiver.audio_data_server.wait_frames(
-                REQUIRED_VIDEO_FRAMES, timeout=GUARD_TIMEOUT
-            )
-            await receiver.audio_control_server.wait_frames(1, timeout=GUARD_TIMEOUT)
+        await asyncio.wait_for(
+            receiver.event_server.command_answered.wait(),
+            timeout=GUARD_TIMEOUT,
+        )
+        await receiver.audio_data_server.wait_frames(
+            REQUIRED_VIDEO_FRAMES, timeout=GUARD_TIMEOUT
+        )
+        await receiver.audio_control_server.wait_frames(1, timeout=GUARD_TIMEOUT)
 
         await sess.stop()
         try:
@@ -164,18 +147,17 @@ async def test_mvp_streams_to_fake_receiver_after_mfisap_handshake(
         except (asyncio.CancelledError, asyncio.TimeoutError):
             pass
 
-        if tcp:
-            # Teardown must mean teardown: no sync packets after stop(). The
-            # screen-audio sender runs on its own task, so this is the only
-            # thing that catches it outliving the session. Twenty event-loop
-            # turns is far more than the one-turn-per-frame a runaway sender
-            # needs (asyncio.sleep is stubbed to a plain yield).
-            settled = receiver.audio_control_server.frames_received
-            for _ in range(20):
-                await asyncio.sleep(0)
-            assert (
-                receiver.audio_control_server.frames_received == settled
-            ), "screen-audio sender still running after stop()"
+        # Teardown must mean teardown: no sync packets after stop(). The
+        # screen-audio sender runs on its own task, so this is the only
+        # thing that catches it outliving the session. Twenty event-loop
+        # turns is far more than the one-turn-per-frame a runaway sender
+        # needs (asyncio.sleep is stubbed to a plain yield).
+        settled = receiver.audio_control_server.frames_received
+        for _ in range(20):
+            await asyncio.sleep(0)
+        assert (
+            receiver.audio_control_server.frames_received == settled
+        ), "screen-audio sender still running after stop()"
 
         # Assertions on the receiver state.
         # Every captured constant in the SETUP bodies still matches the wire
@@ -184,23 +166,19 @@ async def test_mvp_streams_to_fake_receiver_after_mfisap_handshake(
         receiver.assert_protocol_ok()
         # Modern mirroring sends no ANNOUNCE/SDP.
         assert not receiver.announce_received, "ANNOUNCE must not be sent"
-        if tcp:
-            # The reference sender opens with the type-96 audio SETUP (which carries the
-            # eventPort) and has no metadata-only session init.
-            assert receiver.audio_setup_received, "audio SETUP not received"
-            assert not receiver.session_setup_received
-            # The event channel is bidirectional RTSP with the receiver as the
-            # client. A sender that leaves POST /command unanswered gets the
-            # session torn down after ~30 s, so check we replied 200.
-            assert (
-                receiver.event_server.command_answered.is_set()
-            ), "sender never answered the receiver's POST /command"
-            reply = receiver.event_server.command_response
-            assert reply.startswith(b"RTSP/1.0 200 OK\r\n"), reply[:64]
-            assert b"CSeq: 7\r\n" in reply, reply[:64]
-        else:
-            assert receiver.session_setup_received, "session-init SETUP not received"
-            assert not receiver.audio_setup_received
+        # The reference sender opens with the type-96 audio SETUP (which
+        # carries the eventPort) and has no metadata-only session init.
+        assert receiver.audio_setup_received, "audio SETUP not received"
+        assert not receiver.session_setup_received
+        # The event channel is bidirectional RTSP with the receiver as the
+        # client. A sender that leaves POST /command unanswered gets the
+        # session torn down after ~30 s, so check we replied 200.
+        assert (
+            receiver.event_server.command_answered.is_set()
+        ), "sender never answered the receiver's POST /command"
+        reply = receiver.event_server.command_response
+        assert reply.startswith(b"RTSP/1.0 200 OK\r\n"), reply[:64]
+        assert b"CSeq: 7\r\n" in reply, reply[:64]
         assert receiver.stream_setup_received, "stream SETUP not received"
         assert (
             receiver.setup_count == 2
@@ -212,16 +190,10 @@ async def test_mvp_streams_to_fake_receiver_after_mfisap_handshake(
         ), f"too few video bursts: {receiver.video_server.frames_received}"
         # And we actually saw bytes
         assert receiver.video_server.bytes_received > 0
-        # The media-data-control channel carries no media in either dialect.
-        assert receiver.control_server.frames_received == 0
-        if tcp:
-            assert receiver.audio_data_server.bytes_received > 0
-            # The 0xD4 sync packet is what makes the receiver schedule audio
-            # at all; it is a 20-byte RAOP SyncPacket with PT 84.
-            assert receiver.audio_control_server.frames_received >= 1
-        else:
-            # The AVConference stream SETUP negotiates video only.
-            assert receiver.audio_data_server.frames_received == 0
+        assert receiver.audio_data_server.bytes_received > 0
+        # The 0xD4 sync packet is what makes the receiver schedule audio
+        # at all; it is a 20-byte RAOP SyncPacket with PT 84.
+        assert receiver.audio_control_server.frames_received >= 1
     finally:
         if sess is not None:
             try:
@@ -234,7 +206,6 @@ async def test_mvp_streams_to_fake_receiver_after_mfisap_handshake(
                 await run_task
             except BaseException:
                 pass
-        opener.close_all()
         if connection is not None:
             try:
                 connection.close()
@@ -287,9 +258,6 @@ async def test_real_fairplay_material_crosses_into_session(monkeypatch):
     assert ekey.hex() == vector["ekey"]
 
     pair32 = bytes.fromhex("66" * 32)
-    monkeypatch.setenv("MIRROR_TCP", "1")
-    monkeypatch.setenv("MIRROR_CONFIG_DELAY", "0")
-    monkeypatch.setenv("MIRROR_PAIR32", pair32.hex())
 
     # Record what the session's video-key derivation is actually handed. The
     # derived key never reaches the context (it stays a local in `_stream`), so
@@ -305,11 +273,10 @@ async def test_real_fairplay_material_crosses_into_session(monkeypatch):
 
     monkeypatch.setattr(framing, "derive_tcp_stream_key_iv", recording_derive)
 
-    receiver = FakeMirrorReceiver(tcp=True)
+    receiver = FakeMirrorReceiver()
     host, port = await receiver.start()
 
     connection = None
-    opener = RawChannelOpener()
     sess = None
     run_task = None
     try:
@@ -332,7 +299,7 @@ async def test_real_fairplay_material_crosses_into_session(monkeypatch):
             verifier=verifier,
             ctx=ctx,
             h264_path=TEST_FILE,
-            channel_opener=opener,
+            pair_secret=pair32,
         )
 
         # Same deterministic wait as the MVP test: the fake signals the Nth
@@ -406,7 +373,6 @@ async def test_real_fairplay_material_crosses_into_session(monkeypatch):
                 await run_task
             except BaseException:
                 pass
-        opener.close_all()
         if connection is not None:
             try:
                 connection.close()

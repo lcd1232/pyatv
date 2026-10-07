@@ -1,10 +1,11 @@
 """MirrorSession: orchestrates the AirPlay 2 mirror MVP.
 
 Phases:
-  A. Setup: SETUP (session init) → RECORD → SETUP (streams) → open data
-     channels. This order is the modern AirPlay 2 mirror flow captured
-     from a real macOS sender in Phase 28; there is no ANNOUNCE/SDP.
-  B. Streaming: spawn pacer + drain tasks for video and audio.
+  A. Setup: SETUP (audio, type 96) → connect eventPort → RECORD → SETUP
+     (video, type 110) → connect the raw-TCP video dataPort. There is no
+     ANNOUNCE/SDP.
+  B. Streaming: spawn the video producer + drain task (and, when a source is
+     given, the screen-audio sender).
   C. Teardown: cancel tasks, send TEARDOWN, close channels.
 
 The HTTP / pair-verify / MFiSAP setup happens before this class is
@@ -19,28 +20,20 @@ import asyncio
 import contextlib
 import hashlib
 import logging
-import os
 from pathlib import Path
-import plistlib
 import secrets
 import socket
-import struct
 import time
-from typing import Awaitable, Callable, Optional, Tuple, cast
+from typing import Optional, cast
 from uuid import uuid4
 
 from pyatv import exceptions
-from pyatv.auth.hap_channel import AbstractHAPChannel
 from pyatv.auth.hap_pairing import PairVerifyProcedure
 from pyatv.core.protocol import heartbeater
-from pyatv.protocols.airplay import channels
 from pyatv.protocols.airplay.mirror import (
     framing,
-    negotiation,
     pacer,
-    rtp,
     screen_audio,
-    srtp,
     streams,
     tcp_stream,
 )
@@ -53,23 +46,6 @@ from pyatv.support.rtsp import RtspSession
 _LOGGER = logging.getLogger(__name__)
 
 FEEDBACK_INTERVAL = 2.0  # seconds, matches AP2Session.start_keep_alive
-
-# Salt/info strings for HKDF derivation on the per-channel HAP encryption.
-# These names follow the AP2 convention used elsewhere in pyatv (DataStream-Salt
-# etc.); the exact strings the receiver expects will be confirmed during
-# hardware integration.
-#
-# The MirrorVideo-* trio that used to sit here is gone: the video key turned
-# out not to be HAP-derived at all. It is the FairPlay one built in
-# framing.derive_tcp_stream_key_iv, so those three labels had no reader.
-MIRROR_AUDIO_SALT = "MirrorAudio-Salt"
-MIRROR_AUDIO_OUTPUT_INFO = "MirrorAudio-Output-Encryption-Key"
-MIRROR_AUDIO_INPUT_INFO = "MirrorAudio-Input-Encryption-Key"
-# Media-data-control channel. Follows pyatv's data-stream convention from
-# ap2_session.py, where the salt carries the seed the sender chose.
-MIRROR_CONTROL_SALT = "DataStream-Salt"  # seed appended
-MIRROR_CONTROL_OUTPUT_INFO = "DataStream-Output-Encryption-Key"
-MIRROR_CONTROL_INPUT_INFO = "DataStream-Input-Encryption-Key"
 
 QUEUE_HIGH_WATERMARK = 256
 
@@ -90,39 +66,31 @@ MIRROR_USER_AGENT = "AirPlay/870.14.1"
 #: Seconds to wait for the stream SETUP response.
 STREAM_SETUP_TIMEOUT = 30.0
 
-#: The receiver may not be listening on the control port the instant it
-#: answers the stream SETUP, so the connection is retried briefly.
-CONTROL_CHANNEL_ATTEMPTS = 6
-CONTROL_CHANNEL_RETRY_DELAY = 0.4
+#: Encryption type of both stream SETUPs: FairPlay SAP v3, with the stream
+#: key transported in ``ekey``/``eiv``.
+STREAM_ET = 32
 
-# Event channel, shared with pyatv's AirPlay 2 remote-control session.
-# NB: read/write are reversed for the event channel.
-EVENTS_SALT = "Events-Salt"
-EVENTS_WRITE_INFO = "Events-Write-Encryption-Key"
-EVENTS_READ_INFO = "Events-Read-Encryption-Key"
+#: Offset of the 16-byte FairPlay SAP secret inside the SAP context, used when
+#: no chosen ``stream_raw16`` is available.
+SAP_SECRET_OFFSET = 8
 
+#: Seconds between the plaintext avcC config message and the first encrypted
+#: frame, so the receiver can initialise its decoder first.
+CONFIG_DELAY = 0.3
 
-class _NetworkInfoProtocol(asyncio.Protocol):
-    """Listener for the port advertised as ``networkInfo.Port``.
+#: Access units buffered from a live video source (oldest dropped when full).
+LIVE_VIDEO_BUFFER = 90
+#: Seconds to let a live video source buffer before the first frame is sent.
+LIVE_VIDEO_PREBUFFER = 0.5
 
-    It is not yet established whether the receiver dials this port for the
-    mirroring media/control connection or whether the sender is expected to
-    connect outward to the ``dataPort`` it returns (which currently refuses
-    TCP). Log whatever arrives so the next live run answers that.
-    """
-
-    def connection_made(self, transport) -> None:
-        """Log an inbound connection from the receiver."""
-        _LOGGER.debug(
-            "networkInfo port: inbound connection from %s",
-            transport.get_extra_info("peername"),
-        )
-
-    def data_received(self, data: bytes) -> None:
-        """Log data arriving on the advertised networkInfo port."""
-        _LOGGER.debug(
-            "networkInfo port: received %d bytes: %s", len(data), data[:64].hex()
-        )
+#: AAC-ELD frames buffered from a live audio source (oldest dropped when full).
+AUDIO_LIVE_BUFFER = 1200
+#: Frames a live audio source must buffer (~2 s) before sending starts.
+AUDIO_PREBUFFER = 180
+#: Send one screen-audio sync packet every this many frames (~1/s).
+AUDIO_SYNC_EVERY = max(
+    1, int(screen_audio.AUDIO_SAMPLE_RATE / screen_audio.AUDIO_SAMPLES_PER_FRAME)
+)
 
 
 def _device_id_from_uuid(uuid_str: str) -> str:
@@ -139,54 +107,6 @@ def _device_id_from_uuid(uuid_str: str) -> str:
     return ":".join(hex12[i : i + 2] for i in range(0, 12, 2))
 
 
-def _tcp_mode() -> bool:
-    """Whether to speak the TCP mirror dialect (default) vs AVConference.
-
-    The reference sender's simple type-110 SETUP + raw-TCP 128-byte-framed continuous
-    AES-CTR video is the path that actually renders on tvOS 26 (the video key
-    derivation was verified by decrypting the reference sender's live stream). Set
-    ``MIRROR_TCP=0`` to fall back to the experimental AVConference path.
-    """
-    return os.environ.get("MIRROR_TCP", "1") != "0"
-
-
-ChannelOpener = Callable[
-    [Callable[[bytes, bytes], AbstractHAPChannel], str, int, str, str, str],
-    Awaitable[Tuple[asyncio.BaseTransport, AbstractHAPChannel]],
-]
-
-
-def _build_announce_sdp(
-    session_id: int,
-    local_ip: str,
-    remote_ip: str,
-    width: int,
-    height: int,
-    fps: int,
-    audio_sample_rate: int,
-    audio_channels: int,
-) -> str:
-    """SDP body for the mirror ANNOUNCE.
-
-    NOTE: Unlike the AirPlay 1 SDP, this body does NOT carry fpaeskey/aesiv
-    attributes. The AES key/IV come from the MFiSAP handshake at
-    /fp-setup + /auth-setup, NOT via SDP.
-    """
-    return (
-        "v=0\r\n"
-        f"o=AirPlay {session_id} 0 IN IP4 {local_ip}\r\n"
-        "s=AirPlay\r\n"
-        f"c=IN IP4 {remote_ip}\r\n"
-        "t=0 0\r\n"
-        "m=video 0 RTP/AVP 96\r\n"
-        f"a=rtpmap:96 H264/{fps * 1000}\r\n"
-        "a=fmtp:96 profile-level-id=42E01F;packetization-mode=1;"
-        f"width={width};height={height}\r\n"
-        "m=audio 0 RTP/AVP 97\r\n"
-        f"a=rtpmap:97 mpeg4-generic/{audio_sample_rate}/{audio_channels}\r\n"
-    )
-
-
 class MirrorSession:
     """Orchestrates the mirror MVP: setup → stream → teardown."""
 
@@ -196,27 +116,36 @@ class MirrorSession:
         verifier: PairVerifyProcedure,
         ctx: MirrorContext,
         h264_path: Path,
-        channel_opener: ChannelOpener,
+        *,
+        video_command: Optional[str] = None,
+        eld_path: Optional[Path] = None,
+        audio_command: Optional[str] = None,
+        pair_secret: Optional[bytes] = None,
     ) -> None:
-        """Bind the session to one RTSP connection and one H.264 file."""
+        """Bind the session to one RTSP connection and one H.264 file.
+
+        ``video_command`` is a shell command writing Annex-B H.264 to stdout;
+        when given it is streamed live instead of looping ``h264_path``.
+        Screen audio is sent only when a source is given: ``audio_command``
+        (a shell command writing length-prefixed AAC-ELD frames to stdout)
+        or, failing that, ``eld_path`` (a file of such frames, looped).
+        ``pair_secret`` is the 32-byte X25519 shared secret of the media
+        connection's pair-verify; it replaces the verifier's for the video
+        key, and the screen-audio key needs it.
+        """
         self._rtsp = rtsp
         self._verifier = verifier
         self._ctx = ctx
         self._h264_path = h264_path
-        self._open_channel = channel_opener
-        # Not an AbstractHAPChannel: the TCP path opens a plain TCP
-        # RawVideoTCPChannel and the UDP path a MirrorVideoDatagramChannel.
-        # All three only ever have send() called on them.
+        self._video_command = video_command
+        self._eld_path = eld_path
+        self._audio_command = audio_command
+        self._pair_secret = pair_secret
         self._video_channel: Optional[streams.SendChannel] = None
-        self._audio_channel: Optional[AbstractHAPChannel] = None
         self._audio_udp: Optional[asyncio.BaseTransport] = None
         self._event_transport: Optional[asyncio.BaseTransport] = None
-        self._control_transport: Optional[asyncio.BaseTransport] = None
-        self._control_channel: Optional[AbstractHAPChannel] = None
-        self._video_sock: Optional[socket.socket] = None
         self._audio_control_sock: Optional[socket.socket] = None
         self._video_transport: Optional[asyncio.BaseTransport] = None
-        self._audio_transport: Optional[asyncio.BaseTransport] = None
         self._timing_server: Optional[TimingServer] = None
         self._tasks: list[asyncio.Task] = []
         self._stopped = False
@@ -245,43 +174,26 @@ class MirrorSession:
         if self._stopped:
             raise RuntimeError("session already stopped; construct a new one")
         await self._setup_session()
-        if _tcp_mode():
-            # Exact TCP flow (verified via LLDB socket capture 2026-08-24):
-            #   SETUP(audio 96) -> connect eventPort -> RECORD -> SETUP(video 110)
-            #   -> connect video dataPort -> stream. No session-init, and the
-            #   eventPort is returned by the AUDIO SETUP (parsed in
-            #   _setup_audio_stream). RECORD is only answered once the event
-            #   channel is connected.
-            await self._setup_audio_stream()
-            await self._open_event_channel()
-            await self._record()
-            await self._setup_streams()
-            await self._open_channels()
-            if os.environ.get("MIRROR_AUDIO_SEND"):
-                self._register(asyncio.ensure_future(self._stream_screen_audio()))
-            await self._stream_until_done()
-            return
-        # The receiver hands back an eventPort and expects the sender to
-        # connect to it; RECORD is not answered until that channel is up.
+        # Exact flow (verified via LLDB socket capture 2026-08-24):
+        #   SETUP(audio 96) -> connect eventPort -> RECORD -> SETUP(video 110)
+        #   -> connect video dataPort -> stream. No session-init, and the
+        #   eventPort is returned by the AUDIO SETUP (parsed in
+        #   _setup_audio_stream). RECORD is only answered once the event
+        #   channel is connected.
+        await self._setup_audio_stream()
         await self._open_event_channel()
-        # The captured macOS sender queries /info again between the
-        # session-init SETUP and RECORD (Phase 28 capture, seq 37).
-        await self._rtsp.info()
         await self._record()
         await self._setup_streams()
         await self._open_channels()
+        if self._audio_command or self._eld_path:
+            self._register(asyncio.ensure_future(self._stream_screen_audio()))
         await self._stream_until_done()
 
     async def _setup_session(self) -> None:
-        """Send the session-init SETUP (no streams) and record the event port.
+        """Prepare the session identity and serve the timing port.
 
-        Phase 28 captured a real macOS mirroring session through atvproxy and
-        found the modern flow has no ANNOUNCE/SDP at all. Instead the sender
-        opens with a metadata-only SETUP that returns ``eventPort``. Crucially
-        the body must NOT carry ``ekey``/``eiv``/``et`` — FPLY v3 has already
-        established keying and the receiver drops the connection outright if a
-        sender re-sends stream keys here. See
-        docs/superpowers/specs/2026-08-22-fply-phase28-ground-truth-capture.md.
+        No request is sent here: the session-init SETUP of the macOS sender is
+        not part of this flow. The ``eventPort`` comes from the audio SETUP.
         """
         if self._ctx.stream_encryptor is None:
             raise exceptions.ProtocolError(
@@ -299,171 +211,101 @@ class MirrorSession:
             TimingServer, local_addr=(self._rtsp.connection.local_ip, 0)
         )
         self._timing_server = cast(TimingServer, timing_server)
-        timing_port = self._timing_server.port
 
         # Advertise the same AirPlay version we claim in ``sourceVersion``.
         self._rtsp.user_agent = MIRROR_USER_AGENT
 
         session_uuid = str(uuid4()).upper()
-        # Retained so the TCP-dialect stream SETUP can echo the same
-        # session identity (it repeats sessionUUID / deviceID / macAddress).
+        # Retained so the stream SETUPs can echo the same session identity
+        # (they repeat sessionUUID / deviceID / macAddress).
         self._session_uuid = session_uuid
         self._device_id = self._ctx.device_id or _device_id_from_uuid(session_uuid)
         self._mac_address = self._ctx.mac_address or _device_id_from_uuid(str(uuid4()))
-        body = {
-            "statsCollectionEnabled": False,
-            "updateSessionRequest": False,
-            "timingProtocol": "NTP",
-            "sessionUUID": session_uuid,
-            "osName": self._ctx.os_name,
-            "osBuildVersion": self._ctx.os_build_version,
-            "timingPort": timing_port,
-            "sourceVersion": self._ctx.source_version,
-            "isScreenMirroringSession": True,
-            "osVersion": self._ctx.os_version,
-            "isMultiSelectAirPlay": False,
-            "sessionCorrelationUUID": str(uuid4()).upper(),
-            "deviceID": self._device_id,
-            "model": self._ctx.model,
-            "name": self._ctx.name,
-            "macAddress": self._mac_address,
-        }
-        if _tcp_mode():
-            # The reference sender sends NO macOS-AVConference session-init SETUP. Its
-            # flow is SETUP(audio 96) -> connect eventPort -> RECORD -> SETUP(video
-            # 110). The eventPort comes from the AUDIO SETUP response (not here).
-            self._ctx.event_port = 0
-            _LOGGER.debug("TCP mode: skipping session-init SETUP")
-            return
-        resp = await self._rtsp.setup(headers=dict(_SUPPRESS_RAOP_HEADERS), body=body)
-        if resp.code != 200:
-            raise exceptions.ProtocolError(
-                f"SETUP (session init) failed: HTTP {resp.code}"
-            )
-        decoded = decode_bplist_from_body(resp)
-        self._ctx.event_port = decoded.get("eventPort", 0)
-        _LOGGER.debug("Mirror session established, eventPort=%d", self._ctx.event_port)
+        self._ctx.event_port = 0
 
-    async def _open_event_channel(self) -> None:  # pylint: disable=too-many-statements
-        """Connect the event channel advertised by the session SETUP.
+    async def _open_event_channel(self) -> None:
+        """Connect the event channel advertised by the audio SETUP.
 
-        macOS AVConference encrypts this channel with HAP-derived keys. The
-        TCP dialect (no HAP pair-verify -> no channel keys) uses a
-        PLAINTEXT TCP connection instead; the receiver only needs the socket
-        up before it will answer RECORD.
+        A PLAINTEXT TCP connection; the receiver only needs the socket up
+        before it will answer RECORD.
         """
         if not self._ctx.event_port:
             _LOGGER.debug("No eventPort returned; skipping event channel")
             return
         addr = self._rtsp.connection.remote_ip
-        if _tcp_mode():
-            reader, writer = await asyncio.open_connection(addr, self._ctx.event_port)
-            self._event_reader = reader
-            self._event_transport = writer.transport
-            self._event_writer = writer
+        reader, writer = await asyncio.open_connection(addr, self._ctx.event_port)
+        self._event_reader = reader
+        self._event_transport = writer.transport
+        self._event_writer = writer
 
-            async def _serve_events() -> None:  # pylint: disable=too-many-locals
-                # The event channel is bidirectional RTSP with the RECEIVER as
-                # the client: it sends POST /command (updateInfo etc.) and waits
-                # for an RTSP/1.0 200 response. If we never answer, the receiver
-                # tears the whole mirror session down after ~30s. So parse each
-                # request and reply 200 OK (echoing CSeq).
-                buf = b""
-                try:
-                    while not self._stopped:
-                        chunk = await reader.read(4096)
-                        if not chunk:
-                            _LOGGER.info("EVENT channel: receiver EOF")
+        async def _serve_events() -> None:
+            # The event channel is bidirectional RTSP with the RECEIVER as
+            # the client: it sends POST /command (updateInfo etc.) and waits
+            # for an RTSP/1.0 200 response. If we never answer, the receiver
+            # tears the whole mirror session down after ~30s. So parse each
+            # request and reply 200 OK (echoing CSeq).
+            buf = b""
+            try:
+                while not self._stopped:
+                    chunk = await reader.read(4096)
+                    if not chunk:
+                        _LOGGER.info("EVENT channel: receiver EOF")
+                        break
+                    buf += chunk
+                    while True:
+                        hdr_end = buf.find(b"\r\n\r\n")
+                        if hdr_end < 0:
                             break
-                        buf += chunk
-                        while True:
-                            hdr_end = buf.find(b"\r\n\r\n")
-                            if hdr_end < 0:
-                                break
-                            head = buf[:hdr_end].decode("latin-1")
-                            lines = head.split("\r\n")
-                            req_line = lines[0] if lines else ""
-                            cseq = "0"
-                            clen = 0
-                            for ln in lines[1:]:
-                                k, _, v = ln.partition(":")
-                                kl = k.strip().lower()
-                                if kl == "cseq":
-                                    cseq = v.strip()
-                                elif kl == "content-length":
-                                    clen = int(v.strip() or "0")
-                            total = hdr_end + 4 + clen
-                            if len(buf) < total:
-                                break  # wait for full body
-                            body = buf[hdr_end + 4 : total]
-                            buf = buf[total:]
-                            _LOGGER.info(
-                                "EVENT req: %s (CSeq %s, body %dB)",
-                                req_line,
-                                cseq,
-                                clen,
-                            )
-                            if body and os.environ.get("MIRROR_DUMP_EVENTS"):
-                                try:
-                                    _LOGGER.info(
-                                        "EVENT body plist: %r", plistlib.loads(body)
-                                    )
-                                except Exception:
-                                    _LOGGER.debug(
-                                        "EVENT body raw: %s", body[:200].hex()
-                                    )
-                            resp = (
-                                f"RTSP/1.0 200 OK\r\nCSeq: {cseq}\r\n"
-                                f"Content-Length: 0\r\n\r\n"
-                            ).encode("latin-1")
-                            writer.write(resp)
-                            await writer.drain()
-                except asyncio.CancelledError:
-                    pass
-                except Exception as exc:  # noqa: BLE001
-                    _LOGGER.debug("event channel handler ended: %s", exc)
+                        head = buf[:hdr_end].decode("latin-1")
+                        lines = head.split("\r\n")
+                        req_line = lines[0] if lines else ""
+                        cseq = "0"
+                        clen = 0
+                        for ln in lines[1:]:
+                            k, _, v = ln.partition(":")
+                            kl = k.strip().lower()
+                            if kl == "cseq":
+                                cseq = v.strip()
+                            elif kl == "content-length":
+                                clen = int(v.strip() or "0")
+                        total = hdr_end + 4 + clen
+                        if len(buf) < total:
+                            break  # wait for full body
+                        buf = buf[total:]
+                        _LOGGER.info(
+                            "EVENT req: %s (CSeq %s, body %dB)",
+                            req_line,
+                            cseq,
+                            clen,
+                        )
+                        resp = (
+                            f"RTSP/1.0 200 OK\r\nCSeq: {cseq}\r\n"
+                            f"Content-Length: 0\r\n\r\n"
+                        ).encode("latin-1")
+                        writer.write(resp)
+                        await writer.drain()
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:  # noqa: BLE001
+                _LOGGER.debug("event channel handler ended: %s", exc)
 
-            self._register(asyncio.ensure_future(_serve_events()))
-            _LOGGER.debug(
-                "Plaintext event channel connected on port %d",
-                self._ctx.event_port,
-            )
-            return
-        transport, _channel = await self._open_channel(
-            channels.EventChannel,
-            addr,
+        self._register(asyncio.ensure_future(_serve_events()))
+        _LOGGER.debug(
+            "Plaintext event channel connected on port %d",
             self._ctx.event_port,
-            EVENTS_SALT,
-            EVENTS_READ_INFO,  # NB: read/write reversed for event channel
-            EVENTS_WRITE_INFO,
         )
-        self._event_transport = transport
-        _LOGGER.debug("Event channel connected on port %d", self._ctx.event_port)
 
     def _build_ekey_eiv(self):
-        """Return (ekey, eiv) for the TCP-dialect stream SETUP, or (None, None).
+        """Return (ekey, eiv) for the video stream SETUP, or (None, None).
 
-        The reference sender transports a FairPlay-wrapped stream key in ``ekey`` + a
-        16-byte ``eiv``. We proved the receiver decrypts video with the
-        *derived* key (SQAirPlayClientSessionDeriveKeyAndIV), so it can derive
-        the key itself; the first cut therefore omits ekey to test whether the
-        receiver self-derives. If it rejects the SETUP, ekey must be generated
-        by emulating ``_airplay_package_encryption_key`` (see handoff SESSION 3).
-        ``MIRROR_EKEY``/``MIRROR_EIV`` (hex) allow injecting a captured pair.
+        The reference sender transports a FairPlay-wrapped stream key in
+        ``ekey`` + a 16-byte ``eiv``. The ekey wraps our chosen raw16. eiv is
+        a sender-chosen random 16B (the reference sender's sess[0xa8]); the
+        video IV itself derives from raw16, so eiv's value is free unless the
+        receiver validates it.
         """
-        ekey_hex = os.environ.get("MIRROR_EKEY")
-        eiv_hex = os.environ.get("MIRROR_EIV")
-        if ekey_hex and eiv_hex:
-            return bytes.fromhex(ekey_hex), bytes.fromhex(eiv_hex)
-        # The emulator-packaged ekey (wraps our chosen raw16). eiv is a 16-byte
-        # value sent alongside; the video IV itself is derived from raw16, so a
-        # random eiv is used unless one is pinned via MIRROR_EIV.
         if self._ctx.ekey:
-            # eiv is a sender-chosen random 16B (the reference sender's sess[0xa8]);
-            # pyatv is the sender, so it picks its own. The video IV itself derives from
-            # raw16, so eiv's value is free unless the receiver validates it.
-            eiv = bytes.fromhex(eiv_hex) if eiv_hex else secrets.token_bytes(16)
-            return self._ctx.ekey, eiv
+            return self._ctx.ekey, secrets.token_bytes(16)
         return None, None
 
     async def _setup_audio_stream(self) -> None:
@@ -476,9 +318,7 @@ class MirrorSession:
         """
         if self._audio_setup_done:
             return
-        if not (
-            self._ctx.audio_ekey and os.environ.get("MIRROR_AUDIO_STREAM", "1") != "0"
-        ):
+        if not self._ctx.audio_ekey:
             return
         self._audio_setup_done = True
         timing_port = self._timing_server.port if self._timing_server else 0
@@ -505,13 +345,13 @@ class MirrorSession:
                     "latencyMax": 3750,
                     "redundantAudio": 2,
                     "ct": 8,
-                    "spf": int(os.environ.get("MIRROR_AUDIO_SPF", "480")),
+                    "spf": screen_audio.AUDIO_SAMPLES_PER_FRAME,
                     "audioFormat": 16777216,
                     "controlPort": control_port,
                     "usingScreen": True,
                 }
             ],
-            "et": 32,
+            "et": STREAM_ET,
             "timingPort": timing_port,
             "sessionUUID": self._session_uuid or str(uuid4()).upper(),
             "osBuildVersion": self._ctx.os_build_version,
@@ -535,7 +375,7 @@ class MirrorSession:
         decoded = decode_bplist_from_body(a_resp)
         _LOGGER.debug("AUDIO SETUP full response: %r", decoded)
         # The eventPort the receiver expects us to connect to comes from THIS
-        # response (TCP dialect), not a session-init SETUP.
+        # response.
         self._ctx.event_port = decoded.get("eventPort", 0)
         astream = (decoded.get("streams") or [{}])[0]
         self._ctx.audio_data_port = astream.get("dataPort", 0)
@@ -550,110 +390,52 @@ class MirrorSession:
         )
 
     async def _setup_streams(self) -> None:
-        """Send the mirror video stream SETUP and record the data ports.
+        """Send the type-110 video stream SETUP and record the data port.
 
-        Sent AFTER ``RECORD`` — that ordering comes straight from the Phase 28
-        capture and is the reverse of the AirPlay-1 flow. Keys are not
-        transported: the receiver derives them from the FPLY secret plus the
-        ``encryptionSeed`` values sent here.
+        Sent AFTER ``RECORD``. A simple type-110 video stream plus session
+        identity at the top level, and a FairPlay-wrapped key transported in
+        ``ekey``/``eiv``. The receiver returns a *TCP* dataPort. See
+        tcp_stream.py.
         """
-        self._ctx.encryption_seed = secrets.randbits(64)
-        self._ctx.control_encryption_seed = secrets.randbits(64)
-
-        # networkInfo.Port is the UDP port we will *send video from*, not a
-        # separate listener: the real sender advertises the source port of its
-        # media datagrams. Bind it now so the value we announce is the one the
-        # receiver will actually see packets arrive from -- a receiver
-        # filtering on the announced 5-tuple accepts datagrams at the socket
-        # layer (no ICMP) but ignores them if the source port disagrees.
-        self._video_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self._video_sock.bind((self._rtsp.connection.local_ip, 0))
-        network_port = self._video_sock.getsockname()[1]
-
-        # The reference sender uses 32-bit streamConnectionIDs; the receiver appears to
-        # store it in a 32-bit field, so a 63-bit value would make the
-        # receiver's key-derivation label ("AirPlayStreamKey"+id) disagree with
-        # ours. Match the reference sender's range in TCP mode.
-        self._ctx.stream_connection_id = (
-            secrets.randbits(32) if _tcp_mode() else secrets.randbits(63)
-        )
-        if _tcp_mode():
-            # TCP dialect (reverse-engineered 2026-08-23): a simple
-            # type-110 video stream plus session identity at the top level, and
-            # a FairPlay-wrapped key transported in `ekey`/`eiv`. The receiver
-            # returns a *TCP* dataPort (not the UDP one the AVConference dialect
-            # gets). See tcp_stream.py + the SESSION 3 handoff.
-            timing_port = self._timing_server.port if self._timing_server else 0
-            # AUDIO stream SETUP already sent (before RECORD, from run()).
-            _mirror_et = int(os.environ.get("MIRROR_ET", "32"))
-            body = {
-                "streams": [
-                    {
-                        "type": 110,  # the TCP dialect's video stream type
-                        "streamConnectionID": self._ctx.stream_connection_id,
-                        "timestampInfo": [
-                            {"name": name}
-                            for name in ("SubSu", "BePxT", "AfPxT", "BefEn", "EmEnc")
-                        ],
-                    }
-                ],
-                "et": _mirror_et,
-                "timingPort": timing_port,
-                "sessionUUID": self._session_uuid or str(uuid4()).upper(),
-                "osBuildVersion": self._ctx.os_build_version,
-                "sourceVersion": self._ctx.source_version,
-                "deviceID": self._device_id,
-                "macAddress": self._mac_address,
-                "name": self._ctx.name,
-                "model": self._ctx.model,
-            }
-            ekey, eiv = self._build_ekey_eiv() if _mirror_et == 32 else (None, None)
-            if ekey is not None:
-                body["ekey"] = ekey
-                body["eiv"] = eiv
-                _LOGGER.debug(
-                    "SETUP ekey(%d)=%s eiv=%s et=32 type=110 streamID=%s",
-                    len(ekey),
-                    ekey[:24].hex(),
-                    eiv.hex() if eiv else None,
-                    self._ctx.stream_connection_id,
-                )
-        else:
-            body = {
-                "streams": [
-                    {
-                        "type": framing.STREAM_TYPE_VIDEO,
-                        "streamConnectionID": self._ctx.stream_connection_id,
-                        "encryptionSeed": self._ctx.encryption_seed,
-                        "streamConnections": {
-                            "streamConnectionTypeMediaDataControl": {
-                                "streamConnectionKeyEncryptionSeed": (
-                                    self._ctx.control_encryption_seed
-                                ),
-                            }
-                        },
-                        "networkInfo": {"Port": network_port},
-                        "useAVConfMirroring": True,
-                        "displayHDRMode": "SDR",
-                        "hdrMirroringSupported": False,
-                        "streamMode": 0,
-                        "remoteLogLevel": 0,
-                        "remoteShouldShowHUD": False,
-                        "timestampInfo": [
-                            {"name": name}
-                            for name in ("SubSu", "BePxT", "AfPxT", "BefEn", "EmEnc")
-                        ],
-                        "negotiationData": negotiation.build_negotiation_data(
-                            model=self._ctx.model,
-                            source_version=self._ctx.endpoint_version,
-                            os_build=self._ctx.os_build_version,
-                            # Describe the geometry we actually stream, not the
-                            # display of the machine the blob was captured from.
-                            source_size=(self._ctx.width, self._ctx.height),
-                        ),
-                    }
-                ]
-            }
+        # The reference sender uses 32-bit streamConnectionIDs; the receiver
+        # appears to store it in a 32-bit field, so a 63-bit value would make
+        # the receiver's key-derivation label ("AirPlayStreamKey"+id) disagree
+        # with ours.
+        self._ctx.stream_connection_id = secrets.randbits(32)
+        timing_port = self._timing_server.port if self._timing_server else 0
+        # AUDIO stream SETUP already sent (before RECORD, from run()).
+        body = {
+            "streams": [
+                {
+                    "type": 110,
+                    "streamConnectionID": self._ctx.stream_connection_id,
+                    "timestampInfo": [
+                        {"name": name}
+                        for name in ("SubSu", "BePxT", "AfPxT", "BefEn", "EmEnc")
+                    ],
+                }
+            ],
+            "et": STREAM_ET,
+            "timingPort": timing_port,
+            "sessionUUID": self._session_uuid or str(uuid4()).upper(),
+            "osBuildVersion": self._ctx.os_build_version,
+            "sourceVersion": self._ctx.source_version,
+            "deviceID": self._device_id,
+            "macAddress": self._mac_address,
+            "name": self._ctx.name,
+            "model": self._ctx.model,
+        }
+        ekey, eiv = self._build_ekey_eiv()
+        if ekey is not None:
+            body["ekey"] = ekey
+            body["eiv"] = eiv
+            _LOGGER.debug(
+                "SETUP ekey(%d)=%s eiv=%s et=32 type=110 streamID=%s",
+                len(ekey),
+                ekey[:24].hex(),
+                eiv.hex() if eiv else None,
+                self._ctx.stream_connection_id,
+            )
         # The receiver takes noticeably longer over the stream SETUP than the
         # session SETUP (it negotiates the video pipeline and probes the ports
         # we advertised), so allow more than the 4 s RTSP default.
@@ -669,188 +451,60 @@ class MirrorSession:
         decoded = decode_bplist_from_body(resp)
         stream = decoded["streams"][0]
         self._ctx.video_data_port = stream["dataPort"]
-        control = stream.get("streamConnections", {}).get(
-            "streamConnectionTypeMediaDataControl", {}
-        )
-        self._ctx.stream_control_port = control.get("streamConnectionKeyPort", 0)
-        # Derive the screen-video key from the pair-verify (HAP) shared secret.
-        #
-        # Static analysis of Apple's own AirPlayReceiver (Phase 29) shows tvOS 26
-        # screen mirroring uses the CoreUtils "DataStream" path: the receiver's
-        # _ScreenSetup/_GetDataStreamSecurityKeys derives a 32-byte key via
-        # PairingSessionDeriveKey = HKDF-SHA512 over the pair-verify shared
-        # secret with salt "DataStream-Salt"+decimal(streamConnectionID) and
-        # info "DataStream-Output-Encryption-Key", then decrypts frames with
-        # ChaCha20-Poly1305 (NOT the FairPlay master key, and NOT AES). pyatv's
-        # verifier.encryption_keys IS that HKDF.
-        if not _tcp_mode():
-            # AVConference/DataStream path only. The reference sender keys the video
-            # with the FairPlay raw16 (+ pair-verify shared) as AES-CTR, so there is no
-            # DataStream HKDF here and no verifier to derive from.
-            self._ctx.datastream_video_key = framing.derive_datastream_video_key(
-                self._verifier, self._ctx.stream_connection_id
-            )
         _LOGGER.debug(
-            "Mirror stream established, dataPort=%d controlPort=%d "
-            "(SRTP AES-128-CTR video key from DataStream HKDF, "
-            "streamConnectionID %d)",
+            "Mirror stream established, dataPort=%d streamConnectionID %d",
             self._ctx.video_data_port,
-            self._ctx.stream_control_port,
             self._ctx.stream_connection_id,
         )
 
-    async def _open_control_channel(self, addr: str) -> None:
-        """Connect the media-data-control channel, retrying briefly.
-
-        The receiver can take a moment to start listening after answering the
-        stream SETUP, so a single attempt races it.
-        """
-        last_error: Optional[OSError] = None
-        for attempt in range(CONTROL_CHANNEL_ATTEMPTS):
-            try:
-                transport, channel = await self._open_channel(
-                    streams.MirrorControlChannel,
-                    addr,
-                    self._ctx.stream_control_port,
-                    MIRROR_CONTROL_SALT + str(self._ctx.control_encryption_seed),
-                    MIRROR_CONTROL_OUTPUT_INFO,
-                    MIRROR_CONTROL_INPUT_INFO,
-                )
-            except OSError as ex:
-                last_error = ex
-                await asyncio.sleep(CONTROL_CHANNEL_RETRY_DELAY)
-                continue
-            self._control_transport = transport
-            self._control_channel = channel
-            _LOGGER.debug(
-                "Media-data-control channel open on port %d (attempt %d)",
-                self._ctx.stream_control_port,
-                attempt + 1,
-            )
-            return
-
-        _LOGGER.warning(
-            "Media-data-control channel unavailable on port %d after %d "
-            "attempts (%s). The receiver opens its UDP data port only once "
-            "this channel is up, so video will not be delivered.",
-            self._ctx.stream_control_port,
-            CONTROL_CHANNEL_ATTEMPTS,
-            last_error,
-        )
-
     async def _open_channels(self) -> None:
-        """Open the media transports negotiated by the stream SETUP.
+        """Open the raw TCP video connection to the negotiated ``dataPort``.
 
-        Probing a real Apple TV (tvOS 26.6) after a successful stream SETUP
-        shows an unambiguous split:
-
-        =========================  =========  ==========
-        port                       TCP        UDP
-        =========================  =========  ==========
-        ``dataPort``               refused    **open**
-        ``streamConnectionKeyPort`` **open**  ICMP unreachable
-        =========================  =========  ==========
-
-        So mirror video is sent as UDP datagrams to ``dataPort`` (matching the
-        receiver's ``hasUDPMirroringSupport: True``), while
-        ``streamConnectionKeyPort`` is a HAP-encrypted TCP control channel.
+        No HAP/ChaCha layer: the AES-CTR on each frame is the only encryption.
+        Verified by decrypting the reference sender's live TCP stream.
         """
         addr = self._rtsp.connection.remote_ip
-
-        # The control connection must come first: the receiver only opens the
-        # UDP data port once it is established. When it is missing, every
-        # datagram we send comes back as ICMP port-unreachable.
-        if self._ctx.stream_control_port:
-            await self._open_control_channel(addr)
-
         loop = asyncio.get_event_loop()
-        # Declared up front: the branches below open a TCP connection and a
-        # UDP endpoint respectively, which have neither transport nor channel
-        # type in common beyond these two.
-        v_transport: asyncio.BaseTransport
-        v_channel: streams.SendChannel
-        if _tcp_mode():
-            # The reference sender's mirror video is a RAW TCP connection to dataPort
-            # (no HAP/ChaCha layer; the AES-CTR on each frame is the only
-            # encryption). Verified by decrypting the reference sender's live TCP
-            # stream.
-            v_transport, v_channel = await loop.create_connection(
-                tcp_stream.RawVideoTCPChannel,
-                addr,
-                self._ctx.video_data_port,
-            )
-            self._video_transport, self._video_channel = v_transport, v_channel
-            _LOGGER.debug(
-                "Raw TCP video channel open to %s:%d",
-                addr,
-                self._ctx.video_data_port,
-            )
-        else:
-            # Reuse the socket bound in _setup_streams so datagrams leave from
-            # the port announced as networkInfo.Port.
-            v_transport, v_channel = await loop.create_datagram_endpoint(
-                lambda: streams.MirrorVideoDatagramChannel(
-                    (addr, self._ctx.video_data_port)
-                ),
-                sock=self._video_sock,
-            )
-            # The endpoint owns the socket now and closes it with the
-            # transport; dropping the reference is what tells stop() not to
-            # close it a second time, out from under the event loop.
-            self._video_sock = None
-            self._video_transport, self._video_channel = v_transport, v_channel
-            _LOGGER.debug(
-                "Video datagram channel open to %s:%d",
-                addr,
-                self._ctx.video_data_port,
-            )
-
-        # The modern mirror flow negotiates the video stream only (Phase 28
-        # capture shows a single type-110 stream); audio is not part of the
-        # screen-mirroring SETUP. Open the audio channel only if a port was
-        # actually negotiated. In TCP mode the audio channel is NOT a
-        # HAP-encrypted channel (no verifier); skip it for now (video-only
-        # render — the receiver still switches to mirror on the video stream).
-        if self._ctx.audio_data_port and not _tcp_mode():
-            a_transport, a_channel = await self._open_channel(
-                streams.AudioStreamChannel,
-                addr,
-                self._ctx.audio_data_port,
-                MIRROR_AUDIO_SALT,
-                MIRROR_AUDIO_OUTPUT_INFO,
-                MIRROR_AUDIO_INPUT_INFO,
-            )
-            self._audio_transport, self._audio_channel = a_transport, a_channel
+        v_transport, v_channel = await loop.create_connection(
+            tcp_stream.RawVideoTCPChannel,
+            addr,
+            self._ctx.video_data_port,
+        )
+        self._video_transport, self._video_channel = v_transport, v_channel
+        _LOGGER.debug(
+            "Raw TCP video channel open to %s:%d",
+            addr,
+            self._ctx.video_data_port,
+        )
 
     async def _stream_screen_audio(self) -> None:
-        """Send screen audio as AAC-ELD over UDP/RTP (TCP dialect).
+        """Send screen audio as AAC-ELD over UDP/RTP.
 
         VERIFIED playing on tvOS 26 (mic-confirmed +15 dB, drops on stop). The
         key detail: the sync (0xD4) MUST be sent FROM the advertised controlPort
         socket, or the receiver never opens its audio control channel and refuses
         the sync (ICMP), leaving the audio unscheduled/silent.
-        Gated behind MIRROR_AUDIO_SEND. Reads length-prefixed AAC-ELD frames
-        (4-byte BE length + frame, repeated) from MIRROR_AUDIO_ELD_FILE and
-        sends them as RTP packets to the type-96 audio dataPort, AES-128-CBC
-        encrypted with (key=raw16, iv=eiv). See screen_audio.py + the audio
-        spec. If no file is set, sends nothing (matches the reference sender on
-        silence).
+        Only started when an audio source was given. Reads length-prefixed
+        AAC-ELD frames (4-byte BE length + frame, repeated) from ``eld_path``
+        or ``audio_command`` and sends them as RTP packets to the type-96 audio
+        dataPort, AES-128-CBC encrypted with (key=raw16, iv=eiv). See
+        screen_audio.py + the audio spec.
         """
         # One method because the sequence -- key derivation, two sockets,
         # the sync packet, then the send loop -- has to be read in order.
         # pylint: disable=too-many-locals,too-many-branches
         # pylint: disable=too-many-statements
         port = self._ctx.audio_data_port
-        eld_file = os.environ.get("MIRROR_AUDIO_ELD_FILE")
-        audio_live_cmd = os.environ.get("MIRROR_AUDIO_LIVE_CMD")
-        _pair32_hex = os.environ.get("MIRROR_PAIR32", "")
+        eld_file = self._eld_path
+        audio_live_cmd = self._audio_command
+        pair32 = self._pair_secret
         raw16 = self._ctx.stream_raw16
         iv = self._ctx.audio_eiv
         # Audio key = secret16 = sha512(raw16 || pair32)[:16] (DeriveAudioKeyAndIV
         # passes sess[0xa0] through PairingContextDeriveKey when the flag is set;
         # NO "AirPlayStreamKey" labeling, unlike video).
-        if len(raw16) == 16 and _pair32_hex:
-            key = hashlib.sha512(raw16 + bytes.fromhex(_pair32_hex)).digest()[:16]
+        if len(raw16) == 16 and pair32:
+            key = hashlib.sha512(raw16 + pair32).digest()[:16]
         else:
             key = b""
         if not (
@@ -922,7 +576,7 @@ class MirrorSession:
             ctrl_udp, _ = await loop.create_datagram_endpoint(
                 lambda: _AudioDP("CTRL"), remote_addr=(addr, ctrl_port)
             )
-        spf = int(os.environ.get("MIRROR_AUDIO_SPF", "480"))
+        spf = screen_audio.AUDIO_SAMPLES_PER_FRAME
         # matches the reference sender's captured sync (now - now_without_latency)
         latency = 2205
         base_ts = int(time.time()) & 0xFFFFFFFF
@@ -930,37 +584,11 @@ class MirrorSession:
             key, iv, ssrc=0, spf=spf, base_ts=base_ts
         )
         interval = spf / screen_audio.AUDIO_SAMPLE_RATE
-        sync_every = int(
-            os.environ.get(
-                "MIRROR_AUDIO_SYNC_EVERY",
-                str(max(1, int(screen_audio.AUDIO_SAMPLE_RATE / spf))),
-            )
-        )  # ~1/s
+        sync_every = AUDIO_SYNC_EVERY
 
         adv_ctrl = self._audio_control_sock
         if adv_ctrl is not None:
             adv_ctrl.setblocking(False)
-            if os.environ.get("MIRROR_DUMP_EVENTS"):
-
-                def _ctrl_rx():
-                    try:
-                        while True:
-                            data, a = adv_ctrl.recvfrom(2048)
-                            _LOGGER.debug(
-                                "AUDIO CTRL RX %dB from %s: %s",
-                                len(data),
-                                a,
-                                data[:20].hex(),
-                            )
-                    except BlockingIOError:
-                        pass
-                    except Exception:  # noqa: BLE001
-                        pass
-
-                try:
-                    loop.add_reader(adv_ctrl.fileno(), _ctrl_rx)
-                except Exception:  # noqa: BLE001
-                    pass
 
         def _send_sync(first: bool) -> None:
             if ctrl_port == 0:
@@ -982,9 +610,7 @@ class MirrorSession:
 
         audio_reader_task = None
         if audio_live_cmd:
-            live_audio_q = asyncio.Queue(
-                maxsize=int(os.environ.get("MIRROR_AUDIO_LIVE_BUFFER", "1200"))
-            )
+            live_audio_q = asyncio.Queue(maxsize=AUDIO_LIVE_BUFFER)
             audio_proc = await asyncio.create_subprocess_shell(
                 audio_live_cmd,
                 stdout=asyncio.subprocess.PIPE,
@@ -1019,9 +645,8 @@ class MirrorSession:
             audio_reader_task = asyncio.ensure_future(_audio_reader())
             # Pre-buffer ~2s so bursty live delivery (HLS segments) doesn't
             # starve the sender and cause dropouts/glitches.
-            _prebuf = int(os.environ.get("MIRROR_AUDIO_PREBUFFER", "180"))
             for _ in range(300):
-                if live_audio_q.qsize() >= _prebuf:
+                if live_audio_q.qsize() >= AUDIO_PREBUFFER:
                     break
                 await asyncio.sleep(0.05)
 
@@ -1084,7 +709,7 @@ class MirrorSession:
     async def _tcp_live_video(
         self, live_cmd: str, video_q: "asyncio.Queue", video_encryptor
     ) -> None:
-        """Stream a LIVE H.264 source (TCP dialect) in real time.
+        """Stream a LIVE H.264 source in real time.
 
         ``live_cmd`` is a shell command that writes an Annex-B H.264 elementary
         stream to stdout (e.g. ``yt-dlp -o - <url> | ffmpeg ... -f h264 -``).
@@ -1092,7 +717,7 @@ class MirrorSession:
         units, buffered (dropping oldest to bound latency), and paced out at the
         configured fps. SPS/PPS go into the plaintext avcC config frame; VCL
         frames are sent as continuous-keystream AES-CTR messages, exactly like
-        the file path. Gated by ``MIRROR_LIVE_CMD``.
+        the file path. Used when the session was given ``video_command``.
         """
         # pylint: disable=too-many-locals,too-many-statements
         fps = max(self._ctx.fps, 1)
@@ -1107,9 +732,7 @@ class MirrorSession:
             stderr=asyncio.subprocess.DEVNULL,
         )
         self._live_proc = proc
-        live_q: asyncio.Queue = asyncio.Queue(
-            maxsize=int(os.environ.get("MIRROR_LIVE_BUFFER", "90"))
-        )
+        live_q: asyncio.Queue = asyncio.Queue(maxsize=LIVE_VIDEO_BUFFER)
         state: dict[str, Optional[bytes]] = {"sps": None, "pps": None}
         config_ready = asyncio.Event()
 
@@ -1182,7 +805,7 @@ class MirrorSession:
                 len(config),
                 fps,
             )
-            await asyncio.sleep(float(os.environ.get("MIRROR_LIVE_PREBUFFER", "0.5")))
+            await asyncio.sleep(LIVE_VIDEO_PREBUFFER)
 
             index = 0  # pacing counter only; reset on underrun is fine
             pace_start = loop.time()
@@ -1227,7 +850,6 @@ class MirrorSession:
     async def _stream_until_done(self) -> None:
         # The method is long because the flow it drives is; splitting it
         # would scatter a sequence that has to be read in order.
-        # pylint: disable=too-many-locals,too-many-branches
         # pylint: disable=too-many-statements
         if self._ctx.stream_encryptor is None:
             raise RuntimeError(
@@ -1237,39 +859,13 @@ class MirrorSession:
 
         encryptor = self._ctx.stream_encryptor
         video_q: asyncio.Queue = asyncio.Queue(maxsize=QUEUE_HIGH_WATERMARK)
-        audio_q: asyncio.Queue = asyncio.Queue(maxsize=QUEUE_HIGH_WATERMARK)
 
-        video_pacer = pacer.H264NaluPacer(self._h264_path, fps=self._ctx.fps)
-        audio_pacer = pacer.SilentAacPacer()
+        # Refuse a source with no SPS/PPS or no IDR before anything streams.
+        pacer._scan_file(self._h264_path)  # pylint: disable=protected-access
 
         video_encryptor = self._ctx.video_encryptor or encryptor
 
-        ticks_per_frame = rtp.CLOCK_RATE // max(self._ctx.fps, 1)
-
-        # FairPlay keybuf -> video key. The mirror video is FairPlay-keyed; the
-        # key is SHA512("AirPlayStreamKey"+id||keybuf)[:16] (salt likewise from
-        # "AirPlayStreamIV "), where ``keybuf`` is the FairPlay SAP secret
-        # (see fairplay_sap). MIRROR_KEYBUF_WINDOW="start:end" takes
-        # ctx[start:end] of the SAP context as the keybuf (a sweep from when
-        # real extraction had not landed). MIRROR_KEYBUF_MODE selects the
-        # cipher:
-        #   "srtp" (default)  -> per-packet SRTP AES-128-CTR across the SSRCs,
-        #                        cipher from payload offset 8 (the real framing),
-        #   "continuous"      -> single continuous AES-CTR keystream, 1 SSRC.
-        keybuf_encryptor = None
-        keybuf_srtp_key = None  # (key16, salt14) for the per-packet SRTP path
-        keybuf_window = os.environ.get("MIRROR_KEYBUF_WINDOW")
-        keybuf_mode = os.environ.get("MIRROR_KEYBUF_MODE", "srtp")
-        # MIRROR_KEYBUF_DERIV: how the SRTP master key/salt come from the window:
-        #   "sha512" (default) -> SHA512("AirPlayStreamKey"+id||window)[:16] (the
-        #                         LEGACY TCP-screen recipe; disproven for UDP).
-        #   "direct"           -> the window IS the SRTP master key(16)+salt(14),
-        #                         used verbatim (tvOS 26 Viceroy suite-5 model:
-        #                         a sender-chosen 16B AES master key used directly
-        #                         with the RFC3711 AES-CM session KDF).
-        keybuf_deriv = os.environ.get("MIRROR_KEYBUF_DERIV", "sha512")
-
-        # PROVEN video-key recipe (default when no explicit KEYBUF_WINDOW sweep).
+        # PROVEN video-key recipe.
         #
         # Reverse-engineered and byte-verified against the reference sender's live
         # derivation on a tvOS 26 receiver (LLDB, 2026-08-23 — see
@@ -1285,45 +881,34 @@ class MirrorSession:
         #   iv       = sha512("AirPlayStreamIV" +id || secret16)[:16]
         #
         # used as a single continuous AES-128-CTR keystream (id = the
-        # streamConnectionID we sent in SETUP). MIRROR_VIDEO=legacy disables it.
-        if (
-            not keybuf_window
-            and os.environ.get("MIRROR_VIDEO", "proven") == "proven"
-            and (self._ctx.sap_context or self._ctx.stream_raw16)
-        ):
+        # streamConnectionID we sent in SETUP).
+        if self._ctx.sap_context or self._ctx.stream_raw16:
             # Prefer the raw16 we CHOSE and packaged into ekey (the receiver
             # unwraps ekey -> this raw16 and derives the same key). Fall back to
             # a sap_context slice for the no-ekey experiments.
             if self._ctx.stream_raw16 and len(self._ctx.stream_raw16) == 16:
                 raw16 = self._ctx.stream_raw16
             else:
-                raw16_off = int(os.environ.get("MIRROR_RAW16_OFF", "8"))
-                raw16 = self._ctx.sap_context[raw16_off : raw16_off + 16]
+                raw16 = self._ctx.sap_context[
+                    SAP_SECRET_OFFSET : SAP_SECRET_OFFSET + 16
+                ]
             # The screen video key uses the MEDIA-connection pair-verify's X25519
-            # shared secret (the reference sender's raw /pair-verify), NOT the main HAP
-            # pair-verify. MIRROR_PAIR32 (hex) supplies that media pair-verify
-            # shared when pyatv relays the raw pair-verify.
-            _pair32_ovr = os.environ.get("MIRROR_PAIR32")
+            # shared secret (the reference sender's raw /pair-verify), NOT the main
+            # HAP pair-verify. ``pair_secret`` supplies that media pair-verify
+            # shared when the caller relays the raw pair-verify.
             pair32: Optional[bytes]
-            if _pair32_ovr:
-                pair32 = bytes.fromhex(_pair32_ovr)
+            if self._pair_secret:
+                pair32 = self._pair_secret
             else:
                 pair32 = getattr(getattr(self._verifier, "srp", None), "_shared", None)
             if len(raw16) == 16 and pair32 and len(pair32) == 32:
-                # The reference sender's live session bound the FairPlay secret with the
-                # pair-verify secret (flag[0xb0]==1). pyatv's simpler SETUP may
-                # take the flag==0 path where raw16 is used directly.
-                # MIRROR_PAIR_TRANSFORM=0 selects the direct path.
-                _flag = os.environ.get("MIRROR_PAIR_TRANSFORM", "1") != "0"
-                secret16 = framing.stream_secret16(raw16, bytes(pair32), _flag)
+                secret16 = framing.stream_secret16(raw16, bytes(pair32))
                 sid = self._ctx.stream_connection_id
-                key, iv = framing.derive_tcp_stream_key_iv(
-                    raw16, bytes(pair32), sid, flag=_flag
-                )
-                if os.environ.get("MIRROR_CORRUPT_VIDEO_KEY"):
-                    key = bytes([key[0] ^ 0xFF]) + key[1:]
-                    _LOGGER.warning("VIDEO KEY DELIBERATELY CORRUPTED (test)")
-                keybuf_encryptor = framing.MirrorEncryptor.from_key_iv(key, iv)
+                key, iv = framing.derive_tcp_stream_key_iv(raw16, bytes(pair32), sid)
+                # An encryptor handed in on the context is an explicit caller
+                # choice and outranks the derived one.
+                if self._ctx.video_encryptor is None:
+                    video_encryptor = framing.MirrorEncryptor.from_key_iv(key, iv)
                 _LOGGER.debug(
                     "PROVEN video key: streamID=%s raw16=%s pair32=%s secret16=%s "
                     "key=%s iv=%s",
@@ -1337,152 +922,13 @@ class MirrorSession:
             else:
                 _LOGGER.warning(
                     "PROVEN video key unavailable: raw16=%dB pair32=%s — "
-                    "falling back to experimental key paths",
+                    "falling back to the MFiSAP stream encryptor",
                     len(raw16),
                     "None" if not pair32 else f"{len(pair32)}B",
                 )
 
-        if keybuf_window and self._ctx.sap_context:
-            start, end = (int(x) for x in keybuf_window.split(":"))
-            keybuf = self._ctx.sap_context[start:end]
-            sid = self._ctx.stream_connection_id & 0xFFFFFFFFFFFFFFFF
-            sid_override = os.environ.get("MIRROR_KEYBUF_STREAMID")
-            if sid_override is not None:
-                sid = int(sid_override) & 0xFFFFFFFFFFFFFFFF
-            if keybuf_deriv == "direct":
-                # window = master key(16) || master salt(14), used verbatim.
-                key = self._ctx.sap_context[start : start + 16]
-                iv = self._ctx.sap_context[start + 16 : start + 32]
-            else:
-                key, iv = framing.stream_key_iv_from_secret(keybuf, sid)
-            if keybuf_mode == "continuous":
-                keybuf_encryptor = framing.MirrorEncryptor.from_key_iv(key, iv)
-            else:
-                keybuf_srtp_key = (key[:16], iv[:14])
-            _LOGGER.debug(
-                "KEYBUF ACTIVE window=%s deriv=%s mode=%s key=%s iv=%s",
-                keybuf_window,
-                keybuf_deriv,
-                keybuf_mode,
-                key.hex(),
-                iv.hex(),
-            )
-
-        # Number of parallel video SSRCs. The real sender stripes each frame
-        # across 4 synchronised SSRCs (base+0..3, shared frame-counter/timestamp,
-        # each with its own SRTP session key); ``MIRROR_SSRC_COUNT`` selects how
-        # many pyatv emits (1 = single stream, 4 = replicate the real striping).
-        if keybuf_encryptor:
-            ssrc_count = 1  # continuous keystream is single-SSRC
-        elif keybuf_srtp_key:
-            ssrc_count = max(1, int(os.environ.get("MIRROR_SSRC_COUNT", "4")))
-        else:
-            ssrc_count = max(1, int(os.environ.get("MIRROR_SSRC_COUNT", "1")))
-        base_ssrc = secrets.randbits(32)
-        packetizers = [
-            rtp.RtpPacketizer(ssrc=(base_ssrc + i) & 0xFFFFFFFF)
-            for i in range(ssrc_count)
-        ]
-
-        # SRTP AES-128-CTR encryptors, one per SSRC (Apple's AES128AuthNoneRCCM3).
-        # KEY SOURCE: the mirror video is FairPlay (ET=32) keyed. A ground-truth
-        # atvproxy capture DISPROVED pair-verify keying (see srtp.py docstring
-        # and memory note project-mirror-not-pairverify-keyed): with the exact
-        # shared secret + ciphertext, no HKDF/SHA512 recipe over it decrypts to
-        # H.264. The real key is the FairPlay SAP keybuf (keybuf_encryptor /
-        # fply path). MIRROR_SRTP_SECRET selects the fallback when no keybuf
-        # encryptor is set:
-        #   "fply" (default)   -> the FairPlay-derived stream key/iv, or
-        #   "pairverify"       -> disproven raw-shared-secret DataStream A/B, or
-        #   "datastream"       -> disproven precomputed DataStream key.
-        # Env toggles: MIRROR_SRTP_KDF (per-SSRC HMAC KDF),
-        # MIRROR_SRTP_ROC_TRAILER (4-byte RCCM3 trailer).
-        secret_src = os.environ.get("MIRROR_SRTP_SECRET", "fply")
-        shared_key = getattr(getattr(self._verifier, "srp", None), "shared_key", None)
-        master_material = None
-        srtp_encs: list = []
-        if keybuf_encryptor is not None:
-            # An encryptor handed in on the context is an explicit caller
-            # choice and outranks the derived one -- line ~1250 already
-            # promises `self._ctx.video_encryptor or encryptor`, and this
-            # branch used to quietly take it back. The branch is still
-            # *taken* either way, so srtp_encs stays empty exactly as before;
-            # only the reassignment is skipped. ctx.video_encryptor is None in
-            # every shipping configuration, where this is unchanged.
-            if self._ctx.video_encryptor is None:
-                video_encryptor = keybuf_encryptor  # continuous AES-CTR, 1 SSRC
-        elif keybuf_srtp_key is not None:
-            # FairPlay keybuf, per-packet SRTP AES-128-CTR across the SSRCs
-            # (cipher covers payload[8:], per-RTP-packet IV). MIRROR_KEYBUF_SRTP_KDF:
-            #   "direct" (default) -> use derived key/salt as the session key/salt,
-            #   "aescm"            -> treat them as SRTP master key/salt and run the
-            #                         RFC3711 AES-CM session KDF (standard SRTP).
-            k16, s14 = keybuf_srtp_key
-            srtp_kdf = os.environ.get("MIRROR_KEYBUF_SRTP_KDF", "direct")
-            if srtp_kdf == "aescm":
-                k16, s14 = srtp.derive_srtp_session_aescm(k16, s14)
-                _LOGGER.debug(
-                    "KEYBUF SRTP aescm session key=%s salt=%s", k16.hex(), s14.hex()
-                )
-            for pkt in packetizers:
-                if srtp_kdf == "cc":
-                    # AVConference _SRTPDeriveMediaKeyInfo: session key/salt =
-                    # CCKeyDerivationHMac(6, SHA256, 0, master_key,
-                    # context=derivedSSRC(4B), salt=master_salt) -> 30B (16+14).
-                    # derivedSSRC = first 4 bytes of the master key material
-                    # (VCControlChannelMultiWay getKeyDerivationCryptoSet@0x1b7baa150),
-                    # SAME for all SSRCs -- NOT the RTP SSRC.
-                    cc_ctx = os.environ.get("MIRROR_KEYBUF_CC_CONTEXT", "derived")
-                    ctxb = k16[:4] if cc_ctx == "derived" else b""
-                    # pylint: disable-next=protected-access
-                    okm = srtp._cc_key_derivation_hmac(k16, s14, pkt.ssrc, ctxb)
-                    sk, ss = okm[:16], okm[16:30]
-                    if pkt is packetizers[0]:
-                        _LOGGER.debug(
-                            "KEYBUF SRTP cc ssrc=%x session key=%s salt=%s",
-                            pkt.ssrc,
-                            sk.hex(),
-                            ss.hex(),
-                        )
-                    srtp_encs.append(
-                        srtp.SrtpVideoEncryptor(sk, ss, pkt.ssrc, use_kdf=False)
-                    )
-                    continue
-                srtp_encs.append(
-                    srtp.SrtpVideoEncryptor(k16, s14, pkt.ssrc, use_kdf=False)
-                )
-        elif secret_src == "pairverify" and shared_key:
-            session_kdf = os.environ.get("MIRROR_SRTP_KDF", "1") != "0"
-            for pkt in packetizers:
-                srtp_encs.append(
-                    srtp.SrtpVideoEncryptor.from_shared_key(
-                        shared_key,
-                        self._ctx.stream_connection_id,
-                        pkt.ssrc,
-                        session_kdf=session_kdf,
-                    )
-                )
-        elif secret_src == "fply" and self._ctx.stream_encryptor is not None:
-            key = getattr(self._ctx.stream_encryptor, "key", b"")
-            iv = getattr(self._ctx.stream_encryptor, "iv", b"")
-            if len(key) >= 16 and len(iv) >= 14:
-                master_material = key[:16] + iv[:14]
-        elif self._ctx.datastream_video_key is not None:
-            master_material = self._ctx.datastream_video_key
-
-        if master_material is not None:
-            master_key, master_salt = srtp.derive_master_key_salt(master_material)
-            use_kdf = os.environ.get("MIRROR_SRTP_KDF", "1") != "0"
-            roc_trailer = os.environ.get("MIRROR_SRTP_ROC_TRAILER", "0") != "0"
-            for pkt in packetizers:
-                enc = srtp.SrtpVideoEncryptor(
-                    master_key, master_salt, pkt.ssrc, use_kdf=use_kdf
-                )
-                enc.roc_trailer = roc_trailer
-                srtp_encs.append(enc)
-
         async def tcp_video_producer() -> None:  # pylint: disable=too-many-locals
-            """Send one raw-TCP message per H.264 access unit (TCP dialect).
+            """Send one raw-TCP message per H.264 access unit.
 
             Each message = 128-byte header + AES-128-CTR ciphertext, where the
             ciphertext is a single CONTINUOUS keystream across the whole stream
@@ -1490,9 +936,10 @@ class MirrorSession:
             form (4-byte BE length + NAL per unit). Verified against the reference
             sender's live stream — see tcp_stream.py.
             """
-            live_cmd = os.environ.get("MIRROR_LIVE_CMD")
-            if live_cmd:
-                await self._tcp_live_video(live_cmd, video_q, video_encryptor)
+            if self._video_command:
+                await self._tcp_live_video(
+                    self._video_command, video_q, video_encryptor
+                )
                 return
             h264 = Path(self._h264_path).read_bytes()
             nalus = pacer.split_nalus(h264)
@@ -1504,12 +951,7 @@ class MirrorSession:
             # The reference sender's video frames carry only [SEI][slice]; SPS/PPS live
             # solely in the plaintext avcC config built below. Match that so
             # the receiver's screen decoder sees the same structure.
-            # MIRROR_STRIP_SPSPPS=0 leaves them in the frames, for
-            # experiments.
-            strip_ps = os.environ.get("MIRROR_STRIP_SPSPPS", "1") != "0"
-            frame_nalus = [
-                n for n in nalus if not strip_ps or pacer.nal_type(n) not in (7, 8)
-            ]
+            frame_nalus = [n for n in nalus if pacer.nal_type(n) not in (7, 8)]
             units = tcp_stream.group_access_units(frame_nalus, pacer.nal_type)
             if not units or sps is None or pps is None:
                 _LOGGER.warning(
@@ -1522,12 +964,8 @@ class MirrorSession:
                 return
             frame_interval = 1.0 / max(self._ctx.fps, 1)
             ns_per_frame = 1_000_000_000 // max(self._ctx.fps, 1)
-            geom_hex = os.environ.get("MIRROR_GEOM_HEX")
-            if geom_hex:
-                geometry = bytes.fromhex(geom_hex)
-            else:
-                w, h = float(self._ctx.width), float(self._ctx.height)
-                geometry = tcp_stream.build_geometry(w, h, 0.0, 0.0, w, h)
+            w, h = float(self._ctx.width), float(self._ctx.height)
+            geometry = tcp_stream.build_geometry(w, h, 0.0, 0.0, w, h)
 
             # 1) FIRST message: plaintext avcC decoder config (type 0x01000600),
             #    so the receiver can initialise its H.264 decoder. Not encrypted,
@@ -1559,23 +997,16 @@ class MirrorSession:
                 getattr(video_encryptor, "key", b"").hex(),
                 getattr(video_encryptor, "iv", b"").hex(),
             )
-            if os.environ.get("MIRROR_CONFIG_ONLY"):
-                _LOGGER.info("MIRROR_CONFIG_ONLY: sent config, holding (no frames)")
-                while True:
-                    await asyncio.sleep(1.0)
             # Give the receiver time to initialise its decoder from the config
             # before the first encrypted frame (avoid a race).
-            await asyncio.sleep(float(os.environ.get("MIRROR_CONFIG_DELAY", "0.3")))
+            await asyncio.sleep(CONFIG_DELAY)
             index = 0
             _loop_time = asyncio.get_event_loop().time
             _pace_start = _loop_time()
             while True:
                 unit = units[index % len(units)]
                 avcc = tcp_stream.to_avcc(unit)
-                if int(os.environ.get("MIRROR_ET", "32")) == 32:
-                    ciphertext = video_encryptor.encrypt(avcc)  # continuous keystream
-                else:
-                    ciphertext = avcc  # et=1/0: no stream-level encryption
+                ciphertext = video_encryptor.encrypt(avcc)  # continuous keystream
                 header = tcp_stream.build_data_header(
                     len(ciphertext), ts_base + index * ns_per_frame, geometry
                 )
@@ -1589,99 +1020,23 @@ class MirrorSession:
                 if _pace_delay > 0:
                     await asyncio.sleep(_pace_delay)
 
-        async def video_producer() -> None:
-            """Stripe each frame across the SSRCs and SRTP-encrypt each part.
-
-            The real sender splits every frame across 4 synchronised SSRCs
-            (shared frame-counter + timestamp). Here the length-prefixed H.264
-            access unit is split into ``ssrc_count`` byte-parts; part *i* goes on
-            SSRC base+i, SRTP AES-128-CTR encrypted with that SSRC's session key
-            (per-packet IV keyed by the RTP sequence number, inside ``packetize``).
-            The receiver reassembles the parts by shared frame-counter.
-            """
-            index = 0
-            frame_counter = 0
-            n = len(packetizers)
-            async for nal, _pts, _ft in video_pacer.iter_paced(loop=True):
-                payload = struct.pack(">I", len(nal)) + nal
-                ts = index * ticks_per_frame
-                part_len = (len(payload) + n - 1) // n
-                for i, pkt in enumerate(packetizers):
-                    part = payload[i * part_len : (i + 1) * part_len]
-                    if srtp_encs:
-                        datagrams = pkt.packetize(
-                            part,
-                            ts,
-                            encryptor=srtp_encs[i],
-                            frame_counter=frame_counter,
-                        )
-                    else:
-                        encrypted = video_encryptor.encrypt(part)
-                        video_encryptor.start_fresh_block()
-                        datagrams = pkt.packetize(
-                            encrypted, ts, frame_counter=frame_counter
-                        )
-                    for datagram in datagrams:
-                        await video_q.put(datagram)
-                frame_counter = (frame_counter + 1) & 0xFFFF
-                index += 1
-
-        async def audio_producer() -> None:
-            async for payload, pts, _ft in audio_pacer.iter_paced():
-                hdr = framing.MirrorHeader(
-                    payload_size=len(payload),
-                    payload_type=framing.PAYLOAD_TYPE_AUDIO,
-                    timestamp_ntp=pts,
-                    flags=0,
-                )
-                frame = framing.pack_mirror_frame(encryptor, hdr, payload)
-                await audio_q.put(frame)
-
         assert self._video_channel is not None
 
         async def send_feedback(_msg) -> None:
-            resp = await self._rtsp.feedback(allow_error=True)
-            if os.environ.get("MIRROR_DUMP_EVENTS") and resp is not None:
-                body = getattr(resp, "body", None)
-                try:
-                    _LOGGER.info(
-                        "FEEDBACK resp code=%s body=%r",
-                        getattr(resp, "code", "?"),
-                        decode_bplist_from_body(resp) if body else None,
-                    )
-                except Exception:
-                    raw = (
-                        body
-                        if isinstance(body, (bytes, bytearray))
-                        else str(body).encode()
-                    )
-                    _LOGGER.info(
-                        "FEEDBACK resp code=%s raw=%s",
-                        getattr(resp, "code", "?"),
-                        raw[:160],
-                    )
+            await self._rtsp.feedback(allow_error=True)
 
-        producer = tcp_video_producer if _tcp_mode() else video_producer
         # EXTEND, never replace: run() and _open_event_channel() have already
         # registered the screen-audio sender and the event-channel POST
         # /command responder here. Assigning drops them from the list, so
         # stop() never cancels or awaits them — today they still wind
         # themselves down off the ._stopped flag, but only by luck.
         self._register(
-            asyncio.create_task(producer(), name="mirror-video-pacer"),
+            asyncio.create_task(tcp_video_producer(), name="mirror-video-pacer"),
             asyncio.create_task(
                 streams.drain_queue_to_channel(self._video_channel, video_q),
                 name="mirror-video-drain",
             ),
         )
-        if self._audio_channel is not None:
-            self._register(
-                asyncio.create_task(audio_producer(), name="mirror-audio-pacer"),
-                asyncio.create_task(
-                    streams.drain_queue_to_channel(self._audio_channel, audio_q),
-                    name="mirror-audio-drain",
-                ),
-            )
         self._register(
             asyncio.create_task(
                 heartbeater(
@@ -1742,19 +1097,13 @@ class MirrorSession:
         Split out of ``stop()`` so the teardown reads as one list rather than
         as a dozen branches inside the shutdown sequence.
 
-        The raw sockets are the part worth knowing about. ``_video_sock`` is
-        bound in ``_setup_streams`` so the announced ``networkInfo.Port`` is
-        the one datagrams leave from, and ``_audio_control_sock`` is used for
-        bare ``sendto`` -- neither is a transport. The AVConference dialect
-        hands ``_video_sock`` to a datagram endpoint, which adopts it and
-        clears the reference here, so anything still set is ours to close and
-        closing it cannot race a live transport.
+        The raw socket is the part worth knowing about. ``_audio_control_sock``
+        is used for bare ``sendto`` -- it is not a transport, so nothing else
+        closes it.
         """
         for transport in (
-            self._control_transport,
             self._event_transport,
             self._video_transport,
-            self._audio_transport,
             self._audio_udp,
             self._timing_server,
         ):
@@ -1762,21 +1111,16 @@ class MirrorSession:
                 with contextlib.suppress(Exception):
                     transport.close()
 
-        for sock in (self._video_sock, self._audio_control_sock):
-            if sock is not None:
-                with contextlib.suppress(OSError):
-                    sock.close()
-        self._video_sock = None
+        if self._audio_control_sock is not None:
+            with contextlib.suppress(OSError):
+                self._audio_control_sock.close()
         self._audio_control_sock = None
 
         # The live sources, which each producer also kills in its own
-        # `finally`. That covers every way the producer can end -- except
-        # ending before it starts: both spawn the subprocess and record it
-        # here, then read an env var to size their queue, and a non-numeric
-        # `MIRROR_LIVE_BUFFER` raises between the two. The process is then
-        # running with no `finally` left to reach it, and a real source is
-        # ffmpeg or yt-dlp, so it keeps encoding and downloading for as long
-        # as it feels like. Killing an already-dead process is a no-op.
+        # `finally`. This covers a producer cancelled before it reaches that
+        # `finally`. A real source is ffmpeg or yt-dlp, so it would keep
+        # encoding and downloading for as long as it feels like. Killing an
+        # already-dead process is a no-op.
         for proc in (self._live_proc, self._audio_proc):
             if proc is not None and proc.returncode is None:
                 with contextlib.suppress(Exception):
