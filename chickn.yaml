@@ -8,7 +8,8 @@ variables:
     - pyatv
     - scripts
     - examples
-  cs_exclude_words: infoms,cann,cant,asai,cafs,assertIn
+  # clen is a Content-Length local; astroid the pylint dependency.
+  cs_exclude_words: infoms,cann,cant,asai,cafs,assertIn,clen,astroid
   requirements_file: requirements/requirements.txt
   miniaudio_package: $(grep miniaudio= requirements/requirements.txt)
 
