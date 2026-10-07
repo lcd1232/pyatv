@@ -463,11 +463,8 @@ def m2_stepper2_compress(iv: bytes, message: bytes) -> bytes:
 
     Runs ``fairplay_sap.region_a.hash_block``: SAPHash as recovered from the
     reference sender's binary by devirtualisation, which is this project's own code
-    under its own licence.  It replaces the GPLv2-derived
-    ``_saphash_systemcrash`` module this function used to call --
-    ``test_fply.py`` pins the two implementations against each other, and
-    ``test_m2_stepper2_compress_validated_block1_macp1`` pins the output
-    against a captured vector.
+    under its own licence.  ``test_m2_stepper2_compress_validated_block1_macp1``
+    pins the output against a captured vector.
 
     Verified against the real reference sender binary's STEPPER2 (via the Unicorn
     emulator with deterministic / non-session-aligned VM addresses): the

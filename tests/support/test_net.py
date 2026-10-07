@@ -67,7 +67,7 @@ def test_no_address():
     assert get_private_addresses() == []
 
 
-def test_private_addresses_covers_every_rfc1918_range(mock_address):
+def test_private_addresses(mock_address):
     mock_address("wlan0", "10.0.0.1")
     mock_address("eth0", "192.168.0.1")
     mock_address("eth1", "172.16.0.1")

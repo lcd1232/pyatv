@@ -12,10 +12,3 @@ recursive-exclude * *.py[co] .*
 prune docs/vendor
 prune docs/_site
 prune docs/.sass-cache
-
-# `graft pyatv` above sweeps in every file under pyatv/, and
-# include-package-data then puts them in the wheel as package data -- which
-# re-adds _saphash_systemcrash even though pyproject's packages.find already
-# excludes it as a package.  It is GPLv2-derived and pyatv is MIT; nothing
-# imports it at runtime and its only caller is a source-tree test.
-prune pyatv/protocols/airplay/mirror/_saphash_systemcrash

@@ -49,12 +49,7 @@ The other words, and the stores no word reads back, matter only that way.
 The published playfair `hand_garble.c` (copied into shairplay, RPiPlay,
 UxPlay and others) computes the same b0, b1 and b2.  Its output words are
 numbered differently from 13 onward, and the ones that do not feed
-playfair's key were never checked there; `garble_notes.md` maps the two.
-
-`garble_read.py` is the machine-generated port of the same function and
-the authority on what it computes; it is regenerated, never edited.
-`test_garble_plain.py` checks this file against it and against recorded
-handshakes, and `garble_notes.md` records how this file was derived.
+playfair's key were never checked there.
 """
 
 

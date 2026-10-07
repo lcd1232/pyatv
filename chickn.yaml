@@ -8,11 +8,8 @@ variables:
     - pyatv
     - scripts
     - examples
-  # Identifiers codespell reads as prose.  vas/blockIn are register and
-  # buffer names in the ARM interpreter and the vendored SAPHash; abl is
-  # CoreAudio's AudioBufferList; clen a Content-Length local; numer a field
-  # of mach_timebase_info; astroid the pylint dependency, spelled correctly.
-  cs_exclude_words: infoms,cann,cant,asai,cafs,assertIn,vas,blockIn,abl,clen,numer,astroid
+  # clen is a Content-Length local; astroid the pylint dependency.
+  cs_exclude_words: infoms,cann,cant,asai,cafs,assertIn,clen,astroid
   requirements_file: requirements/requirements.txt
   miniaudio_package: $(grep miniaudio= requirements/requirements.txt)
 

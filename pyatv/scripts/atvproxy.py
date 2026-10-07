@@ -7,10 +7,7 @@ import binascii
 from functools import partial
 from io import BytesIO
 from ipaddress import IPv4Address
-import itertools
-import json
 import logging
-import os
 import sys
 from typing import Any, Callable, Dict, Mapping, Optional, Tuple, Union, cast
 
@@ -83,58 +80,6 @@ from pyatv.support.http import (
 )
 
 _LOGGER = logging.getLogger(__name__)
-
-# --- Phase-27/28 protocol capture ------------------------------------------
-# Dump every decrypted proxied exchange (request + response) so a real
-# iOS/macOS mirroring session can be compared field-by-field against what
-# pyatv's MirrorSession sends. Enabled by setting PYATV_CAPTURE_FILE.
-_CAPTURE_FILE = os.environ.get("PYATV_CAPTURE_FILE")
-_CAPTURE_SEQ = itertools.count()
-
-
-def _capture_jsonable(value):
-    """Convert plist/bytes structures into JSON-safe values."""
-    if isinstance(value, bytes):
-        return {"__bytes__": value.hex()}
-    if isinstance(value, dict):
-        return {str(k): _capture_jsonable(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_capture_jsonable(v) for v in value]
-    if isinstance(value, (str, int, float, bool)) or value is None:
-        return value
-    return repr(value)
-
-
-def _capture_body(body) -> Mapping[str, Any]:
-    """Decode a request/response body as plist when possible."""
-    if body is None or body == b"" or body == "":
-        return {"kind": "empty"}
-    raw = body.encode("utf-8") if isinstance(body, str) else body
-    try:
-        decoded = decode_plist_body(raw)
-    except Exception:  # pylint: disable=broad-except
-        decoded = None
-    if decoded is not None:
-        return {"kind": "plist", "value": _capture_jsonable(decoded)}
-    try:
-        text = raw.decode("utf-8")
-    except UnicodeDecodeError:
-        return {"kind": "bytes", "hex": raw.hex(), "len": len(raw)}
-    return {"kind": "text", "value": text, "len": len(raw)}
-
-
-def capture_exchange(direction: str, **fields) -> None:
-    """Append one captured protocol event to the capture file."""
-    if not _CAPTURE_FILE:
-        return
-    record = {"seq": next(_CAPTURE_SEQ), "direction": direction}
-    record.update(fields)
-    try:
-        with open(_CAPTURE_FILE, "a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record) + "\n")
-    except OSError as ex:
-        _LOGGER.warning("capture write failed: %s", ex)
-
 
 DEVICE_NAME = "Proxy"
 BLUETOOTH_ADDRESS = "DA:97:7C:BA:A3:7A"
@@ -1023,121 +968,6 @@ class AirPlayDataStreamChannelAppleTVProxy(
             log_protobuf(_LOGGER, f"{self.name} {source} protobuf", protobuf_message)
 
 
-async def _start_tcp_relay(
-    loop, remote_ip: str, remote_port: int, label: str
-) -> Tuple[asyncio.AbstractServer, int]:
-    """Relay a TCP port through the proxy, recording both directions.
-
-    Used for the mirroring "media data control" connection
-    (``streamConnectionKeyPort``). Bytes are passed through untouched: that
-    channel appears to be keyed from the FairPlay-derived stream secret, which
-    is end-to-end between sender and receiver and therefore identical on both
-    sides of the proxy.
-    """
-
-    async def handle(reader, writer):
-        try:
-            up_reader, up_writer = await asyncio.open_connection(remote_ip, remote_port)
-        except OSError as ex:
-            _LOGGER.warning("%s relay: upstream connect failed: %s", label, ex)
-            writer.close()
-            return
-        _LOGGER.debug("%s relay: connection established", label)
-
-        async def pump(src, dst, direction):
-            count = 0
-            try:
-                while True:
-                    data = await src.read(65536)
-                    if not data:
-                        break
-                    count += 1
-                    capture_exchange(
-                        "control",
-                        label=label,
-                        direction_detail=direction,
-                        index=count,
-                        length=len(data),
-                        head=data[:64].hex(),
-                    )
-                    dst.write(data)
-                    await dst.drain()
-            except Exception as ex:  # pylint: disable=broad-except
-                _LOGGER.debug("%s relay %s ended: %s", label, direction, ex)
-            finally:
-                dst.close()
-
-        await asyncio.gather(
-            pump(reader, up_writer, "sender->receiver"),
-            pump(up_reader, writer, "receiver->sender"),
-            return_exceptions=True,
-        )
-
-    server = await asyncio.start_server(handle, "0.0.0.0", 0)
-    return server, server.sockets[0].getsockname()[1]
-
-
-class _MirrorUdpRelay(asyncio.DatagramProtocol):
-    """Relay + record the mirroring media stream.
-
-    The Apple TV's mirroring ``dataPort`` is UDP-only. Screen-mirroring
-    streams are otherwise passed through untouched, which means the media
-    never traverses the proxy and cannot be captured. This relay sits in the
-    middle: the sender is handed a local port, and every datagram is logged
-    and forwarded on.
-
-    The FairPlay-encrypted payload stays opaque (FPLY is end-to-end between
-    sender and receiver), but the mirror frame *header* is plaintext -- which
-    is the part whose format is still unknown.
-    """
-
-    def __init__(self, loop, remote_ip: str, remote_port: int) -> None:
-        """Initialize a relay towards remote_ip:remote_port."""
-        self.loop = loop
-        self.remote = (remote_ip, remote_port)
-        self.transport: Optional[asyncio.DatagramTransport] = None
-        self.sender_addr = None
-        self._count = 0
-
-    @property
-    def port(self) -> int:
-        """Local port the sender should target."""
-        # Only read after create_datagram_endpoint() has returned, so
-        # connection_made() has already stored the transport.
-        assert self.transport is not None
-        return self.transport.get_extra_info("socket").getsockname()[1]
-
-    def connection_made(self, transport) -> None:
-        """Store the transport once bound."""
-        self.transport = transport
-
-    def datagram_received(self, data: bytes, addr) -> None:
-        """Log and forward a datagram in whichever direction it came from."""
-        self._count += 1
-        to_receiver = addr[0] != self.remote[0]
-        if to_receiver:
-            self.sender_addr = addr
-        capture_exchange(
-            "media",
-            direction_detail="sender->receiver" if to_receiver else "receiver->sender",
-            index=self._count,
-            length=len(data),
-            head=data[:64].hex(),
-            full=data.hex() if len(data) <= 512 else None,
-        )
-        if self._count <= 20 or self._count % 200 == 0:
-            _LOGGER.debug(
-                "mirror media #%d %s %d bytes: %s",
-                self._count,
-                "s->r" if to_receiver else "r->s",
-                len(data),
-                data[:32].hex(),
-            )
-        dest = self.remote if to_receiver else self.sender_addr
-        if dest and self.transport:
-            self.transport.sendto(data, dest)
-
-
 class AirPlayAppleTVProxy(BasicHttpServer, BaseAirPlayServerAuth):
     """Implementation of a fake AirPlay device."""
 
@@ -1166,7 +996,6 @@ class AirPlayAppleTVProxy(BasicHttpServer, BaseAirPlayServerAuth):
         self.connection: Optional[HttpConnection] = None
         self.verifier: Optional[PairVerifyProcedure] = None
         self._channel_servers: Dict[str, asyncio.AbstractServer] = {}
-        self._media_relays: list = []
         self._connected_event: asyncio.Event = asyncio.Event()
         # routes that need special handling when proxied
         self.add_route("GET", "/info", self.handle_info)
@@ -1241,27 +1070,8 @@ class AirPlayAppleTVProxy(BasicHttpServer, BaseAirPlayServerAuth):
             body=encode_plist_body(self._rewrite_info(response_data)),
         )
 
-    @staticmethod
-    def _strip_fairplay_features(value: int) -> int:
-        """Clear the FairPlay/CoreUtils encryption feature bits.
-
-        Set ATVPROXY_STRIP_FAIRPLAY=<comma-separated bit numbers> to force the
-        sender away from FairPlay (X-Apple-ET:32) toward legacy AES (ET=1), so
-        the media becomes pair-verify-keyed and the proxy/oracle can decrypt it.
-        Default bits: 14 (Authentication_4 / FairPlay), 48 (CoreUtilsPairing).
-        """
-        spec = os.environ.get("ATVPROXY_STRIP_FAIRPLAY")
-        if not spec:
-            return value
-        bits = [14, 48] if spec in ("1", "true") else [int(b) for b in spec.split(",")]
-        for b in bits:
-            value &= ~(1 << b)
-        return value
-
     def _rewrite_info(self, info: Mapping[str, Any]) -> Mapping[str, Any]:
         output = dict(info)
-        if "features" in info and isinstance(info["features"], int):
-            output["features"] = self._strip_fairplay_features(info["features"])
         if "psi" in info:
             output["psi"] = SERVER_IDENTIFIER
         if "name" in info:
@@ -1285,18 +1095,9 @@ class AirPlayAppleTVProxy(BasicHttpServer, BaseAirPlayServerAuth):
             output["macAddress"] = shift_hex_identifier(info["macAddress"])
         return output
 
-    @classmethod
-    def _rewrite_dns_txt(cls, info: Mapping[str, str]) -> Mapping[str, str]:
+    @staticmethod
+    def _rewrite_dns_txt(info: Mapping[str, str]) -> Mapping[str, str]:
         output = dict(info)
-        if "features" in info and os.environ.get("ATVPROXY_STRIP_FAIRPLAY"):
-            # "0x<low>,0x<high>" -> strip encryption bits -> reformat
-            parts = info["features"].split(",")
-            low = int(parts[0], 16)
-            high = int(parts[1], 16) if len(parts) > 1 else 0
-            val = cls._strip_fairplay_features((high << 32) | low)
-            output["features"] = (
-                f"0x{val & 0xFFFFFFFF:X},0x{(val >> 32) & 0xFFFFFFFF:X}"
-            )
         if "btaddr" in info and info["btaddr"] != "00:00:00:00:00:00":
             output["btaddr"] = BLUETOOTH_ADDRESS
         if "deviceid" in info:
@@ -1370,12 +1171,10 @@ class AirPlayAppleTVProxy(BasicHttpServer, BaseAirPlayServerAuth):
             ),
         )
 
-    async def _handle_setup_data_stream_channel(  # pylint: disable=too-many-locals
+    async def _handle_setup_data_stream_channel(
         self, request: HttpRequest, request_data: dict
     ):
         request = request._replace(path=self._rewrite_uri(request.path))
-
-        assert self.connection is not None
 
         request_data_streams = request_data["streams"]
         response = await self.send_to_atv(request)
@@ -1386,70 +1185,6 @@ class AirPlayAppleTVProxy(BasicHttpServer, BaseAirPlayServerAuth):
         for request_stream, response_stream in zip(
             request_data_streams, response_data_streams
         ):
-            # Screen-mirroring streams (type 110) carry neither streamID nor
-            # seed -- those are remote-control data-stream fields. Relay such
-            # streams untouched instead of raising KeyError, which used to kill
-            # this task and leave the sender waiting forever for a response
-            # that the Apple TV had already sent.
-            if "streamID" not in response_stream or "seed" not in request_stream:
-                # Screen mirroring: relay the UDP media port through us so the
-                # frames can be recorded, and hand the sender our local port.
-                data_port = response_stream.get("dataPort")
-                if data_port:
-                    _, relay = await self.loop.create_datagram_endpoint(
-                        partial(
-                            _MirrorUdpRelay,
-                            self.loop,
-                            self.connection.remote_ip,
-                            data_port,
-                        ),
-                        local_addr=("0.0.0.0", 0),
-                    )
-                    self._media_relays.append(relay)
-                    _LOGGER.debug(
-                        "Mirror media relay: remote=%d local=%d",
-                        data_port,
-                        relay.port,
-                    )
-                    rewritten = {**response_stream, "dataPort": relay.port}
-                    if "networkInfo" in rewritten:
-                        rewritten["networkInfo"] = {
-                            **rewritten["networkInfo"],
-                            "Port": relay.port,
-                        }
-
-                    # The media-data-control connection is TCP on a separate
-                    # port and must be relayed too, or the sender dials a port
-                    # that only exists on the real receiver.
-                    conns = rewritten.get("streamConnections") or {}
-                    ctl = conns.get("streamConnectionTypeMediaDataControl") or {}
-                    ctl_port = ctl.get("streamConnectionKeyPort")
-                    if ctl_port:
-                        ctl_server, ctl_local = await _start_tcp_relay(
-                            self.loop,
-                            self.connection.remote_ip,
-                            ctl_port,
-                            "mirror-control",
-                        )
-                        self._media_relays.append(ctl_server)
-                        _LOGGER.debug(
-                            "Mirror control relay: remote=%d local=%d",
-                            ctl_port,
-                            ctl_local,
-                        )
-                        rewritten["streamConnections"] = {
-                            **conns,
-                            "streamConnectionTypeMediaDataControl": {
-                                **ctl,
-                                "streamConnectionKeyPort": ctl_local,
-                            },
-                        }
-                    response_data_streams_modified.append(rewritten)
-                else:
-                    _LOGGER.debug("Relaying mirroring SETUP untouched (no dataPort)")
-                    response_data_streams_modified.append(response_stream)
-                continue
-
             stream_id = response_stream["streamID"]
             stream_port = response_stream["dataPort"]
             stream_seed = request_stream["seed"]
@@ -1522,8 +1257,6 @@ class AirPlayAppleTVProxy(BasicHttpServer, BaseAirPlayServerAuth):
             pass
         finally:
             for request_stream in request_data["streams"]:
-                if "streamID" not in request_stream:
-                    continue  # mirroring stream; no channel server was created
                 stream_id = request_stream["streamID"]
                 self._destroy_channel_server(f"Data stream {stream_id}")
 
@@ -1539,17 +1272,6 @@ class AirPlayAppleTVProxy(BasicHttpServer, BaseAirPlayServerAuth):
     ) -> Optional[Union[HttpResponse, asyncio.Task]]:
         """Dispatch request to correct handler method or proxy to remote device."""
         log_request(_LOGGER, request)
-        capture_exchange(
-            "request",
-            method=request.method,
-            path=request.path,
-            # Framing matters: a real mirroring sender runs the whole
-            # conversation as RTSP/1.0 with one shared CSeq counter, while
-            # pyatv historically mixes HTTP/1.1 and RTSP/1.0.
-            protocol=f"{request.protocol}/{request.version}",
-            headers=dict(request.headers),
-            body=_capture_body(request.body),
-        )
         response = super().handle_request(request)
         if response is not None:
             return response
@@ -1574,15 +1296,6 @@ class AirPlayAppleTVProxy(BasicHttpServer, BaseAirPlayServerAuth):
             body=request.body,
         )
         log_response(_LOGGER, response)
-        capture_exchange(
-            "response",
-            method=request.method,
-            path=request.path,
-            protocol=f"{response.protocol}/{response.version}",
-            code=response.code,
-            headers=dict(response.headers),
-            body=_capture_body(response.body),
-        )
         return response._replace(
             headers={
                 k: v
@@ -1765,39 +1478,6 @@ async def publish_airplay_service(
     )
 
 
-async def _wait_until_quit(loop) -> None:
-    """Block until the user asks to quit.
-
-    Reading a line from stdin returns immediately at EOF, which is what
-    happens whenever the proxy is started from a script or with stdin
-    redirected -- it used to exit the instant it came up. Waiting forever
-    instead fixed that but broke the interactive case, and left a prompt
-    saying ENTER quits when it no longer did.
-
-    So: ENTER quits when stdin is a terminal, and otherwise there is nothing
-    to read from, and we wait for a signal.
-
-    KeyboardInterrupt is caught rather than propagated because the caller
-    only unpublishes the Zeroconf service once this returns -- letting Ctrl-C
-    through would leave a stale mDNS advertisement behind. CancelledError is
-    deliberately *not* caught: nothing here cancels these tasks, and
-    swallowing it would break cancellation for anything that ever does.
-    """
-    if sys.stdin.isatty():
-        print("Press ENTER to quit")
-        try:
-            await loop.run_in_executor(None, sys.stdin.readline)
-        except KeyboardInterrupt:
-            pass
-        return
-
-    print("Running until interrupted (Ctrl-C) -- stdin is not a terminal")
-    try:
-        await asyncio.Event().wait()
-    except KeyboardInterrupt:
-        pass
-
-
 async def _start_mrp_proxy(loop, args, zconf: Zeroconf):
     def proxy_factory():
         try:
@@ -1836,7 +1516,8 @@ async def _start_mrp_proxy(loop, args, zconf: Zeroconf):
 
     unpublisher = await publish_mrp_service(zconf, args.local_ip, port, args.name)
 
-    await _wait_until_quit(loop)
+    print("Press ENTER to quit")
+    await loop.run_in_executor(None, sys.stdin.readline)
 
     return unpublisher
 
@@ -1877,7 +1558,8 @@ async def _start_companion_proxy(loop, args, zconf):
         zconf, args.local_ip, port, properties
     )
 
-    await _wait_until_quit(loop)
+    print("Press ENTER to quit")
+    await loop.run_in_executor(None, sys.stdin.readline)
 
     return unpublisher
 
@@ -1921,7 +1603,8 @@ async def _start_airplay_proxy(loop, args, zconf):
         zconf, args.local_ip, port, dict(service.properties)
     )
 
-    await _wait_until_quit(loop)
+    print("Press ENTER to quit")
+    await loop.run_in_executor(None, sys.stdin.readline)
 
     return unpublisher
 
@@ -1945,7 +1628,8 @@ async def _start_relay(loop, args, zconf):
         zconf,
     )
 
-    await _wait_until_quit(loop)
+    print("Press ENTER to quit")
+    await loop.run_in_executor(None, sys.stdin.readline)
 
     server.close()
     return unpublisher

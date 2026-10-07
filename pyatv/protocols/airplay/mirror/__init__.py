@@ -20,8 +20,7 @@ design question, not a missing import.
 One thing to settle at that point: the state-machine guards here raise bare
 ``RuntimeError`` -- "handshake not complete", "called in state X", "not
 connected" -- fourteen of them, where the rest of pyatv raises
-``exceptions.InvalidStateError`` for exactly that (see
-``ap2_session._setup_encrypted_channel``). Nothing catches either today, so
+``exceptions.InvalidStateError`` for exactly that. Nothing catches either today, so
 it costs nothing to leave; a public caller would want the pyatv type.
 
 Which of the two, though, is not uniform in pyatv and the choice has a rule.

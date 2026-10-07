@@ -7,6 +7,7 @@ import pytest
 from pyatv.auth.hap_pairing import NO_CREDENTIALS, HapCredentials
 from pyatv.protocols.airplay.auth import (
     AuthenticationType,
+    HapCredentials,
     NullPairVerifyProcedure,
     pair_setup,
     pair_verify,

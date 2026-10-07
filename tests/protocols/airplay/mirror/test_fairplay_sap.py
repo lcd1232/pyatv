@@ -302,24 +302,6 @@ def test_context_after_m3_rejects_a_wrong_length_secret():
         fairplay_sap.context_after_m3(b"\x00" * 35)
 
 
-def test_asr_sign_extends_from_the_top_bit():
-    """``garble_read._asr`` is ARM's arithmetic shift, not Python's.
-
-    Values with the top bit set must shift in ones. Only the ported FairPlay
-    code calls this, and the golden handshakes happen never to reach it with a
-    negative value, so this is the sole exercise of the sign-extension branch.
-    """
-    from pyatv.protocols.airplay.mirror.fairplay_sap.garble_read import _asr
-
-    # Top bit set: shifting in ones, wrapped back to the field width.
-    assert _asr(0x80, 1, 8) == 0xC0
-    assert _asr(0xFF, 1, 8) == 0xFF
-    assert _asr(0x80000000, 4, 32) == 0xF8000000
-    # Top bit clear: an ordinary logical shift, for contrast.
-    assert _asr(0x40, 1, 8) == 0x20
-    assert _asr(0x7F, 1, 8) == 0x3F
-
-
 def test_the_constants_duplicated_across_recovered_modules_still_agree():
     """Several constants are defined in more than one recovered module.
 

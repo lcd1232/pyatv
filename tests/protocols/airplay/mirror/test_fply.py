@@ -519,43 +519,6 @@ def test_m2_stepper_compress_rejects_wrong_lengths():
         fply.m2_stepper_compress(b"\x00" * 16, b"\x00" * 63)
 
 
-def test_the_shipped_saphash_still_matches_the_vendored_gplv2_one():
-    """The recovered SAPHash reproduces the vendored GPLv2 one, exactly.
-
-    ``m2_stepper2_compress`` now runs ``fairplay_sap.region_a.hash_block``,
-    recovered from the reference sender's binary by devirtualisation rather than
-    from the GPLv2 source.  ``_saphash_systemcrash/_saphash.py`` -- derived
-    work from openairplay/airplay2-receiver, vendored into an MIT project --
-    is no longer on any code path.
-
-    It is kept, and this test keeps calling it *directly* rather than through
-    ``fply``, because it is the only independent implementation of this
-    algorithm available to check the recovery against.  Routing through
-    ``fply`` would compare the recovery with itself and pass no matter what
-    either side did.
-
-    Whether the recovery clears a clean-room bar is a licensing judgement,
-    not a technical one; this test only establishes that the outputs agree.
-    """
-    from contextlib import redirect_stdout
-    import io
-    import random
-
-    from pyatv.protocols.airplay.mirror._saphash_systemcrash import SAPHash
-    from pyatv.protocols.airplay.mirror.fairplay_sap import region_a
-
-    rnd = random.Random(20260905)
-    messages = [bytes(64), b"\xff" * 64, bytes(range(64))]
-    messages += [bytes(rnd.randrange(256) for _ in range(64)) for _ in range(40)]
-
-    with redirect_stdout(io.StringIO()):  # the GPLv2 module prints
-        for message in messages:
-            # SAPHash reads its message big-endian per u32; ours is little.
-            msg_be = b"".join(message[i : i + 4][::-1] for i in range(0, 64, 4))
-            vendored = bytes(SAPHash().hash(msg_be))
-            assert region_a.hash_block(message) == vendored, message.hex()
-
-
 # ---------------------------------------------------------------------------
 # Validation and state guards
 #

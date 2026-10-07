@@ -87,6 +87,20 @@ async def test_pairing_exception_invalid_pin(airplay_conf, expected_credentials)
         ({"features": "0x00000000,0x00010000"}, None),
     ],
 )
+async def test_pairing_exception_invalid_pin(airplay_conf, expected_credentials):
+    with pytest.raises(exceptions.PairingError):
+        await perform_pairing(
+            airplay_conf, 9999, expected_credentials=expected_credentials
+        )
+
+
+@pytest.mark.parametrize(
+    "airplay_properties,expected_credentials",
+    [
+        ({}, DEVICE_CREDENTIALS),
+        ({"features": "0x00000000,0x00010000"}, None),
+    ],
+)
 async def test_pairing_with_device_new_credentials(airplay_conf, expected_credentials):
     # Using patch as decorator does not seem to work with python < 3.8, but can be
     # worked around using asynctest. This is however the only async test using patch

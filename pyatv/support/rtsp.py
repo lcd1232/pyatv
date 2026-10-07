@@ -11,7 +11,6 @@ import plistlib
 from random import randrange
 from typing import Any, Dict, Mapping, NamedTuple, Optional, Tuple, Union
 
-from pyatv import exceptions
 from pyatv.protocols.dmap import tags
 from pyatv.support import async_timeout
 from pyatv.support.http import HttpConnection, HttpResponse, decode_bplist_from_body
@@ -90,7 +89,7 @@ class RtspSession:
         self.active_remote: int = randrange(2**32)
         # Overridable per session: AirPlay 2 screen mirroring is only offered
         # to senders advertising a recent enough AirPlay version (a real macOS
-        # sender reports AirPlay/870.14.1 -- Phase 28 capture).
+        # sender reports AirPlay/870.14.1).
         self.user_agent: str = USER_AGENT
 
     @property
@@ -156,15 +155,6 @@ class RtspSession:
             body=body,
             allow_error=requires_password,
         )
-
-        # `allow_error` above was opted into for the 401 digest challenge
-        # handled below -- but it also suppresses the 403 that HttpConnection
-        # would otherwise raise AuthenticationError for, and this method's
-        # only caller discards the response. Without this, a receiver that
-        # refuses the ANNOUNCE outright is indistinguishable from one that
-        # accepted it, and the failure surfaces much later as something else.
-        if requires_password and response.code == 403:
-            raise exceptions.AuthenticationError("not authenticated")
 
         # Save the necessary data for password authentication
         www_authenticate = response.headers.get("www-authenticate", None)
@@ -300,7 +290,7 @@ class RtspSession:
         # A caller can suppress one of the defaults above by passing it as
         # None. AirPlay 2 screen mirroring needs this: DACP-ID/Active-Remote/
         # Client-Instance are RAOP remote-control headers and a real mirroring
-        # sender does not send them (Phase 28 capture).
+        # sender does not send them.
         hdrs = {k: v for k, v in hdrs.items() if v is not None}
 
         # If body is a dict, assume that payload should be sent as a binary plist

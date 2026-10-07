@@ -4,7 +4,6 @@ from unittest.mock import ANY, MagicMock
 
 import pytest
 
-from pyatv import exceptions
 from pyatv.const import Protocol
 from pyatv.core import (
     AbstractPushUpdater,

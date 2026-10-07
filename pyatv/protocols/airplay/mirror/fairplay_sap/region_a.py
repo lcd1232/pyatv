@@ -52,10 +52,8 @@ THE ONE JOIN THAT IS NOT WHERE IT LOOKS.  `garble_plain.garble` is not
 the garble alone.  It starts by writing buffer1[159..209] -- the
 fifty-one indices a 789-step scramble has not reached -- off the
 scramble's own taps, (i-155), (i-57) and (i-13) at i = 789
-(`garble_plain._finish_scramble`).  That is where `garble_gen`'s window
-boundary fell, so the port carries the tail of the sweep with it, and so
-does `garble_plain`, its readable twin and the one this module runs
-(`garble_read` is the generated authority it is tested against).
+(`garble_plain._finish_scramble`), because that is where the recovered
+code's boundary fell.
 
 So buffer1 is scrambled 789 steps here, not 840, and `garble` finishes
 it.  Scrambling the full 840 first covers those fifty-one indices twice.

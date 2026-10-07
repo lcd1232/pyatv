@@ -43,22 +43,13 @@ version = { attr = "pyatv.const.__version__" }
 
 [tool.setuptools.packages.find]
 include = ["pyatv*"]
-# _saphash_systemcrash is derived from GPLv2 code (openairplay/airplay2-receiver)
-# and pyatv is MIT.  Nothing imports it at runtime -- fply.m2_stepper2_compress
-# runs the recovered fairplay_sap.region_a.hash_block instead -- and its only
-# caller is a source-tree test that checks the recovery against it.
-exclude = ["pyatv.protocols.airplay.mirror._saphash_systemcrash*"]
 
 [tool.black]
-# _saphash_systemcrash is vendored GPLv2 kept as upstream wrote it.
-extend-exclude = '(protobuf/(__init__|.*_pb2).py)|__pycache__|mirror/_saphash_systemcrash/'
+extend-exclude = '(protobuf/(__init__|.*_pb2).py)|__pycache__'
 include = '(pyatv|tests|examples|scripts).*\.py'
 
 [tool.isort]
-skip_glob = [
-    "pyatv/protocols/mrp/protobuf/*.py",
-    "pyatv/protocols/airplay/mirror/_saphash_systemcrash/*",
-]
+skip_glob = "pyatv/protocols/mrp/protobuf/*.py"
 profile = "black"
 force_sort_within_sections = true
 known_first_party = [
@@ -70,12 +61,6 @@ forced_separate = [
     "tests",
     "scripts",
 ]
-
-[tool.mypy]
-# _saphash.py is the vendored GPLv2 derived work, kept unmodified; its three
-# errors are upstream's.  __init__.py beside it is pyatv's own and stays under
-# the typing gate.
-exclude = ['pyatv/protocols/airplay/mirror/_saphash_systemcrash/_saphash\.py$']
 
 [[tool.mypy.overrides]]
 module = [

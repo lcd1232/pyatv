@@ -1,10 +1,6 @@
 [MASTER]
 load-plugins=pylint.extensions.no_self_use
 reports=no
-# _saphash_systemcrash is vendored GPLv2 kept exactly as upstream wrote it.
-# The generated modules in fairplay_sap/ carry `# pylint: skip-file`.
-ignore-paths=
-  .*/airplay/mirror/_saphash_systemcrash/.*
 
 [BASIC]
 good-names=

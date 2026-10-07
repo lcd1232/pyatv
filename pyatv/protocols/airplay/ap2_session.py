@@ -8,11 +8,11 @@ most low-level stuff is taken care of.
 import asyncio
 import logging
 from random import randint
-from typing import Any, Dict, List, Optional, Set, Tuple, cast
+from typing import Any, Dict, List, Optional, Set, cast
 from uuid import uuid4
 
 from pyatv import exceptions
-from pyatv.auth.hap_channel import AbstractHAPChannel, setup_channel
+from pyatv.auth.hap_channel import setup_channel
 from pyatv.auth.hap_pairing import HapCredentials, PairVerifyProcedure
 from pyatv.core.protocol import heartbeater
 from pyatv.interface import DeviceListener
@@ -112,84 +112,78 @@ class AP2Session:
         resp = await self.rtsp.setup(body=body)
         return decode_bplist_from_body(resp)
 
-    async def _setup_encrypted_channel(
-        self,
-        address: str,
-        channel_factory,
-        rtsp_setup_body: Dict[str, Any],
-        salt: str,
-        output_info: str,
-        input_info: str,
-        port_extractor,
-    ) -> Tuple[asyncio.BaseTransport, AbstractHAPChannel]:
-        """Run RTSP SETUP, then open an encrypted side channel to the returned port."""
+    async def _setup_event_channel(self, address: str) -> None:
         if self.verifier is None:
             raise exceptions.InvalidStateError("not in connected state")
-        resp = await self._setup(rtsp_setup_body)
-        port = port_extractor(resp)
-        transport, protocol = await setup_channel(
-            channel_factory,
+
+        resp = await self._setup(
+            {
+                "isRemoteControlOnly": True,
+                "osName": self._info.os_name,
+                "sourceVersion": "550.10",
+                "timingProtocol": "None",
+                "model": self._info.model,
+                "deviceID": self._info.device_id,
+                "osVersion": self._info.os_version,
+                "osBuildVersion": self._info.os_build,
+                "macAddress": self._info.mac,
+                "sessionUUID": str(uuid4()).upper(),
+                "name": self._info.name,
+            }
+        )
+
+        event_port = resp["eventPort"]
+
+        # Event channel is not used so we don't care about it (must be set up though).
+        #
+        # Note: Read/Write info reversed here as connection originates from receiver!
+        transport, _ = await setup_channel(
+            EventChannel,
             self.verifier,
             address,
-            port,
-            salt,
-            output_info,
-            input_info,
+            event_port,
+            EVENTS_SALT,
+            EVENTS_READ_INFO,
+            EVENTS_WRITE_INFO,
         )
         self._channels.append(transport)
-        return transport, protocol
-
-    async def _setup_event_channel(self, address: str) -> None:
-        body = {
-            "isRemoteControlOnly": True,
-            "osName": self._info.os_name,
-            "sourceVersion": "550.10",
-            "timingProtocol": "None",
-            "model": self._info.model,
-            "deviceID": self._info.device_id,
-            "osVersion": self._info.os_version,
-            "osBuildVersion": self._info.os_build,
-            "macAddress": self._info.mac,
-            "sessionUUID": str(uuid4()).upper(),
-            "name": self._info.name,
-        }
-        await self._setup_encrypted_channel(
-            address,
-            EventChannel,
-            body,
-            EVENTS_SALT,
-            EVENTS_READ_INFO,  # NB: read/write reversed for event channel
-            EVENTS_WRITE_INFO,
-            port_extractor=lambda r: r["eventPort"],
-        )
 
     async def _setup_data_channel(self, address: str) -> None:
         if self.verifier is None:
             raise exceptions.InvalidStateError("not in connected state")
 
+        # A 64 bit random seed is included and used as part of the salt in encryption
         seed = randint(0, 2**64)
-        body = {
-            "streams": [
-                {
-                    "controlType": 2,
-                    "channelID": str(uuid4()).upper(),
-                    "seed": seed,
-                    "clientUUID": str(uuid4()).upper(),
-                    "type": 130,
-                    "wantsDedicatedSocket": True,
-                    "clientTypeUUID": "1910A70F-DBC0-4242-AF95-115DB30604E1",
-                }
-            ]
-        }
-        _, protocol = await self._setup_encrypted_channel(
-            address,
+
+        resp = await self._setup(
+            {
+                "streams": [
+                    {
+                        "controlType": 2,
+                        "channelID": str(uuid4()).upper(),
+                        "seed": seed,
+                        "clientUUID": str(uuid4()).upper(),
+                        "type": 130,
+                        "wantsDedicatedSocket": True,
+                        "clientTypeUUID": "1910A70F-DBC0-4242-AF95-115DB30604E1",
+                    }
+                ]
+            }
+        )
+
+        data_port = resp["streams"][0]["dataPort"]
+
+        transport, protocol = await setup_channel(
             DataStreamChannel,
-            body,
+            self.verifier,
+            address,
+            data_port,
             DATASTREAM_SALT + str(seed),
             DATASTREAM_OUTPUT_INFO,
             DATASTREAM_INPUT_INFO,
-            port_extractor=lambda r: r["streams"][0]["dataPort"],
         )
+        self._channels.append(transport)
+
         self.data_channel = cast(DataStreamChannel, protocol)
 
     def stop(self) -> Set[asyncio.Task]:

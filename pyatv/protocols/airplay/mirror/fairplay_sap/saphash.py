@@ -2,8 +2,7 @@
 
 Region A's two big arithmetic bursts are neither the block cipher nor the
 MD5 -- they are the scramble at the heart of SAPHash, the FairPlay v3
-routine that airplay2-receiver's `fairplay3.py` already implements (and
-which this repo vendors as `_saphash_systemcrash/_saphash.py`).
+routine that airplay2-receiver's `fairplay3.py` also implements.
 
     for i in range(840):
         x = b[u32(i - 155) % 210]

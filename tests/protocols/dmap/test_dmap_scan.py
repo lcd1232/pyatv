@@ -45,6 +45,30 @@ async def test_multicast_scan_home_sharing_merge(udns_server, multicast_scan):
     )
 
 
+async def test_multicast_scan_home_sharing_merge(udns_server, multicast_scan):
+    udns_server.add_service(
+        fake_udns.device_service(DMAP_SERVICE_NAME, DMAP_NAME, addresses=[IP_1])
+    )
+    udns_server.add_service(
+        fake_udns.homesharing_service(
+            DMAP_SERVICE_NAME, DMAP_NAME, DMAP_HSGID, addresses=[IP_1]
+        )
+    )
+
+    atvs = await multicast_scan()
+    assert len(atvs) == 1
+
+    assert_device(
+        atvs[0],
+        DMAP_NAME,
+        ip_address(IP_1),
+        DMAP_SERVICE_NAME,
+        Protocol.DMAP,
+        3689,
+        DMAP_HSGID,
+    )
+
+
 async def test_multicast_scan_hscp_device(udns_server, multicast_scan):
     udns_server.add_service(
         fake_udns.hscp_service(

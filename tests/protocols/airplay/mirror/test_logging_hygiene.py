@@ -38,8 +38,6 @@ def test_no_log_above_debug_prints_raw_key_material():
 
     offenders = []
     for path in sorted(package.rglob("*.py")):
-        if "_saphash_systemcrash" in str(path):
-            continue  # vendored, and off every code path
         for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
             if not (
                 isinstance(node, ast.Call)
