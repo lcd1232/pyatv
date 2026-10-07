@@ -1,8 +1,8 @@
 """Ground-truth FPLY tests against captured (M1, M2, M3, M4) bytes.
 
-Capture provenance: live AirParrot mirroring session against an Apple TV the
-pyatv project was tested with.  Bytes are functional protocol data, not source
-code, so they may be embedded as constants.
+Capture provenance: a live mirroring session of the reference sender against an Apple TV
+the pyatv project was tested with. Bytes are functional protocol data, not source code,
+so they may be embedded as constants.
 
 Four independent (M1, M2, M3, M4) pairs captured from the same client/server
 combination, exercising mode=1, 2, 3, 3:
@@ -12,7 +12,7 @@ combination, exercising mode=1, 2, 3, 3:
 * pair 3: mode 0x03
 * pair 4: mode 0x03 (different session, fully independent random material)
 
-Empirical observations (Phase 12 analysis, /tmp/airparrot_fply_phase12.md):
+Empirical observations (Phase 12 analysis, /tmp/fply_phase12.md):
 
 * M3[13:16] = ``8f 1a 9c`` is constant across all four pairs (literal aux
   header emitted by the sender, not derived from M2).
@@ -27,7 +27,7 @@ Empirical observations (Phase 12 analysis, /tmp/airparrot_fply_phase12.md):
 These tests pin the empirical M2 and M3 wire layouts: offsets, header
 bytes, and where the session block and the device tag actually live.
 
-They do NOT expect pyatv to reproduce this capture's M3.  AirParrot's
+They do NOT expect pyatv to reproduce this capture's M3.  The reference sender's
 session block and device tag are functions of ITS ``arc4random``, and
 pyatv's FairPlay path (``fairplay_sap``, recovered from the emulator that
 pinned that randomness to zero) is deterministic: it sends its own
@@ -213,7 +213,7 @@ def test_m2_is_session_random_in_same_mode():
 
 
 # ---------------------------------------------------------------------------
-# What pyatv sends against what AirParrot sent
+# What pyatv sends against what the reference sender sent
 # ---------------------------------------------------------------------------
 
 
@@ -221,7 +221,7 @@ def test_pyatv_agrees_with_the_capture_on_everything_but_the_session():
     """Same framing, same aux header, different session material.
 
     pyatv's session block is the constant :data:`fply.M3_CIPHER_BLOCK` (the
-    sender randomness is pinned), AirParrot's was random, so M3[16:144] and
+    sender randomness is pinned), the reference sender's was random, so M3[16:144] and
     the device tag after it differ by construction.  Everything the wire
     format fixes must still agree.
     """

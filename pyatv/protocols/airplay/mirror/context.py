@@ -79,7 +79,7 @@ class MirrorContext:
     # SHA512("AirPlayStreamKey"+id||keybuf)[:16] over continuous AES-CTR.
     sap_context: bytes = b""
 
-    # AirParrot-dialect key transport: the 16-byte raw16 (SAP secret) we CHOSE
+    # TCP-dialect key transport: the 16-byte raw16 (SAP secret) we CHOSE
     # and packaged into ``ekey`` (the receiver unwraps ekey -> raw16 and derives
     # the video key from it, so we derive/encrypt with this same raw16).
     stream_raw16: bytes = b""

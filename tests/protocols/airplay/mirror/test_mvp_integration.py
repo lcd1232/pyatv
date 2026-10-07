@@ -45,14 +45,14 @@ GUARD_TIMEOUT = 60.0
 pytestmark = pytest.mark.asyncio
 
 
-@pytest.mark.parametrize("airparrot", [False, True], ids=["avconference", "airparrot"])
+@pytest.mark.parametrize("tcp", [False, True], ids=["avconference", "tcp"])
 async def test_mvp_streams_to_fake_receiver_after_mfisap_handshake(
-    monkeypatch, tmp_path, airparrot
+    monkeypatch, tmp_path, tcp
 ):
     """A real MFiSAP handshake must feed a stream the receiver actually sees.
 
     Both wire dialects are covered: the AVConference flow (session-init SETUP,
-    UDP ``dataPort``) and the AirParrot flow that renders on tvOS 26 (audio
+    UDP ``dataPort``) and the TCP flow that renders on tvOS 26 (audio
     SETUP first, RECORD, then a type-110 video SETUP over a TCP ``dataPort``).
 
     Scope, because there are two unrelated handshakes in this package and the
@@ -64,12 +64,12 @@ async def test_mvp_streams_to_fake_receiver_after_mfisap_handshake(
     is deliberate; ``test_real_fairplay_material_crosses_into_session`` is the
     one that puts genuine ``fairplay_sap`` output through the same session.
     """
-    monkeypatch.setenv("MIRROR_AIRPARROT", "1" if airparrot else "0")
-    # The AirParrot video producer waits out a decoder-warmup delay before its
+    monkeypatch.setenv("MIRROR_TCP", "1" if tcp else "0")
+    # The TCP-dialect video producer waits out a decoder-warmup delay before its
     # first encrypted frame. asyncio.sleep is stubbed repo-wide, so the value
     # costs no real time, but pin it so the test does not depend on the default.
     monkeypatch.setenv("MIRROR_CONFIG_DELAY", "0")
-    if airparrot:
+    if tcp:
         # Screen audio: AAC-ELD frames over UDP/RTP, AES-128-CBC keyed from
         # raw16 + the media pair-verify shared secret. Off by default in
         # production, so it has to be switched on explicitly here.
@@ -85,7 +85,7 @@ async def test_mvp_streams_to_fake_receiver_after_mfisap_handshake(
         # by frame count rather than by elapsed time.
         monkeypatch.setenv("MIRROR_AUDIO_SYNC_EVERY", "1")
 
-    receiver = FakeMirrorReceiver(airparrot=airparrot)
+    receiver = FakeMirrorReceiver(tcp=tcp)
     host, port = await receiver.start()
 
     connection = None
@@ -104,8 +104,8 @@ async def test_mvp_streams_to_fake_receiver_after_mfisap_handshake(
         # Build the session context with the handshake's stream encryptor
         rtsp = RtspSession(connection)
         ctx = MirrorContext(stream_encryptor=sm.stream_encryptor)
-        if airparrot:
-            # The AirParrot dialect transports a FairPlay-wrapped stream key in
+        if tcp:
+            # The TCP dialect transports a FairPlay-wrapped stream key in
             # the SETUP body and keys the video from the raw16 it wraps. The
             # fake receiver does not unwrap it, but supplying both exercises
             # the real key-transport and key-derivation code paths.
@@ -148,7 +148,7 @@ async def test_mvp_streams_to_fake_receiver_after_mfisap_handshake(
             run_task.result()  # re-raise whatever killed the session
             pytest.fail("MirrorSession.run() returned before streaming started")
         await wait_frames
-        if airparrot:
+        if tcp:
             await asyncio.wait_for(
                 receiver.event_server.command_answered.wait(),
                 timeout=GUARD_TIMEOUT,
@@ -164,7 +164,7 @@ async def test_mvp_streams_to_fake_receiver_after_mfisap_handshake(
         except (asyncio.CancelledError, asyncio.TimeoutError):
             pass
 
-        if airparrot:
+        if tcp:
             # Teardown must mean teardown: no sync packets after stop(). The
             # screen-audio sender runs on its own task, so this is the only
             # thing that catches it outliving the session. Twenty event-loop
@@ -184,8 +184,8 @@ async def test_mvp_streams_to_fake_receiver_after_mfisap_handshake(
         receiver.assert_protocol_ok()
         # Modern mirroring sends no ANNOUNCE/SDP.
         assert not receiver.announce_received, "ANNOUNCE must not be sent"
-        if airparrot:
-            # AirParrot opens with the type-96 audio SETUP (which carries the
+        if tcp:
+            # The reference sender opens with the type-96 audio SETUP (which carries the
             # eventPort) and has no metadata-only session init.
             assert receiver.audio_setup_received, "audio SETUP not received"
             assert not receiver.session_setup_received
@@ -214,7 +214,7 @@ async def test_mvp_streams_to_fake_receiver_after_mfisap_handshake(
         assert receiver.video_server.bytes_received > 0
         # The media-data-control channel carries no media in either dialect.
         assert receiver.control_server.frames_received == 0
-        if airparrot:
+        if tcp:
             assert receiver.audio_data_server.bytes_received > 0
             # The 0xD4 sync packet is what makes the receiver schedule audio
             # at all; it is a 20-byte RAOP SyncPacket with PT 84.
@@ -287,7 +287,7 @@ async def test_real_fairplay_material_crosses_into_session(monkeypatch):
     assert ekey.hex() == vector["ekey"]
 
     pair32 = bytes.fromhex("66" * 32)
-    monkeypatch.setenv("MIRROR_AIRPARROT", "1")
+    monkeypatch.setenv("MIRROR_TCP", "1")
     monkeypatch.setenv("MIRROR_CONFIG_DELAY", "0")
     monkeypatch.setenv("MIRROR_PAIR32", pair32.hex())
 
@@ -296,16 +296,16 @@ async def test_real_fairplay_material_crosses_into_session(monkeypatch):
     # spying on the call is the only way to see the raw16 arrive. The wrapper
     # calls through, so the real derivation still runs.
     derivations = []
-    real_derive = framing.derive_airparrot_stream_key_iv
+    real_derive = framing.derive_tcp_stream_key_iv
 
     def recording_derive(*args, **kwargs):
         result = real_derive(*args, **kwargs)
         derivations.append((args, kwargs, result))
         return result
 
-    monkeypatch.setattr(framing, "derive_airparrot_stream_key_iv", recording_derive)
+    monkeypatch.setattr(framing, "derive_tcp_stream_key_iv", recording_derive)
 
-    receiver = FakeMirrorReceiver(airparrot=True)
+    receiver = FakeMirrorReceiver(tcp=True)
     host, port = await receiver.start()
 
     connection = None

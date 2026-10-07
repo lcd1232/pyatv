@@ -105,7 +105,7 @@ def _rotr8_or_zero(value, count):
 
 
 def _window_or_zero(value, count):
-    """The byte repeated in a 16-bit word, shifted right by `8 - count`.
+    """Return the byte repeated in a 16-bit word, shifted right by `8 - count`.
 
     0 when `count & 7` is 0.  This is `_rotl8_or_zero` without the final
     byte mask: its callers use the result as an index into a 21-byte ring,
@@ -126,7 +126,7 @@ def _choose(mask, off, on):
 
 
 def _tap(cursor, back):
-    """The scramble tap *back* bytes behind *cursor* on the 210-byte ring.
+    """Return the scramble tap *back* bytes behind *cursor* on the 210-byte ring.
 
     The subtraction is unsigned 32-bit and happens before the modulo:
     cursor 0, back 155 is 101, because 0xffffff65 % 210 is 101, where
@@ -138,7 +138,7 @@ def _tap(cursor, back):
 
 
 def _finish_scramble(b1, cursor):
-    """The last 51 of the round's 840 scramble passes over the b1 ring.
+    """Run the last 51 of the round's 840 scramble passes over the b1 ring.
 
     Each pass is `saphash.scramble`'s step.  The cursor arrives at 789 in
     every recorded call and the loop stops at 840, `saphash.STEPS`.
@@ -157,6 +157,9 @@ def garble(b0, b1, b2, b3, b4, cursor=789):
     *cursor* is where the round's scramble has got to; every real call
     passes 789.
     """
+    # One straight-line pass, as the original is: splitting it would only
+    # hide the order of the stores, which is the point.
+    # pylint: disable=too-many-locals,too-many-statements
     b0, b1, b2, b4 = _Ring(b0), _Ring(b1), _Ring(b2), _Ring(b4)
     out = _Words(b3)
     _finish_scramble(b1, cursor)

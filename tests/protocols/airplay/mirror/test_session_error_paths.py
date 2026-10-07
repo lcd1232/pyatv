@@ -43,9 +43,11 @@ from pyatv import exceptions
 from pyatv.protocols.airplay.mirror import (
     MirrorContext,
     MirrorSession,
-    airparrot_stream,
     fairplay,
     framing,
+)
+from pyatv.protocols.airplay.mirror import (
+    tcp_stream,
 )
 from pyatv.protocols.airplay.mirror import session as session_mod
 from pyatv.support.http import http_connect
@@ -72,7 +74,7 @@ pytestmark = pytest.mark.asyncio
 async def driven_session(
     monkeypatch,
     *,
-    airparrot: bool = True,
+    tcp: bool = True,
     with_audio_ekey: bool = True,
     with_ekey: bool = True,
     with_raw16: bool = True,
@@ -91,10 +93,10 @@ async def driven_session(
     ``ctx_overrides`` sets fields on the MirrorContext before the session runs,
     for tests that need a caller-supplied value rather than a default.
     """
-    monkeypatch.setenv("MIRROR_AIRPARROT", "1" if airparrot else "0")
+    monkeypatch.setenv("MIRROR_TCP", "1" if tcp else "0")
     monkeypatch.setenv("MIRROR_CONFIG_DELAY", "0")
 
-    receiver = FakeMirrorReceiver(airparrot=airparrot, **receiver_kwargs)
+    receiver = FakeMirrorReceiver(tcp=tcp, **receiver_kwargs)
     host, port = await receiver.start()
 
     connection = None
@@ -107,7 +109,7 @@ async def driven_session(
         ctx = MirrorContext(
             stream_encryptor=handshake.stream_encryptor if stream_encryptor else None
         )
-        if airparrot:
+        if tcp:
             if with_audio_ekey:
                 ctx.audio_ekey = b"\x33" * 72
             if with_ekey:
@@ -200,7 +202,7 @@ async def test_session_init_setup_non_200_raises_protocol_error(monkeypatch):
     """A 2xx-but-not-200 session-init SETUP must name SETUP and the status."""
     async with driven_session(
         monkeypatch,
-        airparrot=False,
+        tcp=False,
         status_overrides={"setup_session": RTSP_LOW_ON_STORAGE},
     ) as (receiver, sess):
         error = await run_until_error(sess)
@@ -213,7 +215,7 @@ async def test_session_init_setup_non_200_raises_protocol_error(monkeypatch):
 
 
 async def test_audio_setup_non_200_raises_protocol_error(monkeypatch):
-    """The AirParrot type-96 audio SETUP guard must name the stream type."""
+    """The TCP dialect's type-96 audio SETUP guard must name the stream type."""
     async with driven_session(
         monkeypatch,
         status_overrides={"setup_audio": RTSP_LOW_ON_STORAGE},
@@ -283,7 +285,7 @@ async def test_non_2xx_setup_never_reaches_protocol_error(monkeypatch):
 
 async def test_setup_session_without_stream_encryptor_raises(monkeypatch):
     """Without the FPLY handshake's encryptor, SETUP must refuse to proceed."""
-    async with driven_session(monkeypatch, airparrot=False, stream_encryptor=False) as (
+    async with driven_session(monkeypatch, tcp=False, stream_encryptor=False) as (
         receiver,
         sess,
     ):
@@ -304,7 +306,7 @@ async def test_setup_session_without_stream_encryptor_raises(monkeypatch):
 async def test_missing_event_port_skips_event_channel(monkeypatch, caplog):
     """A SETUP answer with no eventPort must be logged and skipped, not crash."""
     caplog.set_level(logging.DEBUG, logger="pyatv.protocols.airplay.mirror.session")
-    async with driven_session(monkeypatch, airparrot=False, omit_event_port=True) as (
+    async with driven_session(monkeypatch, tcp=False, omit_event_port=True) as (
         receiver,
         sess,
     ):
@@ -357,7 +359,7 @@ async def test_event_request_split_across_segments_is_buffered(monkeypatch):
         sess,
     ):
         # Reaching a video frame means the event channel came up and was
-        # answered long before -- the AirParrot flow opens it during setup.
+        # answered long before -- the TCP flow opens it during setup.
         await stream_then_stop(receiver, sess)
         assert receiver.event_server.command_answered.is_set()
 
@@ -536,7 +538,7 @@ async def test_dead_media_control_port_warns_and_continues(monkeypatch, caplog):
     """
     caplog.set_level(logging.WARNING, logger="pyatv.protocols.airplay.mirror.session")
 
-    async with driven_session(monkeypatch, airparrot=False, dead_control_port=True) as (
+    async with driven_session(monkeypatch, tcp=False, dead_control_port=True) as (
         receiver,
         sess,
     ):
@@ -675,7 +677,7 @@ async def test_a_stopped_session_refuses_to_run_again(monkeypatch):
     from whichever layer noticed the closed socket first, which does not tell
     the caller what they actually did.
     """
-    async with driven_session(monkeypatch, airparrot=True) as (receiver, sess):
+    async with driven_session(monkeypatch, tcp=True) as (receiver, sess):
         await stream_then_stop(receiver, sess)
 
         with pytest.raises(RuntimeError, match="already stopped"):
@@ -692,7 +694,7 @@ async def test_a_dropped_receiver_does_not_end_the_session(monkeypatch, channel)
 
     Aborting either the raw video data connection or the RTSP control
     connection leaves ``run()`` streaming. The transports' ``connection_lost``
-    handlers log the loss -- ``airparrot_stream`` even reports how many
+    handlers log the loss -- ``tcp_stream`` even reports how many
     messages got through -- and the heartbeat's ``failure_func`` warns, but
     nothing propagates, so a session whose Apple TV has been switched off goes
     on encrypting and writing frames until its caller happens to stop it.
@@ -705,7 +707,7 @@ async def test_a_dropped_receiver_does_not_end_the_session(monkeypatch, channel)
     Unlike the other tests in this file, it guards no defect; it makes a
     silent behaviour explicit.
     """
-    async with driven_session(monkeypatch, airparrot=True) as (receiver, sess):
+    async with driven_session(monkeypatch, tcp=True) as (receiver, sess):
         task = asyncio.ensure_future(sess.run())
         try:
             await asyncio.wait_for(
@@ -754,7 +756,7 @@ async def test_stop_during_setup_leaves_no_task_registered_after_it(
     """
     monkeypatch.setenv("MIRROR_AUDIO_SEND", "1")
 
-    async with driven_session(monkeypatch, airparrot=True) as (receiver, sess):
+    async with driven_session(monkeypatch, tcp=True) as (receiver, sess):
         task = asyncio.ensure_future(sess.run())
         try:
             for _ in range(yields):
@@ -831,7 +833,7 @@ async def test_the_live_encoder_path_parses_a_stream_off_a_subprocess(
     )
     monkeypatch.setenv("MIRROR_LIVE_CMD", '"%s" "%s"' % (sys.executable, feeder))
 
-    async with driven_session(monkeypatch, airparrot=True) as (receiver, sess):
+    async with driven_session(monkeypatch, tcp=True) as (receiver, sess):
         # Three MESSAGES: the plaintext config frame, then one per access
         # unit. Waiting for only the config would pass even when nothing
         # classifies a slice as one -- the branch that misroutes every VCL
@@ -910,7 +912,7 @@ async def test_the_live_audio_reader_parses_length_prefixed_frames(
     monkeypatch.setenv("MIRROR_AUDIO_LIVE_CMD", '"%s" "%s"' % (sys.executable, feeder))
     monkeypatch.setenv("MIRROR_AUDIO_PREBUFFER", "1")
 
-    async with driven_session(monkeypatch, airparrot=True) as (receiver, sess):
+    async with driven_session(monkeypatch, tcp=True) as (receiver, sess):
         # Not `stream_then_stop`: that waits on VIDEO, which is ready almost
         # at once, and would stop the session while the audio subprocess is
         # still starting. Wait for audio itself.
@@ -968,7 +970,7 @@ async def test_the_event_channel_frames_on_content_length_not_on_a_blank_line(
     ]
     assert b"\r\n\r\n" in bodies[0], "the fixture must carry a blank line"
 
-    async with driven_session(monkeypatch, airparrot=True, command_bodies=bodies) as (
+    async with driven_session(monkeypatch, tcp=True, command_bodies=bodies) as (
         receiver,
         sess,
     ):
@@ -1009,7 +1011,7 @@ async def test_a_live_stream_missing_its_pps_sends_no_video(monkeypatch, tmp_pat
     )
     monkeypatch.setenv("MIRROR_LIVE_CMD", '"%s" "%s"' % (sys.executable, feeder))
 
-    async with driven_session(monkeypatch, airparrot=True) as (receiver, sess):
+    async with driven_session(monkeypatch, tcp=True) as (receiver, sess):
         task = asyncio.ensure_future(sess.run())
         try:
             # Wait on the feeder exiting rather than on a clock: once the
@@ -1041,7 +1043,7 @@ async def test_a_live_stream_missing_its_pps_sends_no_video(monkeypatch, tmp_pat
 
 
 def _messages(wire: bytes) -> list:
-    """Split an AirParrot raw-video stream into whole messages.
+    """Split the TCP dialect's raw-video stream into whole messages.
 
     Each is a 128-byte header carrying its payload length little-endian at
     offset 0, followed by that payload. A trailing partial message is
@@ -1087,7 +1089,7 @@ async def test_the_access_unit_keeps_its_sei_ahead_of_the_slice(monkeypatch, tmp
     )
     monkeypatch.setenv("MIRROR_LIVE_CMD", '"%s" "%s"' % (sys.executable, feeder))
 
-    async with driven_session(monkeypatch, airparrot=True) as (receiver, sess):
+    async with driven_session(monkeypatch, tcp=True) as (receiver, sess):
         # NOT `wait_frames`: the counter it drives ticks once per TCP read,
         # so two "frames" can be one message arriving in two chunks, or two
         # messages arriving in one. Wait for what is actually being read --
@@ -1115,10 +1117,10 @@ async def test_the_access_unit_keeps_its_sei_ahead_of_the_slice(monkeypatch, tmp
     assert len(messages) >= 2, "expected a config frame and an access unit"
 
     pair32 = bytes.fromhex("66" * 32)
-    key, iv = framing.derive_airparrot_stream_key_iv(raw16, pair32, sid, flag=True)
+    key, iv = framing.derive_tcp_stream_key_iv(raw16, pair32, sid, flag=True)
     plain = framing.MirrorEncryptor.from_key_iv(key, iv).encrypt(messages[1])
 
-    assert plain == airparrot_stream.to_avcc([sei, idr]), (
+    assert plain == tcp_stream.to_avcc([sei, idr]), (
         "access unit came out as %s" % plain[:8].hex()
     )
 
@@ -1129,7 +1131,7 @@ async def test_a_live_source_is_killed_even_when_setup_fails_after_spawning_it(
 ):
     """The subprocess outlives the session if nothing owns it.
 
-    ``_airparrot_live_video`` spawns the source, records it, and only then
+    ``_tcp_live_video`` spawns the source, records it, and only then
     reads ``MIRROR_LIVE_BUFFER`` to size its queue. A non-numeric value
     raises there -- after the process exists and before the ``try`` whose
     ``finally`` kills it -- so the process is left running with nothing
@@ -1145,7 +1147,7 @@ async def test_a_live_source_is_killed_even_when_setup_fails_after_spawning_it(
     monkeypatch.setenv("MIRROR_LIVE_CMD", '"%s" "%s"' % (sys.executable, feeder))
     monkeypatch.setenv("MIRROR_LIVE_BUFFER", "not-a-number")
 
-    async with driven_session(monkeypatch, airparrot=True) as (receiver, sess):
+    async with driven_session(monkeypatch, tcp=True) as (receiver, sess):
         task = asyncio.ensure_future(sess.run())
         deadline = asyncio.get_event_loop().time() + GUARD_TIMEOUT
         while sess._live_proc is None:  # noqa: SLF001
@@ -1198,7 +1200,7 @@ async def test_a_full_live_queue_drops_the_oldest_access_unit(monkeypatch, tmp_p
     monkeypatch.setenv("MIRROR_LIVE_CMD", '"%s" "%s"' % (sys.executable, feeder))
     monkeypatch.setenv("MIRROR_LIVE_BUFFER", "2")
 
-    async with driven_session(monkeypatch, airparrot=True) as (receiver, sess):
+    async with driven_session(monkeypatch, tcp=True) as (receiver, sess):
         task = asyncio.ensure_future(sess.run())
         try:
             deadline = asyncio.get_event_loop().time() + GUARD_TIMEOUT
@@ -1222,14 +1224,14 @@ async def test_a_full_live_queue_drops_the_oldest_access_unit(monkeypatch, tmp_p
     assert len(messages) >= 2, "no access unit followed the config frame"
 
     pair32 = bytes.fromhex("66" * 32)
-    key, iv = framing.derive_airparrot_stream_key_iv(raw16, pair32, sid, flag=True)
+    key, iv = framing.derive_tcp_stream_key_iv(raw16, pair32, sid, flag=True)
     first_au = framing.MirrorEncryptor.from_key_iv(key, iv).encrypt(messages[1])
 
-    assert first_au != airparrot_stream.to_avcc([sei_free[0]]), (
+    assert first_au != tcp_stream.to_avcc([sei_free[0]]), (
         "the first access unit sent was the source's first -- the queue kept "
         "the stale end"
     )
-    assert first_au in [airparrot_stream.to_avcc([n]) for n in sei_free[2:]], (
+    assert first_au in [tcp_stream.to_avcc([n]) for n in sei_free[2:]], (
         "sent an access unit that is not one of the later ones: %s" % first_au[:8].hex()
     )
 
@@ -1252,9 +1254,10 @@ async def test_the_receiver_closing_the_event_channel_does_not_end_the_session(
     of that reader the suite never reached -- the empty read itself, which
     no other test produces because the fake keeps its connection open.
     """
-    async with driven_session(
-        monkeypatch, airparrot=True, hang_up_event_channel=True
-    ) as (receiver, sess):
+    async with driven_session(monkeypatch, tcp=True, hang_up_event_channel=True) as (
+        receiver,
+        sess,
+    ):
         task = asyncio.ensure_future(sess.run())
         try:
             await asyncio.wait_for(

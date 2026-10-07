@@ -2,7 +2,7 @@
 
 WHAT VERIFIES WHAT.  The FairPlay handshake under
 ``pyatv/protocols/airplay/mirror/fairplay_sap/`` was recovered from
-AirParrot 3's binary by devirtualisation.  Two things check it, and they
+the reference sender's binary by devirtualisation.  Two things check it, and they
 check different claims:
 
 * ``fply_pure_golden.jsonl`` -- 256 recorded handshakes, committed, and
@@ -84,7 +84,7 @@ and sync cadence all hold just as well under a key the receiver does not
 share.
 
 Two of those survivors were real, and neither was a missing assertion:
-``airparrot_video_producer`` selected the SPS by NAL type with nothing
+``tcp_video_producer`` selected the SPS by NAL type with nothing
 checking the resulting avcC, and ``MIRROR_STRIP_SPSPPS`` guarded a filter
 that could never fire because the parameter sets had already been removed
 twenty lines earlier.  A third pointed at dead code rather than a test gap --
@@ -100,11 +100,11 @@ version is what was there before, and it passed:
   -- ``(byte0 >> 4) | 1`` is never zero, so the header byte must have a
   bit set ABOVE X while X itself is clear.  Every packet this package
   builds has X set, which is why nothing caught it.
-* ``test_airparrot_stream.py``'s
+* ``test_tcp_stream.py``'s
   ``test_group_access_units_does_not_split_on_an_sei_nal``
   -- a TRAILING SEI is flushed by the tail either way; only an SEI
   followed by a slice distinguishes the two readings.
-* ``test_airparrot_stream.py``'s
+* ``test_tcp_stream.py``'s
   ``test_avcc_config_follows_the_decoder_configuration_record_layout``
   -- asserts the record's LAYOUT, not a captured blob; a blob regenerated
   from mutated code would launder the bug.
@@ -121,7 +121,7 @@ not for saying which one the session picked, which is the part a switch can
 get wrong.  ``test_session.py`` now pins both: ``MIRROR_KEYBUF_DERIV``
 decides whether the window is run through ``stream_key_iv_from_secret`` or
 taken verbatim, and ``MIRROR_KEYBUF_MODE`` decides whether it becomes a
-cipher or an SRTP pair the AirParrot dialect never reaches.  Both spy on the
+cipher or an SRTP pair the TCP dialect never reaches.  Both spy on the
 argument rather than the call, because the proven key path reaches the same
 two functions and is called either way.
 
@@ -158,7 +158,7 @@ real defects rather than just missing assertions:
 
 * an explicit ``ctx.video_encryptor`` was silently dropped in the shipping
   configuration -- the keybuf arm reassigned over the top of it, so the
-  caller's encryptor encrypted zero frames in the AirParrot dialect with a
+  caller's encryptor encrypted zero frames in the TCP dialect with a
   raw16 present, and worked in the other three combinations;
 * ``audio_stream_connection_id`` was written and never read, by symmetry
   with a video field that genuinely is the single source of truth.
@@ -190,7 +190,7 @@ with its source, and the suite run:
 The last two were already caught.  One value has nothing to tie it to:
 ``streamConnectionID`` in the audio SETUP.  The audio key comes from the
 ekey/eiv rather than the id, and the RTP packets carry ssrc 0 to match
-AirParrot, so the announcement appears nowhere else and cannot disagree with
+the reference sender, so the announcement appears nowhere else and cannot disagree with
 anything.  That is why it is not pinned, and why pinning it would assert a
 literal rather than a relationship.
 
@@ -219,7 +219,7 @@ equally well:
 
 * audio ``dataPort`` and the sync's ``controlPort`` -- caught in 0.3s.
 * ``eventPort`` -- caught; TCP, so a wrong port is refused at connect.
-* video ``dataPort``, AirParrot -- caught; TCP again.
+* video ``dataPort``, TCP dialect -- caught; TCP again.
 * video ``dataPort``, AVConference -- caught only by every frame-waiting test
   hitting its guard timeout, which cost ten minutes and named nothing.  UDP
   from an already-bound socket: no refusal, no ICMP, frames simply vanish.
@@ -238,7 +238,7 @@ a new test proves the test is sensitive to it.  It does not show the test
 adds anything: the rest of the suite may already catch the same mutation.
 Two tests here were justified that way and the justification was wrong --
 of the four mutations the screen-audio test was written against, three were
-already caught by ``test_airparrot_audio``'s unit tests, and the length-guard
+already caught by ``test_screen_audio``'s unit tests, and the length-guard
 raises in ``fairplay_sap`` were already being executed by their callers.
 Both tests still earn their place, for narrower reasons than first claimed.
 

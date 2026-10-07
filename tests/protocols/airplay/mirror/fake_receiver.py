@@ -8,12 +8,12 @@ finish without requiring a real Apple TV:
   - ANNOUNCE / SETUP / RECORD / TEARDOWN: respond 200 (with bplist body for SETUP)
   - Data sockets that count received bytes / "frames"
 
-Both mirror dialects are modelled, selected by the ``airparrot`` flag:
+Both mirror dialects are modelled, selected by the ``tcp`` flag:
 
   - AVConference: metadata-only session-init SETUP returning ``eventPort``,
     then a stream SETUP whose ``dataPort`` is UDP-only and which also
     negotiates a TCP media-data-control channel.
-  - AirParrot (the dialect that renders on tvOS 26): no session init; a
+  - TCP (the dialect that renders on tvOS 26): no session init; a
     type-96 audio SETUP carries the ``eventPort``, RECORD follows, and the
     type-110 video SETUP returns a plain TCP ``dataPort``. The event channel
     is bidirectional RTSP driven by the receiver.
@@ -74,8 +74,8 @@ _REASONS = {
 #   * environment-tunable values -- ``spf``/``et`` have MIRROR_* overrides, so
 #     they are checked against "the override, or the captured default".
 
-#: ``streams[0]`` of the AirParrot screen-audio SETUP. RE'd from AirParrot's
-#: negotiation callback (@0x10008e1a4) and seen on the wire in the Phase 28
+#: ``streams[0]`` of the TCP dialect's screen-audio SETUP. RE'd from the reference
+#: sender's negotiation callback (@0x10008e1a4) and seen on the wire in the Phase 28
 #: capture against tvOS 26.
 CAPTURED_AUDIO_STREAM: Dict[str, Any] = {
     # 96 is the screen-audio stream type (the soundtrack of a mirroring
@@ -92,7 +92,7 @@ CAPTURED_AUDIO_STREAM: Dict[str, Any] = {
     # receiver is told to expect desynchronises that de-duplication.
     "redundantAudio": 2,
     # Compression type 8 == AAC-ELD, which is what
-    # ``airparrot_audio.AirParrotAudioPacketizer`` actually produces. A
+    # ``screen_audio.ScreenAudioPacketizer`` actually produces. A
     # mismatch here points the receiver's decoder at the wrong codec.
     "ct": 8,
     # Format bitfield: 0x1000000 is the single AAC-ELD 44100/2 entry. It must
@@ -112,9 +112,9 @@ CAPTURED_AUDIO_TOP: Dict[str, Any] = {
     "et": 32,
 }
 
-#: ``streams[0]`` of the AirParrot screen-video SETUP.
-CAPTURED_VIDEO_STREAM_AIRPARROT: Dict[str, Any] = {
-    # AirParrot's screen-video stream type. The AVConference dialect uses the
+#: ``streams[0]`` of the TCP dialect's screen-video SETUP.
+CAPTURED_VIDEO_STREAM_TCP: Dict[str, Any] = {
+    # The reference sender's screen-video stream type. The AVConference dialect uses the
     # same number, reached via framing.STREAM_TYPE_VIDEO.
     "type": 110,
 }
@@ -196,7 +196,7 @@ def _check_stream_connection_id(where: str, stream: dict, bits: int) -> List[str
     """``streamConnectionID`` is per-session but must fit the receiver's field.
 
     The receiver rebuilds the key-derivation label from this id, so it has to
-    fit whatever width that dialect's receiver stores it in: AirParrot's
+    fit whatever width that dialect's receiver stores it in: the reference sender's
     receiver uses a 32-bit field, while the AVConference one takes the 63-bit
     value the macOS sender generates.
     """
@@ -212,7 +212,7 @@ def check_audio_setup(body: dict) -> List[str]:
     problems = _check_constants("audio stream", stream, CAPTURED_AUDIO_STREAM)
     problems += _check_constants("audio SETUP", body, CAPTURED_AUDIO_TOP)
     problems += _check_session_fields("audio SETUP", body)
-    # Screen audio is AirParrot-dialect only, so always the 32-bit form.
+    # Screen audio is TCP-dialect only, so always the 32-bit form.
     problems += _check_stream_connection_id("audio stream", stream, 32)
 
     want_spf = int(os.environ.get("MIRROR_AUDIO_SPF", str(CAPTURED_AUDIO_SPF)))
@@ -234,16 +234,12 @@ def check_audio_setup(body: dict) -> List[str]:
     return problems
 
 
-def check_video_setup(body: dict, airparrot: bool) -> List[str]:
+def check_video_setup(body: dict, tcp: bool) -> List[str]:
     """Return every way this type-110 SETUP differs from the capture."""
     stream = body["streams"][0]
-    expected = (
-        CAPTURED_VIDEO_STREAM_AIRPARROT if airparrot else CAPTURED_VIDEO_STREAM_AVCONF
-    )
+    expected = CAPTURED_VIDEO_STREAM_TCP if tcp else CAPTURED_VIDEO_STREAM_AVCONF
     problems = _check_constants("video stream", stream, expected)
-    problems += _check_stream_connection_id(
-        "video stream", stream, 32 if airparrot else 63
-    )
+    problems += _check_stream_connection_id("video stream", stream, 32 if tcp else 63)
 
     names = [entry.get("name") for entry in stream.get("timestampInfo") or []]
     if names != CAPTURED_TIMESTAMP_NAMES:
@@ -252,7 +248,7 @@ def check_video_setup(body: dict, airparrot: bool) -> List[str]:
             f"captured is {CAPTURED_TIMESTAMP_NAMES!r}"
         )
 
-    if airparrot:
+    if tcp:
         problems += _check_session_fields("video SETUP", body)
         want_et = int(os.environ.get("MIRROR_ET", str(CAPTURED_VIDEO_ET)))
         if body.get("et") != want_et:
@@ -423,7 +419,7 @@ class _MirrorDataServer(_FrameCounter):
 
 
 class _MirrorEventServer(_MirrorDataServer):
-    """The receiver's end of the AirParrot event channel.
+    """The receiver's end of the TCP dialect's event channel.
 
     The event channel is bidirectional RTSP with the *receiver* as the client:
     it POSTs ``/command`` to the sender and tears the whole mirror session down
@@ -560,7 +556,7 @@ class FakeMirrorReceiver:
 
     def __init__(
         self,
-        airparrot: bool = False,
+        tcp: bool = False,
         status_overrides: dict | None = None,
         omit_event_port: bool = False,
         command_bodies: Optional[List[bytes]] = None,
@@ -571,9 +567,9 @@ class FakeMirrorReceiver:
         hang_up_event_channel: bool = False,
     ) -> None:
         # Dialect split, taken from probing a real tvOS 26 receiver: the
-        # AVConference dataPort is UDP-only, while the AirParrot type-110
+        # AVConference dataPort is UDP-only, while the TCP dialect's type-110
         # dataPort is a plain TCP socket.
-        self.airparrot = airparrot
+        self.tcp = tcp
         # Misbehaviour knobs. A cooperative receiver is the default; these let
         # a test make the fake answer the way a confused or older receiver
         # does, so the sender's error handling runs on real wire bytes rather
@@ -596,13 +592,11 @@ class FakeMirrorReceiver:
         #: Advertise a screen-audio dataPort nothing is bound to, so the
         #: sender's connected UDP socket gets ICMP port-unreachable back.
         self.dead_audio_data_port = dead_audio_data_port
-        self.video_server = (
-            _MirrorDataServer() if airparrot else _MirrorDatagramServer()
-        )
+        self.video_server = _MirrorDataServer() if tcp else _MirrorDatagramServer()
         # The AVConference media-data-control channel (TCP). No mirror media
         # is ever written here, so its tally is expected to stay at zero.
         self.control_server = _MirrorDataServer()
-        # AirParrot screen audio: RTP data and sync packets, both UDP.
+        # TCP-dialect screen audio: RTP data and sync packets, both UDP.
         self.audio_data_server = _MirrorDatagramServer()
         self.audio_control_server = _MirrorDatagramServer()
         # The sender connects to the eventPort we report from SETUP.
@@ -751,7 +745,7 @@ class FakeMirrorReceiver:
         Modern AirPlay 2 mirroring uses a two-phase SETUP (Phase 28 capture):
         a metadata-only session init that answers with ``eventPort``, then a
         ``streams`` request answered with the negotiated data/control ports.
-        The AirParrot dialect drops the session init and instead opens with a
+        The TCP dialect drops the session init and instead opens with a
         type-96 audio stream SETUP (which carries the ``eventPort``), then
         sends the type-110 video stream SETUP after RECORD.
         """
@@ -776,7 +770,7 @@ class FakeMirrorReceiver:
 
         stream_type = streams[0].get("type")
         if stream_type == 96:
-            # AirParrot's screen-audio stream. Its response is where the
+            # The reference sender's screen-audio stream. Its response is where the
             # sender learns the eventPort in that dialect.
             self.audio_setup_received = True
             # ekey/eiv/et sit at the top level of the SETUP body, alongside
@@ -805,9 +799,9 @@ class FakeMirrorReceiver:
         self.video_setup_eiv = decoded.get("eiv")
         self.video_setup_et = decoded.get("et")
         self.video_setup_body = decoded
-        self.protocol_violations += check_video_setup(decoded, self.airparrot)
+        self.protocol_violations += check_video_setup(decoded, self.tcp)
         video_stream = {"type": 110, "dataPort": self._video_port}
-        if not self.airparrot:
+        if not self.tcp:
             # Only the AVConference dialect negotiates a separate HAP-encrypted
             # media-data-control channel.
             video_stream["streamConnections"] = {

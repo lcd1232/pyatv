@@ -1,9 +1,9 @@
-"""AirParrot-dialect screen-AUDIO packetization (RE'd 2026-08-24).
+"""TCP-dialect screen-AUDIO packetization (RE'd 2026-08-24).
 
-Unlike the video stream (raw TCP, 128-byte header, AES-CTR), AirParrot's screen
-audio is **UDP/RTP** carrying **AAC-ELD** (44100 Hz stereo, 480 samples/frame),
-each frame **AES-128-CBC** encrypted (whole 16-byte blocks only; the trailing
-``len % 16`` bytes are sent in the clear). Source: reverse-engineering of
+Unlike the video stream (raw TCP, 128-byte header, AES-CTR), the reference
+sender's screen audio is **UDP/RTP** carrying **AAC-ELD** (44100 Hz stereo, 480
+samples/frame), each frame **AES-128-CBC** encrypted (whole 16-byte blocks only;
+the trailing ``len % 16`` bytes are sent in the clear). Source: reverse-engineering of
 ``_APOAudioConnectionSendFrame`` @0x10008ea9c and ``_init_ap_audio_data_pkt``
 @0x1001b183c.
 
@@ -26,7 +26,7 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 from pyatv.protocols.raop.packets import SyncPacket
 
-#: RTP payload type for the AirParrot screen-audio stream (byte 1 = M<<7 | PT).
+#: RTP payload type for the TCP dialect's screen-audio stream (byte 1 = M<<7 | PT).
 AUDIO_RTP_PT = 0x60  # marker=0, PT=96
 #: Samples per AAC-ELD frame (RTP timestamp increment per packet, 44100 Hz).
 AUDIO_SAMPLES_PER_FRAME = 480
@@ -34,7 +34,7 @@ AUDIO_SAMPLE_RATE = 44100
 
 
 def encrypt_audio_frame(key: bytes, iv: bytes, aac_frame: bytes) -> bytes:
-    """AES-128-CBC encrypt an AAC-ELD frame, AirParrot-style.
+    """AES-128-CBC encrypt an AAC-ELD frame, as the reference sender does.
 
     Only whole 16-byte blocks are encrypted; the trailing ``len % 16`` bytes are
     appended in the clear. The IV is the constant ``eiv`` for every packet (not
@@ -71,7 +71,7 @@ def build_audio_rtp_packet(
     return header + payload
 
 
-class AirParrotAudioPacketizer:
+class ScreenAudioPacketizer:
     """Stateful RTP audio packetizer (seq + timestamp bookkeeping)."""
 
     def __init__(
@@ -112,7 +112,7 @@ class AirParrotAudioPacketizer:
 def audio_setup_stream_params(stream_connection_id: int) -> dict:
     """Return the type-96 SETUP ``streams[0]`` dict for screen audio.
 
-    Values RE'd from AirParrot's negotiation callback (@0x10008e1a4):
+    Values RE'd from the reference sender's negotiation callback (@0x10008e1a4):
     AAC-ELD (audioFormat 0x1000000), ct=8, spf=480, latency 3750, 2x redundancy.
     The caller adds ``ekey``/``eiv`` and the top-level session fields.
     """
@@ -147,7 +147,7 @@ def build_audio_sync_packet(
     return SyncPacket.encode(
         0x80 | (0x10 if first else 0),  # proto (extension bit on first)
         0xD4,  # marker | PT 84
-        0x0004,  # seqno (matches AirParrot)
+        0x0004,  # seqno (matches the reference sender)
         (timestamp - latency) & 0xFFFFFFFF,  # now_without_latency
         ntp >> 32,  # last_sync_sec
         ntp & 0xFFFFFFFF,  # last_sync_frac

@@ -59,7 +59,7 @@ def test_oversize_payload_size_rejected_at_pack():
 def test_mirror_encryptor_continuous_keystream_across_payloads():
     """Two consecutive payloads should NOT decrypt with a fresh cipher.
 
-    AirParrot uses one continuous keystream across all frames. The cipher
+    The reference sender uses one continuous keystream across all frames. The cipher
     state advances across boundaries, so a receiver decrypting frame N
     must NOT reset the counter back to IV for frame N+1.
     """
@@ -575,33 +575,31 @@ def test_derive_stream_keys_is_label_then_id_then_secret():
     assert iv == hashlib.sha512(b"AirPlayStreamIV12345" + secret).digest()[:16]
 
 
-def test_derive_airparrot_stream_key_iv_rejects_a_wrong_length_secret():
+def test_derive_tcp_stream_key_iv_rejects_a_wrong_length_secret():
     with pytest.raises(ValueError, match="raw16 must be 16 bytes"):
-        framing.derive_airparrot_stream_key_iv(bytes(15), bytes(32), 1)
+        framing.derive_tcp_stream_key_iv(bytes(15), bytes(32), 1)
 
 
-def test_derive_airparrot_stream_key_iv_folds_raw16_with_the_pair_secret():
-    """CHARACTERIZATION of AirParrot's ``DeriveKeyAndIV`` (flag=True path)."""
+def test_derive_tcp_stream_key_iv_folds_raw16_with_the_pair_secret():
+    """Characterize the reference sender's ``DeriveKeyAndIV`` (flag=True path)."""
     raw16, pair32 = bytes(range(16)), bytes(range(32, 64))
     secret16 = hashlib.sha512(raw16 + pair32).digest()[:16]
-    key, iv = framing.derive_airparrot_stream_key_iv(raw16, pair32, 527657112)
+    key, iv = framing.derive_tcp_stream_key_iv(raw16, pair32, 527657112)
     assert key == hashlib.sha512(b"AirPlayStreamKey527657112" + secret16).digest()[:16]
     assert iv == hashlib.sha512(b"AirPlayStreamIV527657112" + secret16).digest()[:16]
     # With the fold disabled, raw16 is the secret and the result is
     # derive_stream_keys' output for the same id.
-    assert framing.derive_airparrot_stream_key_iv(
+    assert framing.derive_tcp_stream_key_iv(
         raw16, pair32, 527657112, flag=False
     ) == framing.derive_stream_keys(raw16, 527657112)
 
 
-def test_derive_airparrot_stream_key_iv_treats_the_connection_id_as_unsigned():
+def test_derive_tcp_stream_key_iv_treats_the_connection_id_as_unsigned():
     negative = -3735921725222598274
     raw16, pair32 = bytes(range(16)), bytes(range(32))
-    assert framing.derive_airparrot_stream_key_iv(
+    assert framing.derive_tcp_stream_key_iv(
         raw16, pair32, negative
-    ) == framing.derive_airparrot_stream_key_iv(
-        raw16, pair32, negative & 0xFFFFFFFFFFFFFFFF
-    )
+    ) == framing.derive_tcp_stream_key_iv(raw16, pair32, negative & 0xFFFFFFFFFFFFFFFF)
 
 
 def test_constants_defined_in_two_modules_still_agree():
@@ -611,7 +609,7 @@ def test_constants_defined_in_two_modules_still_agree():
     them move together:
 
     * the 128-byte media-data header -- `framing.HEADER_LEN` and
-      `airparrot_stream._HEADER_LEN`;
+      `tcp_stream._HEADER_LEN`;
     * the 90 kHz video clock -- `rtp.CLOCK_RATE`, which stamps the RTP
       timestamp, and `pacer.VIDEO_CLOCK_HZ`, which decides when a frame is
       due.  These two diverging is the worst of the three: frames would go
@@ -622,21 +620,21 @@ def test_constants_defined_in_two_modules_still_agree():
     Consolidating them is a production change.  This asserts they have not
     drifted meanwhile, and fails whichever side moves.
 
-    `framing.STREAM_TYPE_AUDIO` (96) and `airparrot_audio.AUDIO_RTP_PT`
+    `framing.STREAM_TYPE_AUDIO` (96) and `screen_audio.AUDIO_RTP_PT`
     (0x60) are deliberately NOT compared: they collide in value and are
     different things -- a stream identifier and an RTP payload-type byte
     with the marker bit clear -- which `framing.py` already says in a
     comment above its own definition.
     """
     from pyatv.protocols.airplay.mirror import (  # noqa: PLC0415
-        airparrot_stream,
         fairplay,
         fply,
         pacer,
         rtp,
+        tcp_stream,
     )
 
-    assert framing.HEADER_LEN == airparrot_stream._HEADER_LEN  # noqa: SLF001
+    assert framing.HEADER_LEN == tcp_stream._HEADER_LEN  # noqa: SLF001
     assert rtp.CLOCK_RATE == pacer.VIDEO_CLOCK_HZ
     assert fairplay.USER_AGENT == fply.USER_AGENT
 
@@ -651,7 +649,7 @@ def test_the_stream_key_labels_are_pinned_and_spelled_once():
 
     The sweep now calls ``stream_key_iv_from_secret``, which exists because
     the sweep's secret is a slice of the SAP context and need not be 16
-    bytes, so it cannot go through ``derive_airparrot_stream_key_iv`` and its
+    bytes, so it cannot go through ``derive_tcp_stream_key_iv`` and its
     length check.  These vectors pin the labels themselves: changing either
     string, or the digest, or the truncation, changes them.
     """
@@ -662,12 +660,12 @@ def test_the_stream_key_labels_are_pinned_and_spelled_once():
     # The public entry point is the same derivation with secret16 computed
     # for it, so flag=False must agree with calling the tail directly.
     raw16 = bytes(range(16))
-    assert framing.derive_airparrot_stream_key_iv(
+    assert framing.derive_tcp_stream_key_iv(
         raw16, bytes(range(32)), 99, flag=False
     ) == framing.stream_key_iv_from_secret(raw16, 99)
 
     # ...and its flag=True path stays pinned too.
-    key2, iv2 = framing.derive_airparrot_stream_key_iv(raw16, bytes(range(32)), 7)
+    key2, iv2 = framing.derive_tcp_stream_key_iv(raw16, bytes(range(32)), 7)
     assert key2.hex() == "b4a9f2f205a64fff1400b863cbd3033c"
     assert iv2.hex() == "47d4794311465256f9b332516b8126a5"
 
@@ -675,7 +673,7 @@ def test_the_stream_key_labels_are_pinned_and_spelled_once():
 def test_stream_key_iv_accepts_the_odd_sized_windows_the_sweep_produces():
     """The sweep slices arbitrary windows out of the SAP context.
 
-    ``derive_airparrot_stream_key_iv`` rejects anything but 16 bytes, which
+    ``derive_tcp_stream_key_iv`` rejects anything but 16 bytes, which
     is why the sweep cannot use it; this one must accept whatever length the
     window has, and give a distinct key per length.
     """
@@ -687,7 +685,7 @@ def test_stream_key_iv_accepts_the_odd_sized_windows_the_sweep_produces():
     assert len(keys) == 7, "different window sizes collapsed to the same key"
 
     with pytest.raises(ValueError, match="raw16 must be 16 bytes"):
-        framing.derive_airparrot_stream_key_iv(bytes(20), bytes(32), 1)
+        framing.derive_tcp_stream_key_iv(bytes(20), bytes(32), 1)
 
 
 def test_one_video_frame_costs_a_fraction_of_its_frame_budget():
@@ -708,16 +706,16 @@ def test_one_video_frame_costs_a_fraction_of_its_frame_budget():
     import os
     import time
 
-    from pyatv.protocols.airplay.mirror import airparrot_stream
+    from pyatv.protocols.airplay.mirror import tcp_stream
 
     nalus = [bytes([0x65]) + os.urandom(58 * 1024), bytes([0x06]) + os.urandom(200)]
     encryptor = framing.MirrorEncryptor.from_key_iv(bytes(16), bytes(16))
     geometry = bytes(24)
 
     def one_frame(index: int) -> bytes:
-        avcc = airparrot_stream.to_avcc(nalus)
+        avcc = tcp_stream.to_avcc(nalus)
         ciphertext = encryptor.encrypt(avcc)
-        header = airparrot_stream.build_data_header(
+        header = tcp_stream.build_data_header(
             len(ciphertext), index * 16_666_667, geometry
         )
         return header + ciphertext

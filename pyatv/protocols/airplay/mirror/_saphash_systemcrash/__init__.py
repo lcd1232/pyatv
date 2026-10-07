@@ -8,7 +8,7 @@ THIS FILE IS A DERIVED WORK FROM GPLv2 CODE. Pyatv is MIT-licensed.
 
 NOTHING IN PYATV IMPORTS THIS AT RUNTIME ANY MORE. The reimplementation this
 note used to ask for exists: `fairplay_sap.region_a.hash_block`, recovered
-from the AirParrot 3 binary by devirtualisation rather than from the GPLv2
+from the reference sender's binary by devirtualisation rather than from the GPLv2
 source. `fply.m2_stepper2_compress` calls that, and
 `test_fply.py::test_the_shipped_saphash_still_matches_the_vendored_gplv2_one`
 proves the two agree byte-for-byte over 43 messages.

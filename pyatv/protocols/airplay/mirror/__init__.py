@@ -36,10 +36,10 @@ should stay. ``auth/hap_channel`` raises ``InvalidStateError("not
 connected")`` for the same condition ``streams.send`` raises
 ``RuntimeError`` for, which is the sharpest instance of the mismatch.
 
-TWO DIALECTS, and the default is not the obvious one. ``MIRROR_AIRPARROT``
+TWO DIALECTS, and the default is not the obvious one. ``MIRROR_TCP``
 selects between them and defaults to on:
 
-* AirParrot -- a simple type-110 video stream with a FairPlay-wrapped key in
+* TCP -- a simple type-110 video stream with a FairPlay-wrapped key in
   ``ekey``/``eiv`` over TCP. This is the one that renders on tvOS 26.
 * AVConference -- the macOS sender's dialect: a session-init SETUP, Viceroy
   negotiation blobs, SRTP over UDP. Exercised by the tests, but it is not

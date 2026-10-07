@@ -4,8 +4,8 @@ The AirPlay-2 raw *media* pair-verify requires the client to sign M3 with an
 ed25519 identity that the receiver has REGISTERED in its media peer store. A
 freshly generated pyatv identity is rejected (HTTP 500); the only identity the
 Apple TV accepts is one that completed a raw ``/pair-setup`` — in practice the
-registered AirParrot identity, whose *clamped expanded scalar* (not the RFC-8032
-seed) is all that was recoverable.
+registered the reference sender's identity, whose *clamped expanded scalar* (not the
+RFC-8032 seed) is all that was recoverable.
 
 Standard libraries (``cryptography``) only sign from the 32-byte seed, so this
 module implements the minimal edwards25519 arithmetic needed to sign directly

@@ -86,7 +86,7 @@ def test_full_handshake_derives_correct_keys_and_returns_m3():
     """Drive the handshake against a synthetic server we control.
 
     Verifies that the derived AES key/IV match the SHA1 derivation rule
-    AirParrot uses, and that M3 = cert || AES-CTR(sig).
+    the reference sender uses, and that M3 = cert || AES-CTR(sig).
     """
     h = fairplay.MFiSAPHandshake(header_byte=0x01)
     m1 = h.build_m1()

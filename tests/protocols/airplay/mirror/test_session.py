@@ -14,10 +14,10 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 import pytest
 
 from pyatv.protocols.airplay.mirror import (
-    airparrot_audio,
     context,
     framing,
     rtp,
+    screen_audio,
     session,
     srtp,
     streams,
@@ -67,9 +67,9 @@ async def test_session_init_setup_matches_captured_shape(monkeypatch):
     """
     import plistlib
 
-    # These assert the macOS-AVConference dialect (non-default). AirParrot mode
+    # These assert the macOS-AVConference dialect (non-default). TCP mode
     # skips the session-init SETUP, so force the AVConference path here.
-    monkeypatch.setenv("MIRROR_AIRPARROT", "0")
+    monkeypatch.setenv("MIRROR_TCP", "0")
 
     session_ok = _ok(plistlib.dumps({"eventPort": 49641}, fmt=plistlib.FMT_BINARY))
     rtsp = _fake_rtsp([session_ok], _ok())
@@ -118,9 +118,9 @@ async def test_session_stream_setup_matches_captured_shape(monkeypatch):
     """Stream SETUP must carry the AVConf/Viceroy fields, not AirPlay-1 ones."""
     import plistlib
 
-    # AVConference dialect (non-default); AirParrot mode uses the type-110
+    # AVConference dialect (non-default); TCP mode uses the type-110
     # simple body, so force the AVConference path for this shape assertion.
-    monkeypatch.setenv("MIRROR_AIRPARROT", "0")
+    monkeypatch.setenv("MIRROR_TCP", "0")
 
     stream_ok = _ok(
         plistlib.dumps(
@@ -310,9 +310,9 @@ async def test_srtp_kdf_env_selects_the_derivation_that_encrypts_the_wire(
         monkeypatch.setenv("MIRROR_SRTP_KDF", kdf_env)
 
     # The AVConference dialect is the one whose UDP producer encrypts through
-    # the SRTP encryptors; the AirParrot dialect uses a continuous keystream
+    # the SRTP encryptors; the TCP dialect uses a continuous keystream
     # instead and would never exercise this switch.
-    async with driven_session(monkeypatch, airparrot=False) as (receiver, sess):
+    async with driven_session(monkeypatch, tcp=False) as (receiver, sess):
         # The default MIRROR_SRTP_SECRET="fply" path builds the SRTP master
         # material out of the FairPlay stream key/iv, and only when both are
         # long enough. The handshake against the fake yields an encryptor that
@@ -385,7 +385,7 @@ async def test_video_key_falls_back_to_a_16_byte_sap_context_slice(
     sap_context = bytes((i * 7 + 3) & 0xFF for i in range(276))
     pair32 = bytes.fromhex("66" * 32)
 
-    real_derive = framing.derive_airparrot_stream_key_iv
+    real_derive = framing.derive_tcp_stream_key_iv
     derivations = []
 
     def recording_derive(*args, **kwargs):
@@ -393,7 +393,7 @@ async def test_video_key_falls_back_to_a_16_byte_sap_context_slice(
         derivations.append((args, kwargs, result))
         return result
 
-    monkeypatch.setattr(framing, "derive_airparrot_stream_key_iv", recording_derive)
+    monkeypatch.setattr(framing, "derive_tcp_stream_key_iv", recording_derive)
 
     async with driven_session(monkeypatch, with_raw16=False) as (receiver, sess):
         sess._ctx.sap_context = sap_context
@@ -483,7 +483,7 @@ async def test_audio_sync_packet_reports_a_50ms_latency(monkeypatch, tmp_path):
 
     packet = SyncPacket.decode(sync)
     latency_samples = (packet.now - packet.now_without_latency) & 0xFFFFFFFF
-    assert latency_samples / airparrot_audio.AUDIO_SAMPLE_RATE == pytest.approx(
+    assert latency_samples / screen_audio.AUDIO_SAMPLE_RATE == pytest.approx(
         0.050
     ), f"sync advertised {latency_samples} samples of latency"
 
@@ -511,7 +511,7 @@ async def test_srtp_secret_datastream_keys_the_wire_from_the_setup_time_key(
     """
     monkeypatch.setenv("MIRROR_SRTP_SECRET", "datastream")
 
-    async with driven_session(monkeypatch, airparrot=False) as (receiver, sess):
+    async with driven_session(monkeypatch, tcp=False) as (receiver, sess):
         # Give the fply arm above the material it needs, so this test fails if
         # the chain ever prefers it again rather than passing by default.
         sess._ctx.stream_encryptor = framing.MirrorEncryptor.from_key_iv(
@@ -591,7 +591,7 @@ async def test_keybuf_deriv_chooses_where_the_window_key_comes_from(monkeypatch,
 
     The spy has to look at the argument rather than the call. The proven
     key path reaches the same function through
-    ``derive_airparrot_stream_key_iv``, so it is called either way -- what
+    ``derive_tcp_stream_key_iv``, so it is called either way -- what
     only happens on the non-direct branch is being called with the window.
     """
     context = bytes(range(64))
@@ -609,7 +609,7 @@ async def test_keybuf_deriv_chooses_where_the_window_key_comes_from(monkeypatch,
     if deriv is not None:
         monkeypatch.setenv("MIRROR_KEYBUF_DERIV", deriv)
 
-    async with driven_session(monkeypatch, airparrot=True) as (receiver, sess):
+    async with driven_session(monkeypatch, tcp=True) as (receiver, sess):
         sess._ctx.sap_context = context  # noqa: SLF001
         await stream_then_stop(receiver, sess)
 
@@ -627,7 +627,7 @@ async def test_keybuf_mode_decides_whether_the_window_key_becomes_a_cipher(
     """``MIRROR_KEYBUF_MODE``, and with it the width of the direct slice.
 
     ``"continuous"`` turns the window key into a ``MirrorEncryptor``;
-    anything else parks it as an SRTP key/salt pair that the AirParrot
+    anything else parks it as an SRTP key/salt pair that the TCP
     dialect never reaches. So the same wrong key is inert under the default
     and live under the switch, which is why the slice width is checked here
     rather than alongside the derivation: taking 15 bytes instead of 16
@@ -652,7 +652,7 @@ async def test_keybuf_mode_decides_whether_the_window_key_becomes_a_cipher(
     monkeypatch.setenv("MIRROR_KEYBUF_DERIV", "direct")
     monkeypatch.setenv("MIRROR_KEYBUF_MODE", mode)
 
-    async with driven_session(monkeypatch, airparrot=True) as (receiver, sess):
+    async with driven_session(monkeypatch, tcp=True) as (receiver, sess):
         sess._ctx.sap_context = context  # noqa: SLF001
         await stream_then_stop(receiver, sess)
 
@@ -731,7 +731,7 @@ async def test_keybuf_srtp_kdf_picks_one_of_three_session_derivations(monkeypatc
     monkeypatch.setenv("MIRROR_KEYBUF_MODE", "srtp")
     monkeypatch.setenv("MIRROR_KEYBUF_SRTP_KDF", kdf)
 
-    async with driven_session(monkeypatch, airparrot=True) as (receiver, sess):
+    async with driven_session(monkeypatch, tcp=True) as (receiver, sess):
         sess._ctx.sap_context = context  # noqa: SLF001
         await stream_then_stop(receiver, sess)
 
@@ -773,15 +773,15 @@ async def test_a_wrong_length_raw16_falls_back_instead_of_being_used(monkeypatch
     """
     context = bytes(range(0x40, 0x80))
     seen: list = []
-    real = framing.derive_airparrot_stream_key_iv
+    real = framing.derive_tcp_stream_key_iv
 
     def spy(raw16, *args, **kwargs):
         seen.append(bytes(raw16))
         return real(raw16, *args, **kwargs)
 
-    monkeypatch.setattr(framing, "derive_airparrot_stream_key_iv", spy)
+    monkeypatch.setattr(framing, "derive_tcp_stream_key_iv", spy)
 
-    async with driven_session(monkeypatch, airparrot=True) as (receiver, sess):
+    async with driven_session(monkeypatch, tcp=True) as (receiver, sess):
         sess._ctx.stream_raw16 = b"\xc0" * 8  # noqa: SLF001  truthy, too short
         sess._ctx.sap_context = context  # noqa: SLF001
         await stream_then_stop(receiver, sess)
@@ -813,7 +813,7 @@ async def test_the_screen_audio_key_hashes_raw16_before_pair32(monkeypatch, tmp_
     monkeypatch.setenv("MIRROR_AUDIO_SEND", "1")
     monkeypatch.setenv("MIRROR_AUDIO_ELD_FILE", str(eld))
 
-    async with driven_session(monkeypatch, airparrot=True) as (receiver, sess):
+    async with driven_session(monkeypatch, tcp=True) as (receiver, sess):
         await stream_then_stop(receiver, sess, video_frames=3)
         packets = list(receiver.audio_data_server.datagrams)
         raw16 = sess._ctx.stream_raw16  # noqa: SLF001
@@ -847,7 +847,7 @@ async def test_the_control_channel_salt_names_the_encryption_seed(monkeypatch):
     ``_open_channels`` is driven directly rather than through a session run:
     the argument is the whole subject, and a mock records it.
     """
-    monkeypatch.setenv("MIRROR_AIRPARROT", "0")
+    monkeypatch.setenv("MIRROR_TCP", "0")
     opener = AsyncMock(return_value=(MagicMock(), MagicMock()))
 
     ctx = context.MirrorContext(
@@ -910,7 +910,7 @@ async def test_a_full_live_audio_queue_drops_the_oldest_frame(monkeypatch, tmp_p
     monkeypatch.setenv("MIRROR_AUDIO_LIVE_BUFFER", "2")
     monkeypatch.setenv("MIRROR_AUDIO_PREBUFFER", "2")
 
-    async with driven_session(monkeypatch, airparrot=True) as (receiver, sess):
+    async with driven_session(monkeypatch, tcp=True) as (receiver, sess):
         task = asyncio.ensure_future(sess.run())
         try:
             deadline = asyncio.get_event_loop().time() + GUARD_TIMEOUT
@@ -980,7 +980,7 @@ async def test_the_live_audio_reader_accepts_a_frame_of_exactly_the_cap(
     monkeypatch.setenv("MIRROR_AUDIO_LIVE_CMD", '"%s" "%s"' % (sys.executable, feeder))
     monkeypatch.setenv("MIRROR_AUDIO_PREBUFFER", "3")
 
-    async with driven_session(monkeypatch, airparrot=True) as (receiver, sess):
+    async with driven_session(monkeypatch, tcp=True) as (receiver, sess):
         task = asyncio.ensure_future(sess.run())
         try:
             deadline = asyncio.get_event_loop().time() + GUARD_TIMEOUT
@@ -1032,7 +1032,7 @@ async def test_the_avconference_audio_channel_uses_the_audio_salt(monkeypatch):
     constant -- no stream id appended, unlike the control channel's -- so
     it is the pairing of salt, info strings and channel class that matters.
     """
-    monkeypatch.setenv("MIRROR_AIRPARROT", "0")
+    monkeypatch.setenv("MIRROR_TCP", "0")
     opener = AsyncMock(return_value=(MagicMock(), MagicMock()))
 
     ctx = context.MirrorContext(

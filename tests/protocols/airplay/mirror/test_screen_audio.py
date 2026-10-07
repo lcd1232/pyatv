@@ -1,4 +1,4 @@
-"""Tests for the AirParrot screen-audio packetization (RTP + AES-CBC)."""
+"""Tests for TCP-dialect screen-audio packetization (RTP + AES-CBC)."""
 
 import struct
 import time
@@ -6,7 +6,7 @@ import time
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 import pytest
 
-from pyatv.protocols.airplay.mirror import airparrot_audio as a
+from pyatv.protocols.airplay.mirror import screen_audio as a
 from pyatv.protocols.raop import timing
 
 
@@ -44,7 +44,7 @@ def test_cbc_short_frame_all_clear():
 def test_packetizer_seq_and_timestamp_advance():
     key = bytes(16)
     iv = bytes(16)
-    p = a.AirParrotAudioPacketizer(key, iv, ssrc=0x11223344)
+    p = a.ScreenAudioPacketizer(key, iv, ssrc=0x11223344)
     p1 = p.next_packet(b"\x00" * 20)
     p2 = p.next_packet(b"\x00" * 20)
     s1, t1 = struct.unpack(">HI", p1[2:8])
@@ -54,7 +54,7 @@ def test_packetizer_seq_and_timestamp_advance():
     assert struct.unpack(">I", p1[8:12])[0] == 0x11223344
 
 
-def test_setup_params_match_airparrot():
+def test_setup_params_match_tcp():
     params = a.audio_setup_stream_params(0xDEADBEEF)
     assert params["type"] == 96
     assert params["audioFormat"] == 0x1000000  # AAC-ELD
@@ -78,7 +78,7 @@ def test_encrypt_rejects_a_wrong_length_iv():
 
 def test_packetizer_exposes_the_next_sequence_number():
     """``seq`` reports the sequence the *next* packet will carry."""
-    packetizer = a.AirParrotAudioPacketizer(b"\x00" * 16, b"\x01" * 16)
+    packetizer = a.ScreenAudioPacketizer(b"\x00" * 16, b"\x01" * 16)
 
     assert packetizer.seq == 0
     packetizer.next_packet(bytes(32))

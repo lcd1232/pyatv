@@ -39,7 +39,7 @@ _FPLY_VERSION = 0x03
 _MSGTYPE_M1 = 0x01
 _MSGTYPE_M3 = 0x03
 
-# M1[12]: device sub-type, hard-coded literal 2 for AirParrot (spec §1)
+# M1[12]: device sub-type, hard-coded literal 2 for the reference sender (spec §1)
 _M1_DEVICE_SUBTYPE = 0x02
 
 # M3 payload length (bytes 16..143 = 128 bytes) encoded in M3[8..11] BE
@@ -53,9 +53,9 @@ _M3_PAYLOAD_LEN_FIELD = 0x98  # 152 decimal
 # session), the Apple TV accepted the resulting M3s, and every handshake
 # therefore produced the same 144 bytes: header, mode echo, the three aux
 # bytes ``8f 1a 9c``, and this block.  ``M3_AUX_HEADER`` and the mode echo
-# are the same in the live AirParrot captures in
+# are the same in the live captures of the reference sender in
 # ``tests/protocols/airplay/mirror/test_fply_groundtruth.py``; that session's
-# cipher block differs, because AirParrot's arc4random was real.
+# cipher block differs, because the reference sender's arc4random was real.
 #
 # What DOES vary per session is the 20-byte device tag at M3[144:164], which
 # is a function of M2 through the SAP secret — see :mod:`.fairplay_sap`.
@@ -168,9 +168,9 @@ def _rotl32(value: int, amount: int) -> int:
 # m2_stepper — VERIFIED clean-room port (Phase 14h)
 # ---------------------------------------------------------------------------
 #
-# Closed-form port of AirParrot's `_call_0x3351c59c` (the 13 KB cipher core
+# Closed-form port of the reference sender's `_call_0x3351c59c` (the 13 KB cipher core
 # function on the Mac binary). Verified empirically against 5 distinct (IV,
-# message, output) triples captured from runtime AirParrot via Frida — all
+# message, output) triples captured from the reference sender at runtime via Frida — all
 # 5 reproduce byte-perfectly.
 #
 # Algorithm:
@@ -351,7 +351,7 @@ def _md5_I(x: int, y: int, z: int) -> int:  # pylint: disable=invalid-name
 def m2_stepper_compress(  # pylint: disable=too-many-locals
     iv: bytes, message: bytes
 ) -> bytes:
-    """Run the verified clean-room port of AirParrot's m2_stepper cipher.
+    """Run the verified clean-room port of the reference sender's m2_stepper cipher.
 
     Args:
         iv: 16 bytes — the cipher's input state, parsed as 4 little-endian uint32s.
@@ -361,7 +361,7 @@ def m2_stepper_compress(  # pylint: disable=too-many-locals
         16 bytes — the output state (textbook MD5 final-add applied).
 
     Verified against 5 distinct captured (iv, message, output) triples from
-    runtime AirParrot — all reproduce byte-perfectly.
+    the reference sender at runtime — all reproduce byte-perfectly.
     """
     if len(iv) != 16:
         raise ValueError(f"iv must be 16 bytes, got {len(iv)}")
@@ -415,7 +415,7 @@ def m2_stepper_compress(  # pylint: disable=too-many-locals
 
 # m2_stepper / MD5 compression primitive (Phase 14 re-classification):
 #
-# Function at AirParrot:0x180277fd0 implements an MD5-style compression:
+# The reference sender's function at 0x180277fd0 implements an MD5-style compression:
 # reads 16 little-endian uint32 words via *(param_1+4), uses 4 state words
 # from *(param_1+8), runs 64 mixing rounds over four "round families" with
 # rotation amounts 7/12/17/22, 5/9/14/20, 4/11/16/23, 6/10/15/21 (textbook
@@ -462,14 +462,14 @@ def m2_stepper2_compress(iv: bytes, message: bytes) -> bytes:
     """STEPPER2 compression — pure-Python implementation.
 
     Runs ``fairplay_sap.region_a.hash_block``: SAPHash as recovered from the
-    AirParrot 3 binary by devirtualisation, which is this project's own code
+    reference sender's binary by devirtualisation, which is this project's own code
     under its own licence.  It replaces the GPLv2-derived
     ``_saphash_systemcrash`` module this function used to call --
     ``test_fply.py`` pins the two implementations against each other, and
     ``test_m2_stepper2_compress_validated_block1_macp1`` pins the output
     against a captured vector.
 
-    Verified against real AirParrot 3 binary's STEPPER2 (via the Unicorn
+    Verified against the real reference sender binary's STEPPER2 (via the Unicorn
     emulator with deterministic / non-session-aligned VM addresses): the
     SAPHash algorithm produces the same 16-byte output bit-for-bit.
 
@@ -601,8 +601,8 @@ def derive_stream_key(
     The mirror's real video key is not derived from M3 at all. It is
     negotiated inside FairPlay and read out of the SAP context, then folded
     with the pair-verify shared secret by
-    ``framing.derive_airparrot_stream_key_iv`` -- verified live against
-    AirParrot, and what ``session.py`` actually streams with. Nothing in
+    ``framing.derive_tcp_stream_key_iv`` -- verified live against
+    the reference sender, and what ``session.py`` actually streams with. Nothing in
     ``pyatv`` reads ``stream_aes_key``/``stream_aes_iv``; only this module
     sets them, and ``examples/airplay_mirror_e2e.py`` reads them back.
 
@@ -649,7 +649,7 @@ class FPLYHandshake:
 
     def __init__(self, mode_byte: int = 1) -> None:
         """Start an FPLY v3 handshake in mode *mode_byte* (0-3)."""
-        # Default mode 1 matches what AirParrot uses on the wire (Phase 12
+        # Default mode 1 matches what the reference sender uses on the wire (Phase 12
         # capture) and is the only mode the recovered path was verified at.
         self._mode_byte = mode_byte & 0x03
         self._state = _State.INIT
@@ -696,7 +696,7 @@ class FPLYHandshake:
 
         self._m3_payload = M3_CIPHER_BLOCK
         self._sap_context = fairplay_sap.context_after_m3(self._sap36)
-        # Legacy spec §5.2 fields.  The AirParrot media path does not use
+        # Legacy spec §5.2 fields.  The TCP media path does not use
         # them — it derives the video key from the raw16 in the ekey (see
         # session.py) — and because M3[16:144] is constant these are the
         # same in every session.  Kept so callers that read them still work.
@@ -788,7 +788,7 @@ class FPLYHandshake:
         its docstring. Spec §6.2 offered a second interpretation (XOR the IV
         with the big-endian frame counter) to try if frames were rejected;
         neither is what the working mirror uses, so do not spend time on
-        that choice. ``framing.derive_airparrot_stream_key_iv`` supplies the
+        that choice. ``framing.derive_tcp_stream_key_iv`` supplies the
         real key and IV.
         """
         if self._stream_aes_iv is None:

@@ -28,7 +28,7 @@ class SendChannel(Protocol):
 
     Three unrelated classes fill this role -- :class:`VideoStreamChannel`
     (HAP over TCP), :class:`MirrorVideoDatagramChannel` (UDP) and
-    :class:`..airparrot_stream.RawVideoTCPChannel` (plain TCP). They share no
+    :class:`..tcp_stream.RawVideoTCPChannel` (plain TCP). They share no
     base class: two are :class:`asyncio.Protocol` subclasses and one is a
     :class:`asyncio.DatagramProtocol`. ``send()`` is the whole of what the
     drain task needs from any of them, so that is what is asked for here.

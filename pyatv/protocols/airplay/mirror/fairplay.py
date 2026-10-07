@@ -1,16 +1,16 @@
 """MFiSAP handshake — AirPlay 2 mirror sender authentication.
 
-Implements the 4-message handshake used by AirParrot 3 (and presumably
+Implements the 4-message handshake used by the reference sender (and presumably
 other AirPlay 2 mirror senders) to derive an AES-128-CTR key+IV used to
 encrypt mirror frame payloads end-to-end.
 
-Wire format reverse-engineered from AirParrotNative.dll (PE32+, MSVC,
+Wire format reverse-engineered from the reference sender's native library (PE32+, MSVC,
 Squirrels LLC, January 2025). See the post-RE corrections section of the
 implementation plan for the wire layout reference.
 
 Uses only standard cryptographic primitives (X25519, HKDF-SHA512, SHA-1,
 AES-128-CTR) provided by the existing `cryptography` dependency. The
-nonce generator was changed from AirParrot's predictable
+nonce generator was changed from the reference sender's predictable
 `srand(time(0))+rand()` to `secrets.token_bytes(32)`.
 """
 
@@ -34,7 +34,7 @@ _LOGGER = logging.getLogger(__name__)
 HKDF_SALT = b"MFiSAP-ECDH-Salt"
 HKDF_INFO = b"MFiSAP-ECDH-Info"
 
-# Default M1[0] header byte. AirParrot's ctx[4] is set at create time but the
+# Default M1[0] header byte. The reference sender's ctx[4] is set at create time but the
 # value is not directly visible in the disasm. 0x01 is the convention for
 # "client hello"; if a real Apple TV rejects, try 0x00.
 DEFAULT_M1_HEADER_BYTE = 0x01
@@ -105,7 +105,8 @@ class MFiSAPHandshake:
         assert self._scalar_key is not None
         shared = self._scalar_key.exchange(server_pubkey)
 
-        # SHA1 KDF — labels include trailing null byte (AirParrot: 8 / 7 bytes)
+        # SHA1 KDF — labels include trailing null byte (the reference sender: 8 / 7
+        # bytes)
         self._aes_key = _sha1(b"AES-KEY\x00" + shared)[:16]
         self._aes_iv = _sha1(b"AES-IV\x00" + shared)[:16]
 
@@ -137,7 +138,7 @@ class MFiSAPHandshake:
 
         State has been advanced past the M3 sig encryption; subsequent
         `encrypt(...)` calls on this object continue the keystream from
-        where M3 left off — exactly matching AirParrot's behavior.
+        where M3 left off — exactly matching the reference sender's behavior.
         """
         if self._stream_encryptor is None:
             raise RuntimeError("handshake not complete")

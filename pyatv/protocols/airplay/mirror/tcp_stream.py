@@ -1,9 +1,9 @@
-"""AirParrot-dialect mirror video transport (reverse-engineered 2026-08-23).
+"""TCP-dialect mirror video transport (reverse-engineered 2026-08-23).
 
 Unlike the macOS-AVConference / Viceroy path (UDP RTP + SRTP), a real tvOS 26
-receiver driven by AirParrot 3 takes screen video over a **raw TCP** media-data
-channel with this framing (verified by decrypting AirParrot's live stream, see
-docs/superpowers/specs/2026-08-23-mirror-video-key-handoff.md SESSION 3):
+receiver driven by the reference sender takes screen video over a **raw TCP** media-data
+channel with this framing (verified by decrypting the reference sender's live stream,
+see docs/superpowers/specs/2026-08-23-mirror-video-key-handoff.md SESSION 3):
 
     per message (one H.264 access unit):
         128-byte header:
@@ -49,7 +49,7 @@ _VCL_TYPES = frozenset(range(1, 6))
 class RawVideoTCPChannel(asyncio.Protocol):
     """Plain TCP connection to the receiver's video ``dataPort``.
 
-    No HAP/ChaCha layer (unlike :class:`AbstractHAPChannel`) — the AirParrot
+    No HAP/ChaCha layer (unlike :class:`AbstractHAPChannel`) — the reference sender
     media-data channel is raw TCP; the only encryption is the AES-CTR applied
     to each frame payload before it is queued here.
     """
@@ -119,7 +119,7 @@ def build_geometry(
 ) -> bytes:
     """Pack the 6-float display-geometry field that lives at header offset 40.
 
-    Observed in AirParrot's stream as a constant per-session block, e.g.
+    Observed in the reference sender's stream as a constant per-session block, e.g.
     surface 3324x2160, origin 337x51, content 3164.7x2056.1. The receiver
     appears to require a non-zero rect (a zeroed field gets the stream closed
     after the first frame).
@@ -142,10 +142,10 @@ def build_data_header(
     msg_type: bytes = _VIDEO_DATA_TYPE,
     dims: tuple = (),
 ) -> bytes:
-    """Build the 128-byte AirParrot media-data header for a payload.
+    """Build the 128-byte TCP-dialect media-data header for a payload.
 
     ``dims`` = (width, height) floats written at offset 16 (two little-endian
-    float32). AirParrot's CONFIG frame (type 0x01000600) carries the source
+    float32). The reference sender's CONFIG frame (type 0x01000600) carries the source
     surface dimensions there so the receiver can size its decoder/display;
     video frames leave [16:24] zero. Omitting it leaves the receiver unable to
     configure the mirror surface (black screen).
@@ -164,7 +164,7 @@ def build_data_header(
 def build_avcc_config(sps: bytes, pps: bytes) -> bytes:
     """Build an AVCDecoderConfigurationRecord (avcC) from raw SPS/PPS NALs.
 
-    AirParrot sends this PLAINTEXT as the first data-channel message (header
+    The reference sender sends this PLAINTEXT as the first data-channel message (header
     type 0x01000600) so the receiver can initialise its H.264 decoder before
     any encrypted frame arrives. NALs are without start codes.
     """
@@ -196,7 +196,7 @@ def group_access_units(nalus: List[bytes], nal_type) -> List[List[bytes]]:
     """Group a flat NAL list into access units.
 
     Non-VCL NALs (SPS/PPS/SEI/AUD) attach to the following VCL NAL; each VCL
-    NAL (coded slice) closes an access unit. Mirrors AirParrot's per-frame
+    NAL (coded slice) closes an access unit. Mirrors the reference sender's per-frame
     message grouping (e.g. SEI+IDR in one message, a lone slice in the next).
     """
     units: List[List[bytes]] = []

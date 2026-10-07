@@ -30,7 +30,7 @@ def test_no_log_above_debug_prints_raw_key_material():
     allowed = {
         # Bytes the receiver pushed back on the raw video channel; unexpected,
         # so worth surfacing, and it is inbound protocol data, not a secret.
-        ("airparrot_stream.py", "raw video channel got %d inbound bytes: %s"),
+        ("tcp_stream.py", "raw video channel got %d inbound bytes: %s"),
         # A device_tag mismatch is a real anomaly, and the tag travels in M4
         # in the clear anyway.
         ("fply.py", "M4 echoes device_tag %s, we sent %s"),

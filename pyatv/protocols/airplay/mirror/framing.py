@@ -252,7 +252,7 @@ def derive_datastream_video_key(verifier: Any, stream_connection_id: int) -> byt
 class MirrorEncryptor:
     """Stateful AES-128-CTR encryptor with continuous keystream.
 
-    AirParrot's reverse-engineered MFiSAP path uses a single AES-CTR cipher
+    The reference sender's reverse-engineered MFiSAP path uses a single AES-CTR cipher
     state across the entire mirror session: the same cipher object that
     encrypts the M3 handshake-sig is then advanced through every mirror
     frame's payload. This class wraps a cryptography.io encryptor and
@@ -403,12 +403,13 @@ def build_avcc(sps: bytes, pps: bytes) -> bytes:
     )
 
 
-def derive_airparrot_stream_key_iv(
+def derive_tcp_stream_key_iv(
     raw16: bytes, pair32: bytes, stream_connection_id: int, flag: bool = True
 ) -> tuple:
-    """Return (key, iv) for an AirParrot-dialect media stream (video or audio).
+    """Return (key, iv) for a TCP-dialect media stream (video or audio).
 
-    Verified byte-for-byte against AirParrot's ``DeriveKeyAndIV`` (2026-08-24):
+    Verified byte-for-byte against the reference sender's ``DeriveKeyAndIV``
+    (2026-08-24):
 
         secret16 = sha512(raw16 ‖ pair32)[:16]          (flag=True path)
         key      = sha512("AirPlayStreamKey"
@@ -423,11 +424,11 @@ def derive_airparrot_stream_key_iv(
     if len(raw16) != 16:
         raise ValueError(f"raw16 must be 16 bytes, got {len(raw16)}")
     return stream_key_iv_from_secret(
-        airparrot_secret16(raw16, pair32, flag), stream_connection_id
+        stream_secret16(raw16, pair32, flag), stream_connection_id
     )
 
 
-def airparrot_secret16(raw16: bytes, pair32: bytes, flag: bool = True) -> bytes:
+def stream_secret16(raw16: bytes, pair32: bytes, flag: bool = True) -> bytes:
     """Return the 16 bytes both stream keys are labelled from.
 
     Split out because ``session.py`` logs this value next to the key it
@@ -447,7 +448,7 @@ def stream_key_iv_from_secret(
 ) -> tuple[bytes, bytes]:
     """Label the secret with the stream id and hash it down to (key, iv).
 
-    The tail of :func:`derive_airparrot_stream_key_iv`, split out because
+    The tail of :func:`derive_tcp_stream_key_iv`, split out because
     ``session.py``'s ``MIRROR_KEYBUF_WINDOW`` sweep needs the same two labels
     over a secret it slices out of the SAP context -- a window that is not
     16 bytes, so it cannot go through the function above.

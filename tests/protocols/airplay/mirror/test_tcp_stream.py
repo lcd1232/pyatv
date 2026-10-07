@@ -1,4 +1,4 @@
-"""Tests for the AirParrot-dialect data-channel framing."""
+"""Tests for the TCP-dialect data-channel framing."""
 
 import asyncio
 import logging
@@ -6,16 +6,16 @@ import struct
 
 import pytest
 
-from pyatv.protocols.airplay.mirror import airparrot_stream
+from pyatv.protocols.airplay.mirror import tcp_stream
 
 
 def test_data_header_basic_layout():
-    hdr = airparrot_stream.build_data_header(
-        1234, 0x1122334455667788, msg_type=airparrot_stream._VIDEO_DATA_TYPE
+    hdr = tcp_stream.build_data_header(
+        1234, 0x1122334455667788, msg_type=tcp_stream._VIDEO_DATA_TYPE
     )
     assert len(hdr) == 128
     assert struct.unpack_from("<I", hdr, 0)[0] == 1234
-    assert hdr[4:8] == airparrot_stream._VIDEO_DATA_TYPE
+    assert hdr[4:8] == tcp_stream._VIDEO_DATA_TYPE
     assert struct.unpack_from("<Q", hdr, 8)[0] == 0x1122334455667788
     # No dims/geometry -> [16:24] and [40:64] stay zero.
     assert hdr[16:24] == b"\x00" * 8
@@ -25,21 +25,21 @@ def test_data_header_basic_layout():
 def test_config_header_carries_source_dims():
     # The CONFIG frame must carry (width, height) as two float32 LE at [16:24];
     # without them the receiver decodes but renders black.
-    hdr = airparrot_stream.build_data_header(
+    hdr = tcp_stream.build_data_header(
         31,
         0,
-        msg_type=airparrot_stream._CONFIG_TYPE,
+        msg_type=tcp_stream._CONFIG_TYPE,
         dims=(1280.0, 720.0),
     )
     w, h = struct.unpack_from("<ff", hdr, 16)
     assert (w, h) == (1280.0, 720.0)
-    assert hdr[4:8] == airparrot_stream._CONFIG_TYPE
+    assert hdr[4:8] == tcp_stream._CONFIG_TYPE
 
 
 def test_geometry_lands_at_offset_40():
-    geom = airparrot_stream.build_geometry(1280.0, 720.0, 0.0, 0.0, 1280.0, 720.0)
+    geom = tcp_stream.build_geometry(1280.0, 720.0, 0.0, 0.0, 1280.0, 720.0)
     assert len(geom) == 24
-    hdr = airparrot_stream.build_data_header(10, 0, geom)
+    hdr = tcp_stream.build_data_header(10, 0, geom)
     assert hdr[40:64] == geom
     assert struct.unpack_from("<ffffff", hdr, 40) == (
         1280.0,
@@ -51,18 +51,18 @@ def test_geometry_lands_at_offset_40():
     )
 
 
-def test_derive_stream_key_matches_airparrot_ground_truth():
-    # Captured live from AirParrot's DeriveKeyAndIV (2026-08-24): given these
+def test_derive_stream_key_matches_tcp_ground_truth():
+    # Captured live from the reference sender's DeriveKeyAndIV (2026-08-24): given these
     # raw16/pair32/streamConnectionID, its AES key/iv were exactly these.
     from pyatv.protocols.airplay.mirror.framing import (
-        derive_airparrot_stream_key_iv,
+        derive_tcp_stream_key_iv,
     )
 
     raw16 = bytes.fromhex("b2afda803e40288d693df7084e17fe83")
     pair32 = bytes.fromhex(
         "db2f925a4bb807ffc764fef7728efc89d27842dff25a709e898dca9441a0aa64"
     )
-    key, iv = derive_airparrot_stream_key_iv(raw16, pair32, 527657112)
+    key, iv = derive_tcp_stream_key_iv(raw16, pair32, 527657112)
     assert key.hex() == "3f9ec9a5a6d69c05b961f7bb3c38718d"
     assert iv.hex() == "a0cd20d57da1e134f8c858e5aedbf7c3"
 
@@ -76,7 +76,7 @@ def test_group_access_units_keeps_trailing_non_vcl_nals():
     """
     sps, pps, slice_nal, sei = b"\x67\xaa", b"\x68\xbb", b"\x65\xcc", b"\x06\xdd"
 
-    units = airparrot_stream.group_access_units(
+    units = tcp_stream.group_access_units(
         [sps, pps, slice_nal, sei], lambda n: n[0] & 0x1F
     )
 
@@ -86,7 +86,7 @@ def test_group_access_units_keeps_trailing_non_vcl_nals():
 def test_group_access_units_without_a_trailing_group():
     """The complementary case: ending on a slice leaves nothing pending."""
     slice_nal = b"\x65\xcc"
-    units = airparrot_stream.group_access_units([slice_nal], lambda n: n[0] & 0x1F)
+    units = tcp_stream.group_access_units([slice_nal], lambda n: n[0] & 0x1F)
     assert units == [[slice_nal]]
 
 
@@ -104,7 +104,7 @@ def test_group_access_units_does_not_split_on_an_sei_nal():
     """
     sei, idr = b"\x06\xdd", b"\x65\xcc"
 
-    units = airparrot_stream.group_access_units([sei, idr], lambda n: n[0] & 0x1F)
+    units = tcp_stream.group_access_units([sei, idr], lambda n: n[0] & 0x1F)
 
     assert units == [[sei, idr]]
 
@@ -122,7 +122,7 @@ def test_avcc_config_follows_the_decoder_configuration_record_layout():
     sps = bytes([0x67, 0x64, 0x00, 0x28, 0xAC, 0xD9, 0x40])
     pps = bytes([0x68, 0xEE, 0x3C, 0xB0])
 
-    record = airparrot_stream.build_avcc_config(sps, pps)
+    record = tcp_stream.build_avcc_config(sps, pps)
 
     assert record[0] == 0x01  # configurationVersion
     assert record[1] == 0x64  # AVCProfileIndication: 100 = High
@@ -200,16 +200,14 @@ class _Peer:
 async def _connect_channel(port):
     loop = asyncio.get_event_loop()
     return await loop.create_connection(
-        airparrot_stream.RawVideoTCPChannel, "127.0.0.1", port
+        tcp_stream.RawVideoTCPChannel, "127.0.0.1", port
     )
 
 
 @pytest.mark.asyncio
 async def test_channel_logs_inbound_bytes_from_the_receiver(caplog):
     """A receiver may push a control byte back; it must be logged, not dropped."""
-    caplog.set_level(
-        logging.INFO, logger="pyatv.protocols.airplay.mirror.airparrot_stream"
-    )
+    caplog.set_level(logging.INFO, logger="pyatv.protocols.airplay.mirror.tcp_stream")
     peer = _Peer(reply=b"\xde\xad\xbe\xef")
     port = await peer.start()
     transport = None
@@ -232,7 +230,7 @@ async def test_channel_logs_inbound_bytes_from_the_receiver(caplog):
 async def test_channel_warns_when_the_receiver_half_closes(caplog):
     """EOF from the receiver is abnormal mid-mirror and must be reported."""
     caplog.set_level(
-        logging.WARNING, logger="pyatv.protocols.airplay.mirror.airparrot_stream"
+        logging.WARNING, logger="pyatv.protocols.airplay.mirror.tcp_stream"
     )
     peer = _Peer(half_close=True)
     port = await peer.start()
@@ -255,7 +253,7 @@ async def test_channel_warns_when_the_receiver_half_closes(caplog):
 @pytest.mark.asyncio
 async def test_channel_send_is_a_no_op_once_the_transport_is_gone():
     """Sending after teardown must not raise -- frames can race the close."""
-    channel = airparrot_stream.RawVideoTCPChannel()
+    channel = tcp_stream.RawVideoTCPChannel()
 
     # Never connected.
     channel.send(b"frame")
@@ -274,9 +272,7 @@ async def test_channel_send_is_a_no_op_once_the_transport_is_gone():
 @pytest.mark.asyncio
 async def test_channel_logs_a_progress_line_every_200_messages(caplog):
     """The periodic progress line is the only signal that video is flowing."""
-    caplog.set_level(
-        logging.INFO, logger="pyatv.protocols.airplay.mirror.airparrot_stream"
-    )
+    caplog.set_level(logging.INFO, logger="pyatv.protocols.airplay.mirror.tcp_stream")
     peer = _Peer()
     port = await peer.start()
     transport = None

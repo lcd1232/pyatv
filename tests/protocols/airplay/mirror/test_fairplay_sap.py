@@ -1,7 +1,7 @@
 """The recovered FairPlay handshake against the emulator that produced it.
 
 ``fply_pure_golden.jsonl`` is 256 handshakes recorded from the Unicorn
-emulation of AirParrot's own FairPlay code, before that code was read out
+emulation of the reference sender's own FairPlay code, before that code was read out
 as algorithms: for each one the M2 that went in and the M3, the M4, the
 chosen raw16, the ekey and the first 44 bytes of the FairPlay context that
 came out.  pyatv no longer ships that emulator (it lives in

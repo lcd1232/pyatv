@@ -121,7 +121,7 @@ USER_AGENT = "Viceroy 1.7.0"
 #: legibility change, and altering what goes on the wire needs a live test.
 #:
 #: SCOPE.  ``build_negotiation_data`` is called only from the AVConference
-#: branch of ``session.py`` -- the ``else`` of ``if _airparrot_mode()``, which
+#: branch of ``session.py`` -- the ``else`` of ``if _tcp_mode()``, which
 #: defaults to True.  So neither this SSRC nor ``ntpTime`` below reaches the
 #: wire on the dialect that renders on tvOS 26; the collision above needs two
 #: senders BOTH in AVConference mode.  That is why these are documented rather

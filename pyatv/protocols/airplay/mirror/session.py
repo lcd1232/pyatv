@@ -35,14 +35,14 @@ from pyatv.auth.hap_pairing import PairVerifyProcedure
 from pyatv.core.protocol import heartbeater
 from pyatv.protocols.airplay import channels
 from pyatv.protocols.airplay.mirror import (
-    airparrot_audio,
-    airparrot_stream,
     framing,
     negotiation,
     pacer,
     rtp,
+    screen_audio,
     srtp,
     streams,
+    tcp_stream,
 )
 from pyatv.protocols.airplay.mirror.context import MirrorContext
 from pyatv.protocols.raop import timing as raop_timing
@@ -61,7 +61,7 @@ FEEDBACK_INTERVAL = 2.0  # seconds, matches AP2Session.start_keep_alive
 #
 # The MirrorVideo-* trio that used to sit here is gone: the video key turned
 # out not to be HAP-derived at all. It is the FairPlay one built in
-# framing.derive_airparrot_stream_key_iv, so those three labels had no reader.
+# framing.derive_tcp_stream_key_iv, so those three labels had no reader.
 MIRROR_AUDIO_SALT = "MirrorAudio-Salt"
 MIRROR_AUDIO_OUTPUT_INFO = "MirrorAudio-Output-Encryption-Key"
 MIRROR_AUDIO_INPUT_INFO = "MirrorAudio-Input-Encryption-Key"
@@ -131,7 +131,7 @@ def _device_id_from_uuid(uuid_str: str) -> str:
     Real AirPlay senders pass their hardware MAC; we synthesize a stable
     pseudo-MAC from the session UUID's last 12 hex chars formatted as
     ``XX:XX:XX:XX:XX:XX`` (upper-case, as real senders send it). Apple TV
-    accepts this — Phase 22's AirParrot
+    accepts this — Phase 22's reference-sender
     helper also used a synthesized ID (not its real WiFi MAC) and was
     accepted on /fp-setup.
     """
@@ -139,15 +139,15 @@ def _device_id_from_uuid(uuid_str: str) -> str:
     return ":".join(hex12[i : i + 2] for i in range(0, 12, 2))
 
 
-def _airparrot_mode() -> bool:
-    """Whether to speak AirParrot's mirror dialect (default) vs AVConference.
+def _tcp_mode() -> bool:
+    """Whether to speak the TCP mirror dialect (default) vs AVConference.
 
-    AirParrot's simple type-110 SETUP + raw-TCP 128-byte-framed continuous
+    The reference sender's simple type-110 SETUP + raw-TCP 128-byte-framed continuous
     AES-CTR video is the path that actually renders on tvOS 26 (the video key
-    derivation was verified by decrypting AirParrot's live stream). Set
-    ``MIRROR_AIRPARROT=0`` to fall back to the experimental AVConference path.
+    derivation was verified by decrypting the reference sender's live stream). Set
+    ``MIRROR_TCP=0`` to fall back to the experimental AVConference path.
     """
-    return os.environ.get("MIRROR_AIRPARROT", "1") != "0"
+    return os.environ.get("MIRROR_TCP", "1") != "0"
 
 
 ChannelOpener = Callable[
@@ -204,7 +204,7 @@ class MirrorSession:
         self._ctx = ctx
         self._h264_path = h264_path
         self._open_channel = channel_opener
-        # Not an AbstractHAPChannel: the AirParrot path opens a plain TCP
+        # Not an AbstractHAPChannel: the TCP path opens a plain TCP
         # RawVideoTCPChannel and the UDP path a MirrorVideoDatagramChannel.
         # All three only ever have send() called on them.
         self._video_channel: Optional[streams.SendChannel] = None
@@ -245,8 +245,8 @@ class MirrorSession:
         if self._stopped:
             raise RuntimeError("session already stopped; construct a new one")
         await self._setup_session()
-        if _airparrot_mode():
-            # Exact AirParrot flow (verified via LLDB socket capture 2026-08-24):
+        if _tcp_mode():
+            # Exact TCP flow (verified via LLDB socket capture 2026-08-24):
             #   SETUP(audio 96) -> connect eventPort -> RECORD -> SETUP(video 110)
             #   -> connect video dataPort -> stream. No session-init, and the
             #   eventPort is returned by the AUDIO SETUP (parsed in
@@ -305,7 +305,7 @@ class MirrorSession:
         self._rtsp.user_agent = MIRROR_USER_AGENT
 
         session_uuid = str(uuid4()).upper()
-        # Retained so the AirParrot-dialect stream SETUP can echo the same
+        # Retained so the TCP-dialect stream SETUP can echo the same
         # session identity (it repeats sessionUUID / deviceID / macAddress).
         self._session_uuid = session_uuid
         self._device_id = self._ctx.device_id or _device_id_from_uuid(session_uuid)
@@ -328,12 +328,12 @@ class MirrorSession:
             "name": self._ctx.name,
             "macAddress": self._mac_address,
         }
-        if _airparrot_mode():
-            # AirParrot sends NO macOS-AVConference session-init SETUP. Its flow
-            # is SETUP(audio 96) -> connect eventPort -> RECORD -> SETUP(video
+        if _tcp_mode():
+            # The reference sender sends NO macOS-AVConference session-init SETUP. Its
+            # flow is SETUP(audio 96) -> connect eventPort -> RECORD -> SETUP(video
             # 110). The eventPort comes from the AUDIO SETUP response (not here).
             self._ctx.event_port = 0
-            _LOGGER.debug("AirParrot mode: skipping session-init SETUP")
+            _LOGGER.debug("TCP mode: skipping session-init SETUP")
             return
         resp = await self._rtsp.setup(headers=dict(_SUPPRESS_RAOP_HEADERS), body=body)
         if resp.code != 200:
@@ -348,7 +348,7 @@ class MirrorSession:
         """Connect the event channel advertised by the session SETUP.
 
         macOS AVConference encrypts this channel with HAP-derived keys. The
-        AirParrot dialect (no HAP pair-verify -> no channel keys) uses a
+        TCP dialect (no HAP pair-verify -> no channel keys) uses a
         PLAINTEXT TCP connection instead; the receiver only needs the socket
         up before it will answer RECORD.
         """
@@ -356,7 +356,7 @@ class MirrorSession:
             _LOGGER.debug("No eventPort returned; skipping event channel")
             return
         addr = self._rtsp.connection.remote_ip
-        if _airparrot_mode():
+        if _tcp_mode():
             reader, writer = await asyncio.open_connection(addr, self._ctx.event_port)
             self._event_reader = reader
             self._event_transport = writer.transport
@@ -441,9 +441,9 @@ class MirrorSession:
         _LOGGER.debug("Event channel connected on port %d", self._ctx.event_port)
 
     def _build_ekey_eiv(self):
-        """Return (ekey, eiv) for the AirParrot stream SETUP, or (None, None).
+        """Return (ekey, eiv) for the TCP-dialect stream SETUP, or (None, None).
 
-        AirParrot transports a FairPlay-wrapped stream key in ``ekey`` + a
+        The reference sender transports a FairPlay-wrapped stream key in ``ekey`` + a
         16-byte ``eiv``. We proved the receiver decrypts video with the
         *derived* key (SQAirPlayClientSessionDeriveKeyAndIV), so it can derive
         the key itself; the first cut therefore omits ekey to test whether the
@@ -459,20 +459,20 @@ class MirrorSession:
         # value sent alongside; the video IV itself is derived from raw16, so a
         # random eiv is used unless one is pinned via MIRROR_EIV.
         if self._ctx.ekey:
-            # eiv is a sender-chosen random 16B (AirParrot's sess[0xa8]); pyatv
-            # is the sender, so it picks its own. The video IV itself derives
-            # from raw16, so eiv's value is free unless the receiver validates it.
+            # eiv is a sender-chosen random 16B (the reference sender's sess[0xa8]);
+            # pyatv is the sender, so it picks its own. The video IV itself derives from
+            # raw16, so eiv's value is free unless the receiver validates it.
             eiv = bytes.fromhex(eiv_hex) if eiv_hex else secrets.token_bytes(16)
             return self._ctx.ekey, eiv
         return None, None
 
     async def _setup_audio_stream(self) -> None:
-        """Send AirParrot's type-96 AUDIO stream SETUP (before RECORD).
+        """Send the reference sender's type-96 AUDIO stream SETUP (before RECORD).
 
-        AirParrot's real flow is SETUP(audio 96) -> RECORD -> SETUP(video 110);
-        the audio SETUP must come first or RECORD returns 455. The receiver also
-        needs the audio (screen-audio) stream present to accept the video.
-        Includes ``controlPort`` (a bound UDP port) as AirParrot does.
+        The reference sender's real flow is SETUP(audio 96) -> RECORD -> SETUP(video
+        110); the audio SETUP must come first or RECORD returns 455. The receiver also
+        needs the audio (screen-audio) stream present to accept the video. Includes
+        ``controlPort`` (a bound UDP port) as the reference sender does.
         """
         if self._audio_setup_done:
             return
@@ -482,7 +482,7 @@ class MirrorSession:
             return
         self._audio_setup_done = True
         timing_port = self._timing_server.port if self._timing_server else 0
-        # Bind a UDP control port and advertise it, mirroring AirParrot.
+        # Bind a UDP control port and advertise it, mirroring the reference sender.
         if self._audio_control_sock is None:
             self._audio_control_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self._audio_control_sock.bind((self._rtsp.connection.local_ip, 0))
@@ -492,7 +492,7 @@ class MirrorSession:
         # The eiv is retained so the (optional) screen-audio sender can
         # AES-128-CBC encrypt AAC-ELD frames with (key=raw16, iv=eiv) — the
         # receiver derives the same from the audio ekey/eiv (see
-        # airparrot_audio.py + audio spec). audio_id needs no such stash: it
+        # screen_audio.py + audio spec). audio_id needs no such stash: it
         # goes straight into the SETUP below and, unlike the video stream's
         # id, takes no part in key derivation.
         self._ctx.audio_eiv = audio_eiv
@@ -535,7 +535,7 @@ class MirrorSession:
         decoded = decode_bplist_from_body(a_resp)
         _LOGGER.debug("AUDIO SETUP full response: %r", decoded)
         # The eventPort the receiver expects us to connect to comes from THIS
-        # response (AirParrot dialect), not a session-init SETUP.
+        # response (TCP dialect), not a session-init SETUP.
         self._ctx.event_port = decoded.get("eventPort", 0)
         astream = (decoded.get("streams") or [{}])[0]
         self._ctx.audio_data_port = astream.get("dataPort", 0)
@@ -570,26 +570,26 @@ class MirrorSession:
         self._video_sock.bind((self._rtsp.connection.local_ip, 0))
         network_port = self._video_sock.getsockname()[1]
 
-        # AirParrot uses 32-bit streamConnectionIDs; the receiver appears to
+        # The reference sender uses 32-bit streamConnectionIDs; the receiver appears to
         # store it in a 32-bit field, so a 63-bit value would make the
         # receiver's key-derivation label ("AirPlayStreamKey"+id) disagree with
-        # ours. Match AirParrot's range in AirParrot mode.
+        # ours. Match the reference sender's range in TCP mode.
         self._ctx.stream_connection_id = (
-            secrets.randbits(32) if _airparrot_mode() else secrets.randbits(63)
+            secrets.randbits(32) if _tcp_mode() else secrets.randbits(63)
         )
-        if _airparrot_mode():
-            # AirParrot dialect (reverse-engineered 2026-08-23): a simple
+        if _tcp_mode():
+            # TCP dialect (reverse-engineered 2026-08-23): a simple
             # type-110 video stream plus session identity at the top level, and
             # a FairPlay-wrapped key transported in `ekey`/`eiv`. The receiver
             # returns a *TCP* dataPort (not the UDP one the AVConference dialect
-            # gets). See airparrot_stream.py + the SESSION 3 handoff.
+            # gets). See tcp_stream.py + the SESSION 3 handoff.
             timing_port = self._timing_server.port if self._timing_server else 0
             # AUDIO stream SETUP already sent (before RECORD, from run()).
             _mirror_et = int(os.environ.get("MIRROR_ET", "32"))
             body = {
                 "streams": [
                     {
-                        "type": 110,  # AirParrot video stream type
+                        "type": 110,  # the TCP dialect's video stream type
                         "streamConnectionID": self._ctx.stream_connection_id,
                         "timestampInfo": [
                             {"name": name}
@@ -683,10 +683,10 @@ class MirrorSession:
         # info "DataStream-Output-Encryption-Key", then decrypts frames with
         # ChaCha20-Poly1305 (NOT the FairPlay master key, and NOT AES). pyatv's
         # verifier.encryption_keys IS that HKDF.
-        if not _airparrot_mode():
-            # AVConference/DataStream path only. AirParrot keys the video with
-            # the FairPlay raw16 (+ pair-verify shared) as AES-CTR, so there is
-            # no DataStream HKDF here and no verifier to derive from.
+        if not _tcp_mode():
+            # AVConference/DataStream path only. The reference sender keys the video
+            # with the FairPlay raw16 (+ pair-verify shared) as AES-CTR, so there is no
+            # DataStream HKDF here and no verifier to derive from.
             self._ctx.datastream_video_key = framing.derive_datastream_video_key(
                 self._verifier, self._ctx.stream_connection_id
             )
@@ -769,12 +769,13 @@ class MirrorSession:
         # type in common beyond these two.
         v_transport: asyncio.BaseTransport
         v_channel: streams.SendChannel
-        if _airparrot_mode():
-            # AirParrot's mirror video is a RAW TCP connection to dataPort
+        if _tcp_mode():
+            # The reference sender's mirror video is a RAW TCP connection to dataPort
             # (no HAP/ChaCha layer; the AES-CTR on each frame is the only
-            # encryption). Verified by decrypting AirParrot's live TCP stream.
+            # encryption). Verified by decrypting the reference sender's live TCP
+            # stream.
             v_transport, v_channel = await loop.create_connection(
-                airparrot_stream.RawVideoTCPChannel,
+                tcp_stream.RawVideoTCPChannel,
                 addr,
                 self._ctx.video_data_port,
             )
@@ -807,10 +808,10 @@ class MirrorSession:
         # The modern mirror flow negotiates the video stream only (Phase 28
         # capture shows a single type-110 stream); audio is not part of the
         # screen-mirroring SETUP. Open the audio channel only if a port was
-        # actually negotiated. In AirParrot mode the audio channel is NOT a
+        # actually negotiated. In TCP mode the audio channel is NOT a
         # HAP-encrypted channel (no verifier); skip it for now (video-only
         # render — the receiver still switches to mirror on the video stream).
-        if self._ctx.audio_data_port and not _airparrot_mode():
+        if self._ctx.audio_data_port and not _tcp_mode():
             a_transport, a_channel = await self._open_channel(
                 streams.AudioStreamChannel,
                 addr,
@@ -822,7 +823,7 @@ class MirrorSession:
             self._audio_transport, self._audio_channel = a_transport, a_channel
 
     async def _stream_screen_audio(self) -> None:
-        """Send screen audio as AAC-ELD over UDP/RTP (AirParrot dialect).
+        """Send screen audio as AAC-ELD over UDP/RTP (TCP dialect).
 
         VERIFIED playing on tvOS 26 (mic-confirmed +15 dB, drops on stop). The
         key detail: the sync (0xD4) MUST be sent FROM the advertised controlPort
@@ -831,8 +832,9 @@ class MirrorSession:
         Gated behind MIRROR_AUDIO_SEND. Reads length-prefixed AAC-ELD frames
         (4-byte BE length + frame, repeated) from MIRROR_AUDIO_ELD_FILE and
         sends them as RTP packets to the type-96 audio dataPort, AES-128-CBC
-        encrypted with (key=raw16, iv=eiv). See airparrot_audio.py + the audio
-        spec. If no file is set, sends nothing (matches AirParrot on silence).
+        encrypted with (key=raw16, iv=eiv). See screen_audio.py + the audio
+        spec. If no file is set, sends nothing (matches the reference sender on
+        silence).
         """
         # One method because the sequence -- key derivation, two sockets,
         # the sync packet, then the send loop -- has to be read in order.
@@ -921,16 +923,17 @@ class MirrorSession:
                 lambda: _AudioDP("CTRL"), remote_addr=(addr, ctrl_port)
             )
         spf = int(os.environ.get("MIRROR_AUDIO_SPF", "480"))
-        latency = 2205  # matches AirParrot's captured sync (now - now_without_latency)
+        # matches the reference sender's captured sync (now - now_without_latency)
+        latency = 2205
         base_ts = int(time.time()) & 0xFFFFFFFF
-        pk = airparrot_audio.AirParrotAudioPacketizer(
+        pk = screen_audio.ScreenAudioPacketizer(
             key, iv, ssrc=0, spf=spf, base_ts=base_ts
         )
-        interval = spf / airparrot_audio.AUDIO_SAMPLE_RATE
+        interval = spf / screen_audio.AUDIO_SAMPLE_RATE
         sync_every = int(
             os.environ.get(
                 "MIRROR_AUDIO_SYNC_EVERY",
-                str(max(1, int(airparrot_audio.AUDIO_SAMPLE_RATE / spf))),
+                str(max(1, int(screen_audio.AUDIO_SAMPLE_RATE / spf))),
             )
         )  # ~1/s
 
@@ -966,7 +969,7 @@ class MirrorSession:
             # (NTP-since-1900 via ntp_now), or the receiver correlates two
             # epochs 2.2e9 s apart and re-syncs the audio every sync packet
             # (~1/s) — an audible glitch each second.
-            sync = airparrot_audio.build_audio_sync_packet(
+            sync = screen_audio.build_audio_sync_packet(
                 first, pk.timestamp, latency, raop_timing.ntp_now()
             )
             try:
@@ -1078,10 +1081,10 @@ class MirrorSession:
             if ctrl_udp is not None:
                 ctrl_udp.close()
 
-    async def _airparrot_live_video(
+    async def _tcp_live_video(
         self, live_cmd: str, video_q: "asyncio.Queue", video_encryptor
     ) -> None:
-        """Stream a LIVE H.264 source (AirParrot dialect) in real time.
+        """Stream a LIVE H.264 source (TCP dialect) in real time.
 
         ``live_cmd`` is a shell command that writes an Annex-B H.264 elementary
         stream to stdout (e.g. ``yt-dlp -o - <url> | ffmpeg ... -f h264 -``).
@@ -1095,7 +1098,7 @@ class MirrorSession:
         fps = max(self._ctx.fps, 1)
         frame_interval = 1.0 / fps
         w, h = float(self._ctx.width), float(self._ctx.height)
-        geometry = airparrot_stream.build_geometry(w, h, 0.0, 0.0, w, h)
+        geometry = tcp_stream.build_geometry(w, h, 0.0, 0.0, w, h)
         loop = asyncio.get_event_loop()
 
         proc = await asyncio.create_subprocess_shell(
@@ -1136,7 +1139,7 @@ class MirrorSession:
                     elif t == 6:
                         cur.append(nal)  # SEI belongs to the next AU
                     # VCL slice -> completes an access unit. Narrower than
-                    # ``airparrot_stream._VCL_TYPES`` (1..5), which is the same
+                    # ``tcp_stream._VCL_TYPES`` (1..5), which is the same
                     # concept spelled a second way; see the note there. They
                     # agree on any real stream: 2/3/4 are Extended-profile data
                     # partitions that Baseline/Main/High forbid.
@@ -1164,13 +1167,13 @@ class MirrorSession:
                 _LOGGER.warning("live video: no SPS/PPS from source; aborting")
                 return
 
-            config = airparrot_stream.build_avcc_config(state["sps"], state["pps"])
-            config_hdr = airparrot_stream.build_data_header(
+            config = tcp_stream.build_avcc_config(state["sps"], state["pps"])
+            config_hdr = tcp_stream.build_data_header(
                 len(config),
                 0,
                 geometry,
                 # pylint: disable-next=protected-access
-                msg_type=airparrot_stream._CONFIG_TYPE,
+                msg_type=tcp_stream._CONFIG_TYPE,
                 dims=(w, h),
             )
             await video_q.put(config_hdr + config)
@@ -1197,11 +1200,11 @@ class MirrorSession:
                 else:
                     au = live_q.get_nowait()
                 au = [n for n in au if (n[0] & 0x1F) not in (7, 8)]
-                avcc = airparrot_stream.to_avcc(au)
+                avcc = tcp_stream.to_avcc(au)
                 ciphertext = video_encryptor.encrypt(avcc)
                 # Real monotonic clock at send time: always increasing, so the
                 # receiver keeps advancing its display even across underruns.
-                header = airparrot_stream.build_data_header(
+                header = tcp_stream.build_data_header(
                     len(ciphertext), time.monotonic_ns(), geometry
                 )
                 await video_q.put(header + ciphertext)
@@ -1268,10 +1271,10 @@ class MirrorSession:
 
         # PROVEN video-key recipe (default when no explicit KEYBUF_WINDOW sweep).
         #
-        # Reverse-engineered and byte-verified against AirParrot 3's live
+        # Reverse-engineered and byte-verified against the reference sender's live
         # derivation on a tvOS 26 receiver (LLDB, 2026-08-23 — see
         # docs/.../2026-08-23-mirror-video-key-handoff.md SESSION 3 and memory
-        # note project-mirror-video-key-solved). AirParrot's
+        # note project-mirror-video-key-solved). The reference sender's
         # _SQAirPlayClientSessionDeriveKeyAndIV binds the FairPlay SAP secret
         # with the pair-verify X25519 shared secret, then hashes per stream:
         #
@@ -1297,7 +1300,7 @@ class MirrorSession:
                 raw16_off = int(os.environ.get("MIRROR_RAW16_OFF", "8"))
                 raw16 = self._ctx.sap_context[raw16_off : raw16_off + 16]
             # The screen video key uses the MEDIA-connection pair-verify's X25519
-            # shared secret (AirParrot's raw /pair-verify), NOT the main HAP
+            # shared secret (the reference sender's raw /pair-verify), NOT the main HAP
             # pair-verify. MIRROR_PAIR32 (hex) supplies that media pair-verify
             # shared when pyatv relays the raw pair-verify.
             _pair32_ovr = os.environ.get("MIRROR_PAIR32")
@@ -1307,14 +1310,14 @@ class MirrorSession:
             else:
                 pair32 = getattr(getattr(self._verifier, "srp", None), "_shared", None)
             if len(raw16) == 16 and pair32 and len(pair32) == 32:
-                # AirParrot's live session bound the FairPlay secret with the
+                # The reference sender's live session bound the FairPlay secret with the
                 # pair-verify secret (flag[0xb0]==1). pyatv's simpler SETUP may
                 # take the flag==0 path where raw16 is used directly.
                 # MIRROR_PAIR_TRANSFORM=0 selects the direct path.
                 _flag = os.environ.get("MIRROR_PAIR_TRANSFORM", "1") != "0"
-                secret16 = framing.airparrot_secret16(raw16, bytes(pair32), _flag)
+                secret16 = framing.stream_secret16(raw16, bytes(pair32), _flag)
                 sid = self._ctx.stream_connection_id
-                key, iv = framing.derive_airparrot_stream_key_iv(
+                key, iv = framing.derive_tcp_stream_key_iv(
                     raw16, bytes(pair32), sid, flag=_flag
                 )
                 if os.environ.get("MIRROR_CORRUPT_VIDEO_KEY"):
@@ -1478,27 +1481,27 @@ class MirrorSession:
                 enc.roc_trailer = roc_trailer
                 srtp_encs.append(enc)
 
-        async def airparrot_video_producer() -> None:  # pylint: disable=too-many-locals
-            """Send one raw-TCP message per H.264 access unit (AirParrot).
+        async def tcp_video_producer() -> None:  # pylint: disable=too-many-locals
+            """Send one raw-TCP message per H.264 access unit (TCP dialect).
 
             Each message = 128-byte header + AES-128-CTR ciphertext, where the
             ciphertext is a single CONTINUOUS keystream across the whole stream
             (no per-frame reset) and the plaintext is the access unit in AVCC
-            form (4-byte BE length + NAL per unit). Verified against AirParrot's
-            live stream — see airparrot_stream.py.
+            form (4-byte BE length + NAL per unit). Verified against the reference
+            sender's live stream — see tcp_stream.py.
             """
             live_cmd = os.environ.get("MIRROR_LIVE_CMD")
             if live_cmd:
-                await self._airparrot_live_video(live_cmd, video_q, video_encryptor)
+                await self._tcp_live_video(live_cmd, video_q, video_encryptor)
                 return
             h264 = Path(self._h264_path).read_bytes()
             nalus = pacer.split_nalus(h264)
             # SPS/PPS are transported PLAINTEXT in the avcC config, NOT in the
-            # encrypted frames (verified against AirParrot's stream), so strip
-            # them from the frame NALs.
+            # encrypted frames (verified against the reference sender's stream), so
+            # strip them from the frame NALs.
             sps = next((n for n in nalus if pacer.nal_type(n) == 7), None)
             pps = next((n for n in nalus if pacer.nal_type(n) == 8), None)
-            # AirParrot's video frames carry only [SEI][slice]; SPS/PPS live
+            # The reference sender's video frames carry only [SEI][slice]; SPS/PPS live
             # solely in the plaintext avcC config built below. Match that so
             # the receiver's screen decoder sees the same structure.
             # MIRROR_STRIP_SPSPPS=0 leaves them in the frames, for
@@ -1507,10 +1510,10 @@ class MirrorSession:
             frame_nalus = [
                 n for n in nalus if not strip_ps or pacer.nal_type(n) not in (7, 8)
             ]
-            units = airparrot_stream.group_access_units(frame_nalus, pacer.nal_type)
+            units = tcp_stream.group_access_units(frame_nalus, pacer.nal_type)
             if not units or sps is None or pps is None:
                 _LOGGER.warning(
-                    "AirParrot video: missing SPS/PPS or no access units "
+                    "TCP video: missing SPS/PPS or no access units "
                     "(sps=%s pps=%s units=%d)",
                     sps is not None,
                     pps is not None,
@@ -1524,23 +1527,23 @@ class MirrorSession:
                 geometry = bytes.fromhex(geom_hex)
             else:
                 w, h = float(self._ctx.width), float(self._ctx.height)
-                geometry = airparrot_stream.build_geometry(w, h, 0.0, 0.0, w, h)
+                geometry = tcp_stream.build_geometry(w, h, 0.0, 0.0, w, h)
 
             # 1) FIRST message: plaintext avcC decoder config (type 0x01000600),
             #    so the receiver can initialise its H.264 decoder. Not encrypted,
             #    so it does not advance the continuous AES-CTR keystream.
-            config = airparrot_stream.build_avcc_config(sps, pps)
-            config_hdr = airparrot_stream.build_data_header(
+            config = tcp_stream.build_avcc_config(sps, pps)
+            config_hdr = tcp_stream.build_data_header(
                 len(config),
                 0,
                 geometry,
                 # pylint: disable-next=protected-access
-                msg_type=airparrot_stream._CONFIG_TYPE,
+                msg_type=tcp_stream._CONFIG_TYPE,
                 dims=(float(self._ctx.width), float(self._ctx.height)),
             )
             await video_q.put(config_hdr + config)
             _LOGGER.info(
-                "AirParrot video: sent avcC config (%d B), %d access units, "
+                "TCP video: sent avcC config (%d B), %d access units, "
                 "continuous AES-CTR",
                 len(config),
                 len(units),
@@ -1548,8 +1551,8 @@ class MirrorSession:
 
             # 2) Then encrypted frames (type 0x00000600), continuous keystream.
             # The header timestamp ([8:16]) is a large monotonic mach-style value
-            # (AirParrot uses mach_absolute_time); a 0-based value can fail the
-            # receiver's timing validation.
+            # (the reference sender uses mach_absolute_time); a 0-based value can fail
+            # the receiver's timing validation.
             ts_base = time.monotonic_ns()
             _LOGGER.debug(
                 "producer video_encryptor key=%s iv=%s",
@@ -1568,12 +1571,12 @@ class MirrorSession:
             _pace_start = _loop_time()
             while True:
                 unit = units[index % len(units)]
-                avcc = airparrot_stream.to_avcc(unit)
+                avcc = tcp_stream.to_avcc(unit)
                 if int(os.environ.get("MIRROR_ET", "32")) == 32:
                     ciphertext = video_encryptor.encrypt(avcc)  # continuous keystream
                 else:
                     ciphertext = avcc  # et=1/0: no stream-level encryption
-                header = airparrot_stream.build_data_header(
+                header = tcp_stream.build_data_header(
                     len(ciphertext), ts_base + index * ns_per_frame, geometry
                 )
                 await video_q.put(header + ciphertext)
@@ -1658,7 +1661,7 @@ class MirrorSession:
                         raw[:160],
                     )
 
-        producer = airparrot_video_producer if _airparrot_mode() else video_producer
+        producer = tcp_video_producer if _tcp_mode() else video_producer
         # EXTEND, never replace: run() and _open_event_channel() have already
         # registered the screen-audio sender and the event-channel POST
         # /command responder here. Assigning drops them from the list, so

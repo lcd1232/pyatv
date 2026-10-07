@@ -1,6 +1,6 @@
 """Tests for the FPLY v3 wire format and handshake state machine.
 
-Spec references: /tmp/airparrot_fply_spec_v3.md (sections cited inline).
+Spec references: /tmp/fply_spec_v3.md (sections cited inline).
 
 This file covers the framing — M1, M2 parsing, M3 assembly, the state
 machine and the async runner.  The known-answer tests for what goes IN the
@@ -266,7 +266,7 @@ def test_handshake_build_m1_returns_16_bytes():
     h = fply.FPLYHandshake()
     m1 = h.build_m1()
     assert len(m1) == 16
-    # FPLYHandshake defaults to mode 1 (matches AirParrot capture).
+    # FPLYHandshake defaults to mode 1 (matches the reference sender's capture).
     assert m1 == fply.build_m1(1)
 
 
@@ -405,10 +405,10 @@ async def test_run_fply_handshake_raises_on_m3_non_200():
 # ---------------------------------------------------------------------------
 
 
-# 5 ground-truth triples captured from runtime AirParrot 3 (Mac native build)
-# via Frida (snap_complete / m2stepper_capture2 instrumentation).  Each is
-# (iv_hex, message_hex_64bytes, expected_output_hex).  All five reproduce
-# byte-perfectly through `m2_stepper_compress`.
+# 5 ground-truth triples captured from the reference sender at runtime (Mac native
+# build) via Frida (snap_complete / m2stepper_capture2 instrumentation). Each is
+# (iv_hex, message_hex_64bytes, expected_output_hex). All five reproduce byte-perfectly
+# through `m2_stepper_compress`.
 _M2_STEPPER_TRIPLES = (
     (
         "dcdcf3b90b74dcfb867ff76016729051",
@@ -478,7 +478,7 @@ def test_m2_stepper2_compress_signature():
 
 def test_m2_stepper2_compress_validated_block1_macp1():
     """STEPPER2 validated against the Unicorn emulator (which is bit-perfect
-    against real AirParrot 3 binary in trace-replay mode WHEN configured
+    against the real reference sender binary in trace-replay mode WHEN configured
     with non-session-aligned VM addresses). The 16-byte output
     be3496aacd2e73de6e6d0cb54fec78fa is the protocol-correct output
     (i.e. what AirPlay 2 receivers expect, per @systemcrash's
@@ -523,7 +523,7 @@ def test_the_shipped_saphash_still_matches_the_vendored_gplv2_one():
     """The recovered SAPHash reproduces the vendored GPLv2 one, exactly.
 
     ``m2_stepper2_compress`` now runs ``fairplay_sap.region_a.hash_block``,
-    recovered from the AirParrot 3 binary by devirtualisation rather than
+    recovered from the reference sender's binary by devirtualisation rather than
     from the GPLv2 source.  ``_saphash_systemcrash/_saphash.py`` -- derived
     work from openairplay/airplay2-receiver, vendored into an MIT project --
     is no longer on any code path.
