@@ -22,6 +22,11 @@ from pyatv.support.rtsp import RtspSession
 
 from tests.protocols.airplay.mirror.fake_receiver import FakeMirrorReceiver
 
+# Five seconds of ffmpeg's testsrc, 1280x720 at 30 fps, baseline H.264 with
+# an IDR every 30 frames and no B-frames:
+#   ffmpeg -f lavfi -i testsrc=size=1280x720:rate=30 -t 5 -c:v libx264 \
+#     -profile:v baseline -g 30 -keyint_min 30 -sc_threshold 0 -bf 0 \
+#     -pix_fmt yuv420p -f h264 test_pattern.h264
 TEST_FILE = Path(__file__).parent / "test_pattern.h264"
 
 #: Recorded FPLY v3 handshakes (``m2`` in, ``ekey``/``raw16`` out) captured from
