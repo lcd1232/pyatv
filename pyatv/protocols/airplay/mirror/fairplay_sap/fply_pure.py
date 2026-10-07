@@ -118,9 +118,6 @@ REGION_A_KEYS = [
     bytes.fromhex("0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d"),
 ]
 ROUND_MASK = bytes([0x0D]) * 16
-# The middle three blocks of the M2 payload, a convenient window for
-# checking `decrypt_m2` before the CBC chaining XOR is applied.
-M2_CIPHERTEXT = slice(62, 110)
 
 
 def decrypt_m2(block):

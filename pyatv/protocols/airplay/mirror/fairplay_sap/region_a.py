@@ -83,7 +83,7 @@ MESSAGE_A = bytes.fromhex(
 )
 
 # The seventeen-byte constants that top and tail each call's message
-# (masked).  SUFFIX_1 and PREFIX_2 are saphash.CONSTANT_17A and CONSTANT_17B.
+# (masked).
 PREFIX_1 = bytes.fromhex("f791a04046652b8172fe8594d39f239813")
 SUFFIX_1 = bytes.fromhex("e1432a53f0ffe53d9aa37df6ed0d321134")
 PREFIX_2 = bytes.fromhex("ad49914004e9b07263c8ddc13890aa4b77")

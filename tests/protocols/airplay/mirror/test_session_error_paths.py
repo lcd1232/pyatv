@@ -329,7 +329,7 @@ async def test_missing_pair32_logs_proven_key_unavailable(monkeypatch, caplog):
     matching = [
         r.getMessage()
         for r in caplog.records
-        if "PROVEN video key unavailable" in r.getMessage()
+        if "Video stream key unavailable" in r.getMessage()
     ]
     assert matching, [r.getMessage() for r in caplog.records]
     assert "raw16=16B" in matching[0], matching[0]

@@ -838,7 +838,7 @@ class MirrorSession:
                 if self._ctx.video_encryptor is None:
                     video_encryptor = framing.MirrorEncryptor.from_key_iv(key, iv)
                 _LOGGER.debug(
-                    "PROVEN video key: streamID=%s raw16=%s pair32=%s secret16=%s "
+                    "Video stream key: streamID=%s raw16=%s pair32=%s secret16=%s "
                     "key=%s iv=%s",
                     sid,
                     raw16.hex(),
@@ -849,7 +849,7 @@ class MirrorSession:
                 )
             else:
                 _LOGGER.warning(
-                    "PROVEN video key unavailable: raw16=%dB pair32=%s — "
+                    "Video stream key unavailable: raw16=%dB pair32=%s — "
                     "falling back to the MFiSAP stream encryptor",
                     len(raw16),
                     "None" if not pair32 else f"{len(pair32)}B",

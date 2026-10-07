@@ -72,8 +72,6 @@ __all__ = [
     "MAC_KEY_MASK",
     "MAC_AT",
     "WRAP_AT",
-    "LIVE_CONTEXT",
-    "DEAD_CONTEXT",
     "VECTORS",
 ]
 
@@ -90,16 +88,6 @@ WRAP_AT = slice(0x38, 0x48)  # the 16-byte wrapped secret
 
 # FPLY's usual byte mask, the one `fply_md5.SECRET_MASK` also applies
 MAC_KEY_MASK = 0x0D
-
-# The bytes of the 276-byte FairPlay context the ekey depends on: two
-# integrity gates (any change yields an empty ekey) and the encrypted SAP
-# secret.  DEAD_CONTEXT is never read.
-LIVE_CONTEXT = (
-    (0, 16, "gate"),
-    (16, 48, "the encrypted SAP secret"),
-    (256, 273, "gate"),
-)
-DEAD_CONTEXT = ((48, 256), (273, 276))
 
 
 def mac_key(sap36: bytes) -> bytes:

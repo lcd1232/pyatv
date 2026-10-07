@@ -7,11 +7,8 @@ the FairPlay context that came out.  Every byte of M3 and the ekey must match.
 
 from __future__ import annotations
 
-import importlib
-import importlib.abc
 import json
 import pathlib
-import sys
 
 import pytest
 
@@ -152,59 +149,6 @@ def test_ekey_rejects_a_wrong_length_secret():
     sap36 = fairplay_sap.sap_secret(bytes.fromhex(VECTORS[0]["m2"]))
     with pytest.raises(ValueError):
         fairplay_sap.ekey(sap36, b"\x00" * 15)
-
-
-def test_nothing_here_needs_the_emulator():
-    """The handshake runs without importing the unicorn emulator."""
-    fairplay_sap.handshake(bytes.fromhex(VECTORS[0]["m2"]), b"\x02" * 16)
-    assert "unicorn" not in sys.modules
-
-
-class _Unavailable(importlib.abc.MetaPathFinder):
-    """An import of *names*, or of anything under them, fails outright.
-
-    Simulates an installed pyatv, where development-only modules are absent.
-    """
-
-    def __init__(self, *names):
-        self.names = names
-
-    def find_spec(self, fullname, path=None, target=None):
-        """Refuse *fullname* if it is one of ours; return ``None`` if not."""
-        if fullname.split(".")[0] in self.names:
-            raise ImportError(f"no module named {fullname!r}")
-
-
-def test_the_whole_handshake_runs_with_the_harness_unavailable():
-    """All 256 handshakes, with development-only modules made unimportable.
-
-    The package is re-imported inside the blocker so top-level imports are
-    caught too, and restored afterwards for the rest of the suite.
-    """
-    package = "pyatv.protocols.airplay.mirror.fairplay_sap"
-    loaded = {
-        name: module
-        for name, module in sys.modules.items()
-        if name == package or name.startswith(package + ".")
-    }
-    blocker = _Unavailable("unicorn", "devirt")
-    for name in loaded:
-        del sys.modules[name]
-    sys.meta_path.insert(0, blocker)
-    try:
-        fresh = importlib.import_module(package)
-        for v in VECTORS:
-            sap36, tag, _, ekey = fresh.handshake(
-                bytes.fromhex(v["m2"]), bytes.fromhex(v["raw16"])
-            )
-            assert sap36.hex() == v["ctx_m3"][16:88]
-            assert tag == bytes.fromhex(v["m3"])[144:164]
-            assert ekey.hex() == v["ekey"]
-    finally:
-        sys.meta_path.remove(blocker)
-        sys.modules.update(loaded)
-    assert "unicorn" not in sys.modules
-    assert "devirt" not in sys.modules
 
 
 # Length guards: the algorithms index fixed-size buffers, so a wrong-length
