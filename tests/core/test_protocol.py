@@ -2,6 +2,7 @@
 
 import asyncio
 from functools import partial
+import logging
 import math
 from typing import Any, Optional
 from unittest.mock import MagicMock
@@ -139,13 +140,28 @@ async def test_message_is_passed_to_send(monitor):
 # MessageDispatcher
 
 
-async def test_simple_dispatch():
+async def test_simple_dispatch(caplog):
+    """Both an async and a plain listener receive their message.
+
+    The two halves take different paths through ``dispatch``: a coroutine
+    function becomes an awaitable task, while a plain one is handed to
+    ``loop.call_soon`` and produces no task at all. That is why the second
+    half needs a loop turn before asserting -- ``gather()`` over an empty
+    task list returns before ``call_soon`` has run anything.
+
+    The log is checked too. ``_call_listener`` catches and logs anything a
+    listener raises, which is right -- one bad listener must not stop the
+    others -- but it also means a broken listener looks exactly like a
+    working one from out here. This test used to call an undefined name and
+    assert on the wrong mock, and passed for precisely that reason.
+    """
+    caplog.set_level(logging.ERROR, logger="pyatv.core.protocol")
     test_mock = MagicMock()
 
     async def dispatch_func1(mock, message: bytes) -> None:
         mock.func1(message)
 
-    def dispatch_func2(message: bytes) -> None:
+    def dispatch_func2(mock, message: bytes) -> None:
         mock.func2(message)
 
     dispatcher = MessageDispatcher[int, bytes]()
@@ -156,7 +172,10 @@ async def test_simple_dispatch():
     test_mock.func1.assert_called_once_with(b"123")
 
     await asyncio.wait_for(asyncio.gather(*dispatcher.dispatch(2, b"456")), 5.0)
-    test_mock.func1.assert_called_once_with(b"123")
+    await asyncio.sleep(0)  # let call_soon deliver before asserting
+    test_mock.func2.assert_called_once_with(b"456")
+
+    assert "error during dispatch" not in caplog.text, caplog.text
 
 
 async def test_dispatch_with_filter():
@@ -172,7 +191,7 @@ async def test_dispatch_with_filter():
     )
 
     await asyncio.wait_for(asyncio.gather(*dispatcher.dispatch(1, 1)), 5.0)
-    assert dispatched_value == None
+    assert dispatched_value is None
 
     await asyncio.wait_for(asyncio.gather(*dispatcher.dispatch(1, 2)), 5.0)
     assert dispatched_value == 2

@@ -24,7 +24,7 @@ from pyatv.const import (
     Protocol,
 )
 from pyatv.core import AbstractPushUpdater, OutputDeviceState, SetupData, UpdatedState
-from pyatv.core.facade import FacadeAppleTV, SetupData
+from pyatv.core.facade import FacadeAppleTV
 from pyatv.interface import (
     AppleTV,
     Apps,

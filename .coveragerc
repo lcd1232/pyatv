@@ -1,5 +1,11 @@
 [run]
 source = pyatv
+# The FairPlay ports under pyatv/protocols/airplay/mirror/fairplay_sap/ are
+# long straight-line code run on every one of 256 golden handshakes -- the
+# pathological case for a per-line trace callback.  PEP 669 monitoring
+# disables itself per line once a line is seen.  coverage falls back to the
+# default core where sys.monitoring is unavailable (Python < 3.12).
+core = sysmon
 
 omit =
     pyatv/scripts/*.py

@@ -11,6 +11,7 @@ import plistlib
 from random import randrange
 from typing import Any, Dict, Mapping, NamedTuple, Optional, Tuple, Union
 
+from pyatv import exceptions
 from pyatv.protocols.dmap import tags
 from pyatv.support import async_timeout
 from pyatv.support.http import HttpConnection, HttpResponse, decode_bplist_from_body
@@ -87,6 +88,10 @@ class RtspSession:
         self.session_id: int = randrange(2**32)
         self.dacp_id: str = f"{randrange(2 ** 64):X}"
         self.active_remote: int = randrange(2**32)
+        # Overridable per session: AirPlay 2 screen mirroring is only offered
+        # to senders advertising a recent enough AirPlay version (a real macOS
+        # sender reports AirPlay/870.14.1 -- Phase 28 capture).
+        self.user_agent: str = USER_AGENT
 
     @property
     def uri(self) -> str:
@@ -152,6 +157,15 @@ class RtspSession:
             allow_error=requires_password,
         )
 
+        # `allow_error` above was opted into for the 401 digest challenge
+        # handled below -- but it also suppresses the 403 that HttpConnection
+        # would otherwise raise AuthenticationError for, and this method's
+        # only caller discards the response. Without this, a receiver that
+        # refuses the ANNOUNCE outright is indistinguishable from one that
+        # accepted it, and the failure surfaces much later as something else.
+        if requires_password and response.code == 403:
+            raise exceptions.AuthenticationError("not authenticated")
+
         # Save the necessary data for password authentication
         www_authenticate = response.headers.get("www-authenticate", None)
         if response.code == 401 and www_authenticate and requires_password:
@@ -171,9 +185,10 @@ class RtspSession:
         self,
         headers: Optional[Dict[str, Any]] = None,
         body: Optional[Union[str, bytes, dict]] = None,
+        timeout: float = 4.0,
     ) -> HttpResponse:
         """Send SETUP message."""
-        return await self.exchange("SETUP", headers=headers, body=body)
+        return await self.exchange("SETUP", headers=headers, body=body, timeout=timeout)
 
     async def record(
         self,
@@ -260,6 +275,7 @@ class RtspSession:
         body: Optional[Union[str, bytes, dict]] = None,
         allow_error: bool = False,
         protocol: str = "RTSP/1.0",
+        timeout: float = 4.0,
     ) -> HttpResponse:
         """Send a RTSP message and return response."""
         cseq = self.cseq
@@ -281,6 +297,12 @@ class RtspSession:
         if headers:
             hdrs.update(headers)
 
+        # A caller can suppress one of the defaults above by passing it as
+        # None. AirPlay 2 screen mirroring needs this: DACP-ID/Active-Remote/
+        # Client-Instance are RAOP remote-control headers and a real mirroring
+        # sender does not send them (Phase 28 capture).
+        hdrs = {k: v for k, v in hdrs.items() if v is not None}
+
         # If body is a dict, assume that payload should be sent as a binary plist
         if isinstance(body, dict):
             hdrs["Content-Type"] = BPLIST_CONTENT_TYPE
@@ -294,7 +316,7 @@ class RtspSession:
             method,
             uri or self.uri,
             protocol=protocol,
-            user_agent=USER_AGENT,
+            user_agent=self.user_agent,
             content_type=content_type,
             headers=hdrs,
             body=body,
@@ -313,7 +335,7 @@ class RtspSession:
 
         # Wait for response to the CSeq we expect
         try:
-            async with async_timeout(4):
+            async with async_timeout(timeout):
                 await self.requests[cseq][0].wait()
             response = self.requests[cseq][1]
         except asyncio.TimeoutError as ex:
