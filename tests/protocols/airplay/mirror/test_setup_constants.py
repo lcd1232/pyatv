@@ -10,6 +10,7 @@ Per-session values (``streamConnectionID``, ``sessionUUID``, ports,
 from __future__ import annotations
 
 import asyncio
+import collections
 import contextlib
 import copy
 import pathlib
@@ -562,7 +563,7 @@ async def test_screen_audio_sends_rtp_packets_for_each_eld_frame(monkeypatch, tm
         sess,
     ):
         await stream_then_stop(receiver, sess, video_frames=3)
-        packets = list(receiver.audio_data_server.datagrams)
+        packets = receiver.audio_data_server.originals()
         syncs = list(receiver.audio_control_server.datagrams)
         sync_sources = list(receiver.audio_control_server.sources)
         spf = receiver.audio_setup_body["streams"][0]["spf"]
@@ -759,7 +760,7 @@ async def test_the_periodic_audio_sync_goes_out_once_every_sync_every_frames(
         sess,
     ):
         await stream_then_stop(receiver, sess, video_frames=3)
-        packets = list(receiver.audio_data_server.datagrams)
+        packets = receiver.audio_data_server.originals()
         syncs = list(receiver.audio_control_server.datagrams)
 
     assert (
@@ -794,7 +795,7 @@ async def test_screen_audio_stays_silent_when_half_its_key_is_missing(
         sess,
     ):
         await stream_then_stop(receiver, sess, video_frames=3)
-        packets = list(receiver.audio_data_server.datagrams)
+        packets = receiver.audio_data_server.originals()
         syncs = list(receiver.audio_control_server.datagrams)
 
     assert not packets, "audio was sent under a key derived from half its input"
@@ -832,3 +833,29 @@ async def test_every_setup_shares_one_eiv(monkeypatch):
     }
     assert len(eivs) == 1, eivs
     assert len(eivs.pop()) == 16
+
+
+async def test_every_audio_packet_is_sent_twice(monkeypatch, tmp_path):
+    """Each screen-audio packet goes out ``redundantAudio`` times, the copy
+    one frame after the original, as the SETUP announces (AirParrot does
+    the same)."""
+    frame = bytes(range(48))
+    eld = tmp_path / "frames.eld"
+    eld.write_bytes(b"".join(len(frame).to_bytes(4, "big") + frame for _ in range(8)))
+    async with driven_session(monkeypatch, session_kwargs={"eld_path": eld}) as (
+        receiver,
+        sess,
+    ):
+        await stream_then_stop(receiver, sess, video_frames=3)
+        seqs = [
+            int.from_bytes(d[2:4], "big") for d in receiver.audio_data_server.datagrams
+        ]
+
+    assert receiver.audio_setup_body["streams"][0]["redundantAudio"] == 2
+    assert len(seqs) >= 4, seqs
+    # Original n, then the copy of n-1: 0, 1, 0, 2, 1, 3, 2, ...
+    expected = [0] + [x for n in range(1, len(seqs)) for x in (n, n - 1)]
+    assert seqs == expected[: len(seqs)], seqs
+    # Every packet but the newest has been sent exactly twice.
+    counts = collections.Counter(seqs)
+    assert all(counts[n] == 2 for n in range(max(seqs))), counts

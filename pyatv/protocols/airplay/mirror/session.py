@@ -18,6 +18,7 @@ PairVerifyProcedure, and a filled-in MirrorContext.
 from __future__ import annotations
 
 import asyncio
+import collections
 import contextlib
 import hashlib
 import logging
@@ -377,7 +378,7 @@ class MirrorSession:
                     "streamConnectionID": audio_id,
                     "latencyMin": 3750,
                     "latencyMax": 3750,
-                    "redundantAudio": 2,
+                    "redundantAudio": screen_audio.AUDIO_REDUNDANCY,
                     "ct": 8,
                     "spf": screen_audio.AUDIO_SAMPLES_PER_FRAME,
                     "audioFormat": 16777216,
@@ -668,6 +669,10 @@ class MirrorSession:
             ctrl_port,
         )
         idx = 0
+        # The packets still owed a copy, newest first (see AUDIO_REDUNDANCY).
+        resend: collections.deque = collections.deque(
+            maxlen=screen_audio.AUDIO_REDUNDANCY - 1
+        )
         try:
             _send_sync(first=True)
             # Pace against a wall-clock schedule (frame N due at
@@ -688,7 +693,11 @@ class MirrorSession:
                         frame = live_audio_q.get_nowait()
                 else:
                     frame = frames[idx % len(frames)]
-                self._audio_udp.sendto(pk.next_packet(frame))
+                packet = pk.next_packet(frame)
+                self._audio_udp.sendto(packet)
+                for copy in resend:
+                    self._audio_udp.sendto(copy)
+                resend.appendleft(packet)
                 idx += 1
                 if idx % sync_every == 0:
                     _send_sync(first=False)

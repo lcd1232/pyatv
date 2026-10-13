@@ -105,6 +105,12 @@ class ScreenAudioPacketizer:
         return self._ts
 
 
+#: Copies of every screen-audio packet sent, announced in SETUP as
+#: ``redundantAudio``. A copy goes out one frame after the original, so a lost
+#: datagram is usually covered; the receiver drops duplicates by sequence
+#: number. AirParrot sends two.
+AUDIO_REDUNDANCY = 2
+
 #: ``streams[0]`` fields of the screen-audio SETUP that tvOS 27 needs: without
 #: them (and the session SETUP) it accepts the stream and never plays it.
 #: AirParrot 3.1.9 added them.
@@ -123,7 +129,7 @@ def audio_setup_stream_params(stream_connection_id: int) -> dict:
         "streamConnectionID": stream_connection_id,
         "latencyMin": 3750,
         "latencyMax": 3750,
-        "redundantAudio": 2,
+        "redundantAudio": AUDIO_REDUNDANCY,
         "ct": 8,
         "spf": AUDIO_SAMPLES_PER_FRAME,
         "audioFormat": 0x1000000,

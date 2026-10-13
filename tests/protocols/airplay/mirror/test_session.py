@@ -254,7 +254,7 @@ async def test_the_screen_audio_key_hashes_raw16_before_pair32(monkeypatch, tmp_
         sess,
     ):
         await stream_then_stop(receiver, sess, video_frames=3)
-        packets = list(receiver.audio_data_server.datagrams)
+        packets = receiver.audio_data_server.originals()
         raw16 = sess._ctx.stream_raw16  # noqa: SLF001
         eiv = sess._ctx.audio_eiv  # noqa: SLF001
 
@@ -306,7 +306,7 @@ async def test_a_full_live_audio_queue_drops_the_oldest_frame(monkeypatch, tmp_p
                 if asyncio.get_event_loop().time() > deadline:
                     break
                 await asyncio.sleep(0.01)
-            packets = list(receiver.audio_data_server.datagrams)
+            packets = receiver.audio_data_server.originals()
             raw16 = sess._ctx.stream_raw16  # noqa: SLF001
             eiv = sess._ctx.audio_eiv  # noqa: SLF001
         finally:
@@ -357,14 +357,14 @@ async def test_the_live_audio_reader_accepts_a_frame_of_exactly_the_cap(
         task = asyncio.ensure_future(sess.run())
         try:
             deadline = asyncio.get_event_loop().time() + GUARD_TIMEOUT
-            while len(receiver.audio_data_server.datagrams) < len(frames):
+            while len(receiver.audio_data_server.originals()) < len(frames):
                 if task.done():
                     task.result()
                     break
                 if asyncio.get_event_loop().time() > deadline:
                     break
                 await asyncio.sleep(0.01)
-            packets = list(receiver.audio_data_server.datagrams)
+            packets = receiver.audio_data_server.originals()
             raw16 = sess._ctx.stream_raw16  # noqa: SLF001
             eiv = sess._ctx.audio_eiv  # noqa: SLF001
         finally:

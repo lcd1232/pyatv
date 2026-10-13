@@ -406,6 +406,20 @@ class _MirrorDatagramServer(_FrameCounter):
             self._owner.sources.append(addr)
             self._owner._count(len(data))
 
+    def originals(self) -> list[bytes]:
+        """Return the first copy of each RTP packet, in arrival order.
+
+        The sender repeats every audio packet (``redundantAudio``); like a
+        real receiver, this drops the repeats by sequence number.
+        """
+        seen: set = set()
+        out = []
+        for data in self.datagrams:
+            if data[2:4] not in seen:
+                seen.add(data[2:4])
+                out.append(data)
+        return out
+
     async def start(self) -> int:
         loop = asyncio.get_event_loop()
         transport, _ = await loop.create_datagram_endpoint(

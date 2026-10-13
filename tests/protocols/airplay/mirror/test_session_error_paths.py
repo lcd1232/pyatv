@@ -661,14 +661,14 @@ async def test_the_live_audio_reader_parses_length_prefixed_frames(
         task = asyncio.ensure_future(sess.run())
         try:
             deadline = asyncio.get_event_loop().time() + GUARD_TIMEOUT
-            while len(receiver.audio_data_server.datagrams) < len(frames):
+            while len(receiver.audio_data_server.originals()) < len(frames):
                 if task.done():
                     task.result()
                     raise AssertionError("run() ended before audio was sent")
                 if asyncio.get_event_loop().time() > deadline:
                     break
                 await asyncio.sleep(0.02)
-            packets = list(receiver.audio_data_server.datagrams)
+            packets = receiver.audio_data_server.originals()
         finally:
             await sess.stop()
             task.cancel()
