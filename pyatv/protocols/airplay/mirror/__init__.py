@@ -1,7 +1,7 @@
 """AirPlay 2 screen mirroring sender.
 
 Streams H.264 video (and optionally AAC-ELD screen audio) to an Apple TV
-running tvOS 26: a type-110 video stream sent over TCP, keyed through a
+(verified on tvOS 27): a type-110 video stream sent over TCP, keyed through a
 FairPlay-wrapped key in ``ekey``/``eiv``. The FairPlay SAP handshake is
 implemented in pure Python in
 :mod:`~pyatv.protocols.airplay.mirror.fairplay_sap`.

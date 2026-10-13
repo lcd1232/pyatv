@@ -220,7 +220,7 @@ class MirrorSession:
         self._rtsp.user_agent = MIRROR_USER_AGENT
 
         session_uuid = str(uuid4()).upper()
-        # Both stream SETUPs repeat sessionUUID / deviceID / macAddress.
+        # Every SETUP repeats sessionUUID / deviceID / macAddress (_identity).
         self._session_uuid = session_uuid
         self._device_id = self._ctx.device_id or _device_id_from_uuid(session_uuid)
         self._mac_address = self._ctx.mac_address or _device_id_from_uuid(str(uuid4()))
@@ -688,6 +688,9 @@ class MirrorSession:
                         frame = await live_audio_q.get()
                         start = loop.time()
                         idx = 0
+                        # A copy owed from before the gap would now go out
+                        # late; the receiver has either got it or given up.
+                        resend.clear()
                     else:
                         frame = live_audio_q.get_nowait()
                 else:

@@ -43,7 +43,8 @@ _REASONS = {
 # Protocol constants are pinned; per-session values (IDs, ports, UUIDs) are
 # checked for presence and shape only.
 
-#: ``streams[0]`` of the screen-audio SETUP, as captured against tvOS 26.
+#: ``streams[0]`` of the screen-audio SETUP, as captured against tvOS 26, plus
+#: the fields tvOS 27 needs to play it.
 CAPTURED_AUDIO_STREAM: Dict[str, Any] = {
     # Screen-audio stream type (110 is screen video).
     "type": 96,
@@ -446,6 +447,7 @@ class FakeMirrorReceiver:
         split_event_request: bool = False,
         dead_audio_data_port: bool = False,
         hang_up_event_channel: bool = False,
+        event_port_from_audio_setup: bool = False,
     ) -> None:
         # The keyword arguments make the fake misbehave so the sender's error
         # handling runs on real wire bytes. ``status_overrides`` maps a phase
@@ -454,6 +456,9 @@ class FakeMirrorReceiver:
         self.status_overrides = dict(status_overrides or {})
         #: Answer SETUP without the ``eventPort`` the sender needs.
         self.omit_event_port = omit_event_port
+        #: Name the real eventPort in the audio SETUP's reply and a dead one in
+        #: the session SETUP's, as a receiver that moves it might.
+        self.event_port_from_audio_setup = event_port_from_audio_setup
         #: Answer the type-96 audio SETUP without a ``controlPort``.
         self.omit_audio_control_port = omit_audio_control_port
         #: Advertise a screen-audio dataPort nothing is bound to, so the
@@ -628,7 +633,9 @@ class FakeMirrorReceiver:
             self.protocol_violations += check_session_setup(decoded)
             payload: Dict[str, Any] = {"skipRecord": True}
             if not self.omit_event_port:
-                payload["eventPort"] = self._event_port
+                payload["eventPort"] = (
+                    1 if self.event_port_from_audio_setup else self._event_port
+                )
             return (
                 plistlib.dumps(payload, fmt=plistlib.FMT_BINARY),
                 "application/x-apple-binary-plist",
@@ -654,6 +661,8 @@ class FakeMirrorReceiver:
                 audio_stream["controlPort"] = self._audio_control_port
             # tvOS 27 names the eventPort in the session SETUP's reply only.
             payload = {"streams": [audio_stream]}
+            if self.event_port_from_audio_setup:
+                payload["eventPort"] = self._event_port
             return (
                 plistlib.dumps(payload, fmt=plistlib.FMT_BINARY),
                 "application/x-apple-binary-plist",

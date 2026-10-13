@@ -170,6 +170,36 @@ async def stream_then_stop(receiver, sess, *, video_frames: int = 1) -> None:
 # ---------------------------------------------------------------------------
 
 
+async def test_session_setup_non_200_raises_protocol_error(monkeypatch):
+    """A refused session SETUP stops the session before any stream SETUP."""
+    async with driven_session(
+        monkeypatch,
+        status_overrides={"setup_session": RTSP_LOW_ON_STORAGE},
+    ) as (receiver, sess):
+        error = await run_until_error(sess)
+
+    assert isinstance(error, exceptions.ProtocolError), repr(error)
+    assert "session SETUP" in str(error)
+    assert str(RTSP_LOW_ON_STORAGE) in str(error)
+    assert receiver.session_setup_received
+    assert not receiver.audio_setup_received
+
+
+async def test_an_event_port_in_the_audio_setup_reply_wins(monkeypatch):
+    """If the audio SETUP's reply names an eventPort, the sender uses it."""
+    async with driven_session(monkeypatch, event_port_from_audio_setup=True) as (
+        receiver,
+        sess,
+    ):
+        await stream_then_stop(receiver, sess)
+        await asyncio.wait_for(
+            receiver.event_server.command_answered.wait(), timeout=GUARD_TIMEOUT
+        )
+
+    # The session SETUP's eventPort (1) was dead; the channel came up anyway.
+    assert receiver.event_server.command_answered.is_set()
+
+
 async def test_audio_setup_non_200_raises_protocol_error(monkeypatch):
     """The type-96 audio SETUP guard must name the stream type."""
     async with driven_session(
@@ -840,7 +870,8 @@ async def test_the_access_unit_keeps_its_sei_ahead_of_the_slice(monkeypatch, tmp
 async def test_a_full_live_queue_drops_the_oldest_access_unit(monkeypatch, tmp_path):
     """A full live video queue drops its oldest access unit to bound latency.
 
-    The reader fills the queue during the ``LIVE_VIDEO_PREBUFFER`` wait. The
+    The reader parses the feeder's whole output in one read and so overfills
+    the two-slot queue before the sender takes its first access unit. The
     first access unit sent must be one of the later ones, not the first.
     """
     sei_free = [b"\x41" + bytes([0xB0 + i]) * 24 for i in range(6)]
