@@ -15,11 +15,10 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 import pytest
 
 from pyatv import exceptions
-from pyatv.protocols.airplay.mirror import ed25519_scalar, media_pair_verify
-from pyatv.protocols.airplay.mirror.media_pair_verify import (
-    IDENTITY_PUBLIC,
-    IDENTITY_SCALAR,
-)
+from pyatv.protocols.airplay.mirror import MediaIdentity, media_pair_verify
+
+#: A registered identity, as after the one-time PIN pairing.
+IDENTITY = MediaIdentity.generate()
 
 
 class _Response:
@@ -78,20 +77,13 @@ class _FakeReceiver:
 
 @pytest.mark.asyncio
 async def test_returns_the_shared_secret_after_a_valid_signature():
-    receiver = _FakeReceiver(registered=IDENTITY_PUBLIC)
+    receiver = _FakeReceiver(registered=IDENTITY.public_key)
 
-    shared = await media_pair_verify(receiver)
+    shared = await media_pair_verify(receiver, IDENTITY)
 
     assert receiver.signature_ok
     assert len(shared) == 32
     assert shared == receiver.shared
-
-
-def test_the_scalar_belongs_to_the_public_key():
-    point = ed25519_scalar._scalarmult(
-        ed25519_scalar._B, int.from_bytes(IDENTITY_SCALAR, "little")
-    )
-    assert ed25519_scalar._encodepoint(point) == IDENTITY_PUBLIC
 
 
 @pytest.mark.asyncio
@@ -99,12 +91,12 @@ async def test_an_unregistered_identity_is_an_authentication_error():
     other = Ed25519PrivateKey.generate().public_key().public_bytes_raw()
 
     with pytest.raises(exceptions.AuthenticationError, match="M1 returned HTTP 500"):
-        await media_pair_verify(_FakeReceiver(registered=other))
+        await media_pair_verify(_FakeReceiver(registered=other), IDENTITY)
 
 
 @pytest.mark.asyncio
 async def test_a_refused_m3_is_an_authentication_error():
-    receiver = _FakeReceiver(IDENTITY_PUBLIC, m3_code=470)
+    receiver = _FakeReceiver(IDENTITY.public_key, m3_code=470)
 
     with pytest.raises(exceptions.AuthenticationError, match="M3 returned HTTP 470"):
-        await media_pair_verify(receiver)
+        await media_pair_verify(receiver, IDENTITY)
