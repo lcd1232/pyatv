@@ -804,8 +804,8 @@ async def test_screen_audio_stays_silent_when_half_its_key_is_missing(
 
 async def test_each_stream_setup_goes_to_its_own_uri(monkeypatch):
     """Stream SETUPs go to ``rtsp://<ip>/<streamConnectionID>``; RECORD
-    follows on the audio stream's URI. AirParrot 3.1.9 does this, and tvOS 27
-    plays the screen audio only from a session set up this way.
+    follows on the audio stream's URI. tvOS 27 plays the screen audio only
+    from a session set up this way.
     """
     async with driven_session(monkeypatch) as (receiver, sess):
         await stream_then_stop(receiver, sess)
@@ -837,8 +837,7 @@ async def test_every_setup_shares_one_eiv(monkeypatch):
 
 async def test_every_audio_packet_is_sent_twice(monkeypatch, tmp_path):
     """Each screen-audio packet goes out ``redundantAudio`` times, the copy
-    one frame after the original, as the SETUP announces (AirParrot does
-    the same)."""
+    one frame after the original, as the SETUP announces."""
     frame = bytes(range(48))
     eld = tmp_path / "frames.eld"
     eld.write_bytes(b"".join(len(frame).to_bytes(4, "big") + frame for _ in range(8)))

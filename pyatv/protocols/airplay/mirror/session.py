@@ -5,7 +5,7 @@
      → connect the raw-TCP video dataPort. There is no ANNOUNCE/SDP. Each
      stream SETUP goes to its own URI, ``rtsp://<ip>/<streamConnectionID>``,
      and both share one ``eiv``; tvOS 27 plays screen audio only from a
-     session set up this way (AirParrot 3.1.9 does it).
+     session set up this way.
   2. Streaming: the video producer + drain task, the feedback heartbeat and,
      when a source is given, the screen-audio sender.
   3. Teardown: cancel tasks, send TEARDOWN, close channels.
@@ -65,8 +65,7 @@ _SUPPRESS_RAOP_HEADERS = {
 # a current macOS sender reports.
 MIRROR_USER_AGENT = "AirPlay/870.14.1"
 
-#: Headers of the stream SETUPs: the suppressed RAOP ones, plus the
-#: ``rmodel`` AirParrot 3.1.9 sends.
+#: Headers of the stream SETUPs: the suppressed RAOP ones, plus ``rmodel``.
 _STREAM_SETUP_HEADERS = {**_SUPPRESS_RAOP_HEADERS, "rmodel": "PC1,1"}
 
 #: Seconds to wait for the stream SETUP response.

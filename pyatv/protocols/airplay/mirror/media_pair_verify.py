@@ -38,8 +38,8 @@ _LOGGER = logging.getLogger(__name__)
 #: Length of the X25519 shared secret this returns.
 SHARED_SECRET_LENGTH = 32
 
-#: The ed25519 identity the pair-verify signs with: AirParrot's, which is
-#: registered with the receiver. pyatv cannot register an identity of its
+#: The ed25519 identity the pair-verify signs with: the reference sender's,
+#: which is registered with the receiver. pyatv cannot register an identity of its
 #: own yet, so this is the one the receiver accepts. The scalar is the
 #: clamped expanded scalar, not the RFC 8032 seed.
 IDENTITY_PUBLIC = bytes.fromhex(

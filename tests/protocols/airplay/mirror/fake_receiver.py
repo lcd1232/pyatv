@@ -59,7 +59,7 @@ CAPTURED_AUDIO_STREAM: Dict[str, Any] = {
     "audioFormat": 0x1000000,
     # Mirroring audio rather than a standalone AirPlay audio stream.
     "usingScreen": True,
-    # Added by AirParrot 3.1.9; tvOS 27 plays the stream only with these.
+    # tvOS 27 plays the stream only with these.
     "isMedia": True,
     "sr": 44100,
     "audioMode": "default",
@@ -71,8 +71,8 @@ CAPTURED_AUDIO_TOP: Dict[str, Any] = {
     "et": 32,
 }
 
-#: Constants of the session SETUP (no ``streams``), as captured from
-#: AirParrot 3.1.9 against tvOS 27.
+#: Constants of the session SETUP (no ``streams``), as captured against
+#: tvOS 27.
 CAPTURED_SESSION_SETUP: Dict[str, Any] = {
     "et": 32,
     "timingProtocol": "NTP",
