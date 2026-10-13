@@ -657,7 +657,7 @@ USER_AGENT = "AirPlay/550.10"
 
 async def run_fply_handshake(
     connection: HttpConnection,
-    mode_byte: int = 3,
+    mode_byte: int = 1,
 ) -> FPLYHandshake:
     """Execute the FPLY v3 handshake over an existing HTTP connection.
 
@@ -666,8 +666,8 @@ async def run_fply_handshake(
     the handshake and a media key is wrapped into :attr:`FPLYHandshake.ekey`
     (and :attr:`FPLYHandshake.audio_ekey`) before returning.
 
-    ``mode_byte`` 3 is what macOS senders use; with it M1 is byte-identical
-    to theirs.
+    ``mode_byte`` defaults to 1: :data:`M3_CIPHER_BLOCK` is a mode-1 M3, and
+    an Apple TV answers it with HTTP 403 when M1 asked for another mode.
 
     Both requests carry ``X-Apple-HKP: 3`` and ``X-Apple-ET: 32`` (FairPlay
     encryption type).

@@ -326,6 +326,21 @@ class _FakeConnection:
 
 
 @pytest.mark.asyncio
+async def test_run_fply_handshake_defaults_to_mode_1():
+    """M1 asks for mode 1, the mode of the constant M3 cipher block.
+
+    An Apple TV answers the M3 with HTTP 403 when M1 asked for mode 3.
+    """
+    conn = _FakeConnection(
+        [_FakeHttpResponse(200, _valid_m2()), _FakeHttpResponse(200, b"")]
+    )
+    await fply.run_fply_handshake(conn)
+
+    m1 = conn.sent[0][2]
+    assert m1 == fply.build_m1(1), m1.hex()
+
+
+@pytest.mark.asyncio
 async def test_run_fply_handshake_posts_m1_and_m3_to_fp_setup():
     """run_fply_handshake must POST M1 then M3 to /fp-setup."""
     conn = _FakeConnection(

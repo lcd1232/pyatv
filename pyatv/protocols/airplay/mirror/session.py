@@ -107,7 +107,7 @@ class MirrorSession:
     def __init__(
         self,
         rtsp: RtspSession,
-        verifier: PairVerifyProcedure,
+        verifier: Optional[PairVerifyProcedure],
         ctx: MirrorContext,
         h264_path: Path,
         *,
@@ -124,8 +124,9 @@ class MirrorSession:
         (a shell command writing length-prefixed AAC-ELD frames to stdout)
         or, failing that, ``eld_path`` (a file of such frames, looped).
         ``pair_secret`` is the 32-byte X25519 shared secret of the media
-        connection's pair-verify; it replaces the verifier's for the video
-        key, and the screen-audio key needs it.
+        pair-verify (:func:`.media_pair_verify`); both stream keys are
+        derived from it. ``verifier`` is only consulted when it is not given,
+        and may be None.
         """
         self._rtsp = rtsp
         self._verifier = verifier
