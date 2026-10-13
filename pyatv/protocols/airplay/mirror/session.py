@@ -86,12 +86,19 @@ CONFIG_DELAY = 0.3
 #: Access units buffered from a live video source (oldest dropped when full).
 LIVE_VIDEO_BUFFER = 90
 #: Seconds to let a live video source buffer before the first frame is sent.
-LIVE_VIDEO_PREBUFFER = 0.5
+#: Whatever is buffered here stays queued for the whole session and is added
+#: to the delay, so none: the source is live and paced already. (0.5 s put
+#: the picture 0.72 s behind on an Apple TV 4K; 0.0, 0.26 s.)
+LIVE_VIDEO_PREBUFFER = 0.0
 
 #: AAC-ELD frames buffered from a live audio source (oldest dropped when full).
 AUDIO_LIVE_BUFFER = 1200
-#: Frames a live audio source must buffer (~2 s) before sending starts.
-AUDIO_PREBUFFER = 180
+#: Frames a live audio source must buffer (~87 ms) before sending starts.
+#: Like the video prebuffer this is permanent delay, not jitter protection:
+#: the receiver's own latency buffer absorbs network jitter. It only has to
+#: cover a live source's delivery bursts; 180 frames (~2 s) left the sound
+#: audibly behind the picture.
+AUDIO_PREBUFFER = 8
 #: Send one screen-audio sync packet every this many frames (~1/s).
 AUDIO_SYNC_EVERY = max(
     1, int(screen_audio.AUDIO_SAMPLE_RATE / screen_audio.AUDIO_SAMPLES_PER_FRAME)
@@ -645,7 +652,7 @@ class MirrorSession:
                         live_audio_q.put_nowait(frame)
 
             audio_reader_task = asyncio.ensure_future(_audio_reader())
-            # Pre-buffer ~2 s so bursty live delivery doesn't cause dropouts.
+            # Pre-buffer a few frames so bursty live delivery doesn't underrun.
             for _ in range(300):
                 if live_audio_q.qsize() >= AUDIO_PREBUFFER:
                     break
