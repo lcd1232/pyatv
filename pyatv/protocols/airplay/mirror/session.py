@@ -1,8 +1,11 @@
 """MirrorSession: drives one AirPlay 2 mirror session.
 
-  1. Setup: SETUP (audio, type 96) → connect eventPort → RECORD → SETUP
-     (video, type 110) → connect the raw-TCP video dataPort. There is no
-     ANNOUNCE/SDP.
+  1. Setup: session SETUP (no streams; answers the eventPort) → SETUP
+     (audio, type 96) → connect eventPort → RECORD → SETUP (video, type 110)
+     → connect the raw-TCP video dataPort. There is no ANNOUNCE/SDP. Each
+     stream SETUP goes to its own URI, ``rtsp://<ip>/<streamConnectionID>``,
+     and both share one ``eiv``; tvOS 27 plays screen audio only from a
+     session set up this way (AirParrot 3.1.9 does it).
   2. Streaming: the video producer + drain task, the feedback heartbeat and,
      when a source is given, the screen-audio sender.
   3. Teardown: cancel tasks, send TEARDOWN, close channels.
@@ -60,6 +63,10 @@ _SUPPRESS_RAOP_HEADERS = {
 # AirPlay version. pyatv's default (AirPlay/550.10) is too old; this is what
 # a current macOS sender reports.
 MIRROR_USER_AGENT = "AirPlay/870.14.1"
+
+#: Headers of the stream SETUPs: the suppressed RAOP ones, plus the
+#: ``rmodel`` AirParrot 3.1.9 sends.
+_STREAM_SETUP_HEADERS = {**_SUPPRESS_RAOP_HEADERS, "rmodel": "PC1,1"}
 
 #: Seconds to wait for the stream SETUP response.
 STREAM_SETUP_TIMEOUT = 30.0
@@ -152,6 +159,9 @@ class MirrorSession:
         self._event_reader: Optional[asyncio.StreamReader] = None
         self._event_writer: Optional[asyncio.StreamWriter] = None
         self._audio_setup_done = False
+        #: The one ``eiv`` of the session and stream SETUPs; it is also the
+        #: screen audio's AES-CBC IV. Chosen in ``_setup_session``.
+        self._stream_eiv: bytes = b""
         self._audio_proc: Optional[asyncio.subprocess.Process] = None
         self._live_proc: Optional[asyncio.subprocess.Process] = None
 
@@ -164,10 +174,11 @@ class MirrorSession:
         if self._stopped:
             raise RuntimeError("session already stopped; construct a new one")
         await self._setup_session()
-        # SETUP(audio 96) -> connect eventPort -> RECORD -> SETUP(video 110)
-        # -> connect video dataPort -> stream. There is no session-init SETUP;
-        # the eventPort comes from the audio SETUP, and RECORD is only
-        # answered once the event channel is connected.
+        # session SETUP -> SETUP(audio 96) -> connect eventPort -> RECORD ->
+        # SETUP(video 110) -> connect video dataPort -> stream. The eventPort
+        # comes from the session SETUP, and RECORD is only answered once the
+        # event channel is connected.
+        await self._setup_session_stream()
         await self._setup_audio_stream()
         await self._open_event_channel()
         await self._record()
@@ -180,7 +191,8 @@ class MirrorSession:
     async def _setup_session(self) -> None:
         """Prepare the session identity and serve the timing port.
 
-        No request is sent here; the ``eventPort`` comes from the audio SETUP.
+        No request is sent here; ``_setup_session_stream`` sends the session
+        SETUP.
         """
         if self._ctx.stream_encryptor is None:
             raise exceptions.ProtocolError(
@@ -206,9 +218,50 @@ class MirrorSession:
         self._device_id = self._ctx.device_id or _device_id_from_uuid(session_uuid)
         self._mac_address = self._ctx.mac_address or _device_id_from_uuid(str(uuid4()))
         self._ctx.event_port = 0
+        self._stream_eiv = secrets.token_bytes(16)
+
+    def _identity(self) -> dict:
+        """Return the session identity every SETUP repeats at the top level."""
+        return {
+            "et": STREAM_ET,
+            "timingPort": self._timing_server.port if self._timing_server else 0,
+            "sessionUUID": self._session_uuid or str(uuid4()).upper(),
+            "osBuildVersion": self._ctx.os_build_version,
+            "sourceVersion": self._ctx.source_version,
+            "deviceID": self._device_id,
+            "macAddress": self._mac_address,
+            "name": self._ctx.name,
+            "model": self._ctx.model,
+        }
+
+    async def _setup_session_stream(self) -> None:
+        """Send the session SETUP: no streams, answered with the eventPort.
+
+        tvOS 27 plays the screen audio only when the session is opened this
+        way first. It carries the identity, ``timingProtocol``, the
+        mirroring flag and the wrapped key with the shared ``eiv``.
+        """
+        body = {
+            **self._identity(),
+            "timingProtocol": "NTP",
+            "isScreenMirroringSession": True,
+        }
+        if self._ctx.ekey:
+            body["ekey"] = self._ctx.ekey
+            body["eiv"] = self._stream_eiv
+        resp = await self._rtsp.setup(
+            headers=dict(_SUPPRESS_RAOP_HEADERS),
+            body=body,
+            timeout=STREAM_SETUP_TIMEOUT,
+        )
+        if resp.code != 200:
+            raise exceptions.ProtocolError(f"session SETUP failed: HTTP {resp.code}")
+        decoded = decode_bplist_from_body(resp)
+        _LOGGER.debug("session SETUP response: %r", decoded)
+        self._ctx.event_port = decoded.get("eventPort", 0)
 
     async def _open_event_channel(self) -> None:
-        """Connect the event channel advertised by the audio SETUP.
+        """Connect the event channel advertised by the session SETUP.
 
         A plaintext TCP connection; the receiver will not answer RECORD
         until it is up.
@@ -280,35 +333,36 @@ class MirrorSession:
     def _build_ekey_eiv(self):
         """Return (ekey, eiv) for the video stream SETUP, or (None, None).
 
-        ``ekey`` is the FairPlay-wrapped ``stream_raw16``. ``eiv`` is random:
-        the video IV is derived from raw16, not taken from eiv.
+        ``ekey`` is the FairPlay-wrapped ``stream_raw16``. ``eiv`` is the
+        session's shared one; the video IV is derived from raw16, not taken
+        from eiv, but tvOS 27 expects the same eiv on every stream SETUP.
         """
         if self._ctx.ekey:
-            return self._ctx.ekey, secrets.token_bytes(16)
+            return self._ctx.ekey, self._stream_eiv
         return None, None
 
     async def _setup_audio_stream(self) -> None:
         """Send the type-96 audio stream SETUP (before RECORD).
 
-        The audio SETUP must come first or RECORD returns 455, and the receiver
-        only accepts the video stream if the audio stream exists. It advertises
-        ``controlPort``, a bound UDP port the audio sync packets are sent from.
+        The audio SETUP must precede RECORD or RECORD returns 455, and the
+        receiver only accepts the video stream if the audio stream exists. It
+        advertises ``controlPort``, a bound UDP port the audio sync packets
+        are sent from, and goes to the stream's own URI; RECORD then follows
+        on that URI.
         """
         if self._audio_setup_done:
             return
         if not self._ctx.audio_ekey:
             return
         self._audio_setup_done = True
-        timing_port = self._timing_server.port if self._timing_server else 0
         if self._audio_control_sock is None:
             self._audio_control_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self._audio_control_sock.bind((self._rtsp.connection.local_ip, 0))
         control_port = self._audio_control_sock.getsockname()[1]
         audio_id = secrets.randbits(32)
-        audio_eiv = secrets.token_bytes(16)
-        # The eiv is the screen-audio CBC IV. Unlike the video stream's id,
-        # audio_id takes no part in key derivation.
-        self._ctx.audio_eiv = audio_eiv
+        # The shared eiv is the screen-audio CBC IV. Unlike the video
+        # stream's id, audio_id takes no part in key derivation.
+        self._ctx.audio_eiv = self._stream_eiv
         audio_body = {
             "streams": [
                 {
@@ -322,22 +376,16 @@ class MirrorSession:
                     "audioFormat": 16777216,
                     "controlPort": control_port,
                     "usingScreen": True,
+                    **screen_audio.AUDIO_STREAM_EXTRA,
                 }
             ],
-            "et": STREAM_ET,
-            "timingPort": timing_port,
-            "sessionUUID": self._session_uuid or str(uuid4()).upper(),
-            "osBuildVersion": self._ctx.os_build_version,
-            "sourceVersion": self._ctx.source_version,
-            "deviceID": self._device_id,
-            "macAddress": self._mac_address,
-            "name": self._ctx.name,
-            "model": self._ctx.model,
+            **self._identity(),
             "ekey": self._ctx.audio_ekey,
-            "eiv": audio_eiv,
+            "eiv": self._stream_eiv,
         }
+        self._rtsp.session_id = audio_id
         a_resp = await self._rtsp.setup(
-            headers=dict(_SUPPRESS_RAOP_HEADERS),
+            headers=dict(_STREAM_SETUP_HEADERS),
             body=audio_body,
             timeout=STREAM_SETUP_TIMEOUT,
         )
@@ -347,7 +395,8 @@ class MirrorSession:
             )
         decoded = decode_bplist_from_body(a_resp)
         _LOGGER.debug("AUDIO SETUP full response: %r", decoded)
-        self._ctx.event_port = decoded.get("eventPort", 0)
+        # tvOS 27 names the eventPort in the session SETUP's reply only.
+        self._ctx.event_port = decoded.get("eventPort") or self._ctx.event_port
         astream = (decoded.get("streams") or [{}])[0]
         self._ctx.audio_data_port = astream.get("dataPort", 0)
         self._ctx.audio_control_port = astream.get("controlPort", 0)
@@ -363,15 +412,15 @@ class MirrorSession:
     async def _setup_streams(self) -> None:
         """Send the type-110 video stream SETUP and record the data port.
 
-        Sent after ``RECORD``: a type-110 stream, the session identity at the
-        top level, and the wrapped key in ``ekey``/``eiv``. The receiver
-        returns a TCP dataPort (see tcp_stream.py).
+        Sent after ``RECORD`` to the stream's own URI: a type-110 stream, the
+        session identity at the top level, and the wrapped key in
+        ``ekey``/``eiv``. The receiver returns a TCP dataPort (see
+        tcp_stream.py).
         """
         # 32 bits: the receiver appears to store the id in a 32-bit field, so
         # a wider value would make its key label ("AirPlayStreamKey"+id)
         # disagree with ours.
         self._ctx.stream_connection_id = secrets.randbits(32)
-        timing_port = self._timing_server.port if self._timing_server else 0
         body = {
             "streams": [
                 {
@@ -383,15 +432,7 @@ class MirrorSession:
                     ],
                 }
             ],
-            "et": STREAM_ET,
-            "timingPort": timing_port,
-            "sessionUUID": self._session_uuid or str(uuid4()).upper(),
-            "osBuildVersion": self._ctx.os_build_version,
-            "sourceVersion": self._ctx.source_version,
-            "deviceID": self._device_id,
-            "macAddress": self._mac_address,
-            "name": self._ctx.name,
-            "model": self._ctx.model,
+            **self._identity(),
         }
         ekey, eiv = self._build_ekey_eiv()
         if ekey is not None:
@@ -406,8 +447,9 @@ class MirrorSession:
             )
         # The receiver negotiates the video pipeline and probes the advertised
         # ports before answering, so allow more than the 4 s RTSP default.
+        self._rtsp.session_id = self._ctx.stream_connection_id
         resp = await self._rtsp.setup(
-            headers=dict(_SUPPRESS_RAOP_HEADERS),
+            headers=dict(_STREAM_SETUP_HEADERS),
             body=body,
             timeout=STREAM_SETUP_TIMEOUT,
         )

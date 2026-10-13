@@ -1,8 +1,9 @@
 """In-process AirPlay 2 mirror receiver for driving a MirrorSession in tests.
 
 It serves RTSP/HTTP control on a random local port and answers /fp-setup,
-/auth-setup, /info, SETUP, RECORD and TEARDOWN. A type-96 audio SETUP returns
-the ``eventPort``, RECORD follows, and the type-110 video SETUP returns a TCP
+/auth-setup, /info, SETUP, RECORD and TEARDOWN, the way tvOS 27 does: a
+session SETUP (no streams) returns the ``eventPort``, the type-96 audio SETUP
+the audio ports, RECORD follows, and the type-110 video SETUP returns a TCP
 ``dataPort``. The event channel is RTSP driven by the receiver. Data sockets
 count (and partly retain) what arrives; the fake does not decrypt video.
 """
@@ -58,12 +59,24 @@ CAPTURED_AUDIO_STREAM: Dict[str, Any] = {
     "audioFormat": 0x1000000,
     # Mirroring audio rather than a standalone AirPlay audio stream.
     "usingScreen": True,
+    # Added by AirParrot 3.1.9; tvOS 27 plays the stream only with these.
+    "isMedia": True,
+    "sr": 44100,
+    "audioMode": "default",
 }
 
 #: Top-level (outside ``streams``) constants of the audio SETUP.
 CAPTURED_AUDIO_TOP: Dict[str, Any] = {
     # Encryption type 32 is FairPlay SAP v3 (the ekey/eiv beside it).
     "et": 32,
+}
+
+#: Constants of the session SETUP (no ``streams``), as captured from
+#: AirParrot 3.1.9 against tvOS 27.
+CAPTURED_SESSION_SETUP: Dict[str, Any] = {
+    "et": 32,
+    "timingProtocol": "NTP",
+    "isScreenMirroringSession": True,
 }
 
 #: ``streams[0]`` of the screen-video SETUP.
@@ -121,6 +134,25 @@ def _check_stream_connection_id(where: str, stream: dict, bits: int) -> List[str
     sid = stream.get("streamConnectionID")
     if not isinstance(sid, int) or not 0 < sid < 2**bits:
         return [f"{where}: streamConnectionID {sid!r} is not a {bits}-bit id"]
+    return []
+
+
+def check_session_setup(body: dict) -> List[str]:
+    """Return every way this session SETUP differs from the capture."""
+    problems = _check_constants("session SETUP", body, CAPTURED_SESSION_SETUP)
+    problems += _check_session_fields("session SETUP", body)
+    # A sender with no FairPlay key leaves both out, as in the video SETUP.
+    if "ekey" in body and (
+        not isinstance(body.get("eiv"), bytes) or len(body["eiv"]) != 16
+    ):
+        problems.append(f"session SETUP: eiv {body.get('eiv')!r} is not 16 bytes")
+    return problems
+
+
+def check_stream_uri(where: str, uri: str, stream: dict) -> List[str]:
+    """Check that a stream SETUP went to ``rtsp://<ip>/<streamConnectionID>``."""
+    if uri.rsplit("/", 1)[-1] != str(stream.get("streamConnectionID")):
+        return [f"{where}: sent to {uri}, not to its streamConnectionID"]
     return []
 
 
@@ -430,6 +462,8 @@ class FakeMirrorReceiver:
         self.announce_received = False
         self.info_requests = 0
         self.setup_count = 0
+        #: (method, URI) of every request, in arrival order.
+        self.requests: List[Tuple[str, str]] = []
         self.session_setup_received = False
         self.audio_setup_received = False
         self.stream_setup_received = False
@@ -470,15 +504,16 @@ class FakeMirrorReceiver:
         return self._server_pk_bytes
 
     def assert_protocol_ok(self) -> None:
-        """Fail if any SETUP disagreed with the captured tvOS 26 protocol.
+        """Fail if any SETUP disagreed with the captured protocol.
 
         Raising from inside ``_dispatch_setup`` would be swallowed by the
         control handler's catch-all and surface as a hang, so violations are
         accumulated there and asserted here, from the test's own task.
         """
-        assert not self.protocol_violations, (
-            "SETUP body disagrees with the captured tvOS 26 protocol:\n  "
-            + "\n  ".join(self.protocol_violations)
+        assert (
+            not self.protocol_violations
+        ), "SETUP body disagrees with the captured protocol:\n  " + "\n  ".join(
+            self.protocol_violations
         )
 
     async def start(self) -> Tuple[str, int]:
@@ -550,13 +585,21 @@ class FakeMirrorReceiver:
             except Exception:
                 pass
 
-    def _dispatch_setup(self, body: bytes) -> Tuple[bytes, str | None, int]:
-        """Answer a SETUP, distinguishing session-init / audio / video.
+    def _check_shared_eiv(self, where: str, body: dict) -> List[str]:
+        """Check that a stream SETUP repeats the session SETUP's ``eiv``."""
+        session = self.session_setup_body or {}
+        if "eiv" in session and body.get("eiv") != session["eiv"]:
+            return [f"{where}: eiv differs from the session SETUP's"]
+        return []
 
-        The sender opens with a type-96 audio SETUP (answered with the
-        ``eventPort``) and sends the type-110 video SETUP after RECORD. A
-        SETUP without ``streams`` is recorded so tests can assert it is not
-        sent.
+    def _dispatch_setup(self, uri: str, body: bytes) -> Tuple[bytes, str | None, int]:
+        """Answer a SETUP, distinguishing session / audio / video.
+
+        As on tvOS 27: the session SETUP (no ``streams``) is answered with the
+        ``eventPort``, the type-96 audio SETUP with the audio ports only, and
+        the type-110 video SETUP, sent after RECORD, with the TCP dataPort.
+        Each stream SETUP must go to its own URI and repeat the session's
+        ``eiv``.
         """
         decoded = {}
         if body:
@@ -568,7 +611,8 @@ class FakeMirrorReceiver:
         if not streams:
             self.session_setup_received = True
             self.session_setup_body = decoded
-            payload = {}
+            self.protocol_violations += check_session_setup(decoded)
+            payload: Dict[str, Any] = {"skipRecord": True}
             if not self.omit_event_port:
                 payload["eventPort"] = self._event_port
             return (
@@ -586,15 +630,16 @@ class FakeMirrorReceiver:
             self.audio_setup_eiv = decoded.get("eiv")
             self.audio_setup_body = decoded
             self.protocol_violations += check_audio_setup(decoded)
+            self.protocol_violations += check_stream_uri("audio SETUP", uri, streams[0])
+            self.protocol_violations += self._check_shared_eiv("audio SETUP", decoded)
             audio_stream = {
                 "type": 96,
                 "dataPort": 1 if self.dead_audio_data_port else self._audio_port,
             }
             if not self.omit_audio_control_port:
                 audio_stream["controlPort"] = self._audio_control_port
+            # tvOS 27 names the eventPort in the session SETUP's reply only.
             payload = {"streams": [audio_stream]}
-            if not self.omit_event_port:
-                payload["eventPort"] = self._event_port
             return (
                 plistlib.dumps(payload, fmt=plistlib.FMT_BINARY),
                 "application/x-apple-binary-plist",
@@ -607,6 +652,8 @@ class FakeMirrorReceiver:
         self.video_setup_et = decoded.get("et")
         self.video_setup_body = decoded
         self.protocol_violations += check_video_setup(decoded)
+        self.protocol_violations += check_stream_uri("video SETUP", uri, streams[0])
+        self.protocol_violations += self._check_shared_eiv("video SETUP", decoded)
         video_stream = {"type": 110, "dataPort": self._video_port}
         return (
             plistlib.dumps({"streams": [video_stream]}, fmt=plistlib.FMT_BINARY),
@@ -617,6 +664,9 @@ class FakeMirrorReceiver:
     def _dispatch(
         self, method: str, request_line: str, body: bytes
     ) -> Tuple[bytes, str | None, int]:
+        parts = request_line.split(" ")
+        uri = parts[1] if len(parts) > 1 else ""
+        self.requests.append((method, uri))
         if (
             method == "POST"
             and "/fp-setup" in request_line
@@ -655,7 +705,7 @@ class FakeMirrorReceiver:
             return b"", None, 200
         if method == "SETUP":
             self.setup_count += 1
-            return self._dispatch_setup(body)
+            return self._dispatch_setup(uri, body)
         if method == "RECORD":
             self.record_received = True
             return b"", None, self.status_overrides.get("record", 200)

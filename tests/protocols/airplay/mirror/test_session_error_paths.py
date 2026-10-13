@@ -345,8 +345,9 @@ async def test_audio_setup_skipped_without_audio_ekey(monkeypatch):
         await stream_then_stop(receiver, sess)
 
     assert not receiver.audio_setup_received
-    # Only the video SETUP went out.
-    assert receiver.setup_count == 1
+    # Only the session and video SETUPs went out.
+    assert receiver.setup_count == 2
+    assert receiver.session_setup_received
     assert receiver.stream_setup_received
 
 
@@ -396,11 +397,11 @@ async def test_no_ekey_omits_stream_keys_from_setup(monkeypatch):
     async with driven_session(monkeypatch, with_ekey=False) as (receiver, sess):
         original = receiver._dispatch_setup
 
-        def _capture(body: bytes):
+        def _capture(uri: str, body: bytes):
             if body:
                 with contextlib.suppress(Exception):
                     bodies.append(plistlib.loads(bytes(body)))
-            return original(body)
+            return original(uri, body)
 
         receiver._dispatch_setup = _capture
         await stream_then_stop(receiver, sess)
@@ -411,6 +412,9 @@ async def test_no_ekey_omits_stream_keys_from_setup(monkeypatch):
     assert video, bodies
     assert "ekey" not in video[0], video[0]
     assert "eiv" not in video[0], video[0]
+    # The session SETUP leaves them out too.
+    session = [b for b in bodies if "streams" not in b]
+    assert session and "ekey" not in session[0] and "eiv" not in session[0], bodies
 
 
 # ---------------------------------------------------------------------------

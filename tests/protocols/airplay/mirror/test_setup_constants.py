@@ -670,10 +670,12 @@ async def test_the_announced_stream_id_is_the_one_the_key_is_derived_from(monkey
 
 
 async def test_the_tcp_request_order_is_the_captured_one(monkeypatch):
-    """Requests go SETUP(audio 96), RECORD, SETUP(video 110), TEARDOWN.
+    """Requests go SETUP(session), SETUP(audio 96), RECORD, SETUP(video 110),
+    TEARDOWN.
 
-    The receiver only answers RECORD once the event channel from the audio
-    SETUP is up, so the order matters.
+    The receiver only answers RECORD once the event channel from the session
+    SETUP is up, so the order matters; tvOS 27 plays audio only with the
+    session SETUP first.
     """
     seen: list = []
     real = http.HttpConnection.send_and_receive
@@ -702,7 +704,13 @@ async def test_the_tcp_request_order_is_the_captured_one(monkeypatch):
         await stream_then_stop(receiver, sess)
 
     rtsp = [label for label in seen if label != "POST"]
-    assert rtsp == ["SETUP(audio)", "RECORD", "SETUP(video)", "TEARDOWN"], rtsp
+    assert rtsp == [
+        "SETUP",
+        "SETUP(audio)",
+        "RECORD",
+        "SETUP(video)",
+        "TEARDOWN",
+    ], rtsp
 
     # The FairPlay handshake precedes all of it, on the same connection.
     assert seen[:2] == ["POST", "POST"], seen[:4]
@@ -791,3 +799,36 @@ async def test_screen_audio_stays_silent_when_half_its_key_is_missing(
 
     assert not packets, "audio was sent under a key derived from half its input"
     assert not syncs, "a sync went out for a stream that cannot be keyed"
+
+
+async def test_each_stream_setup_goes_to_its_own_uri(monkeypatch):
+    """Stream SETUPs go to ``rtsp://<ip>/<streamConnectionID>``; RECORD
+    follows on the audio stream's URI. AirParrot 3.1.9 does this, and tvOS 27
+    plays the screen audio only from a session set up this way.
+    """
+    async with driven_session(monkeypatch) as (receiver, sess):
+        await stream_then_stop(receiver, sess)
+
+    receiver.assert_protocol_ok()
+    uris = {method: [] for method in ("SETUP", "RECORD")}
+    for method, uri in receiver.requests:
+        if method in uris:
+            uris[method].append(uri.rsplit("/", 1)[-1])
+    audio_id = str(receiver.audio_setup_body["streams"][0]["streamConnectionID"])
+    video_id = str(receiver.video_setup_body["streams"][0]["streamConnectionID"])
+    assert uris["SETUP"][1:] == [audio_id, video_id], uris
+    assert uris["RECORD"] == [audio_id], uris
+
+
+async def test_every_setup_shares_one_eiv(monkeypatch):
+    """The session, audio and video SETUPs carry the same ``eiv``."""
+    async with driven_session(monkeypatch) as (receiver, sess):
+        await stream_then_stop(receiver, sess)
+
+    eivs = {
+        receiver.session_setup_body["eiv"],
+        receiver.audio_setup_eiv,
+        receiver.video_setup_eiv,
+    }
+    assert len(eivs) == 1, eivs
+    assert len(eivs.pop()) == 16

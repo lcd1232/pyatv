@@ -105,11 +105,17 @@ class ScreenAudioPacketizer:
         return self._ts
 
 
+#: ``streams[0]`` fields of the screen-audio SETUP that tvOS 27 needs: without
+#: them (and the session SETUP) it accepts the stream and never plays it.
+#: AirParrot 3.1.9 added them.
+AUDIO_STREAM_EXTRA = {"isMedia": True, "sr": AUDIO_SAMPLE_RATE, "audioMode": "default"}
+
+
 def audio_setup_stream_params(stream_connection_id: int) -> dict:
     """Return the type-96 SETUP ``streams[0]`` dict for screen audio.
 
     AAC-ELD (audioFormat 0x1000000), ct=8, spf=480, latency 3750, 2x
-    redundancy.
+    redundancy, plus :data:`AUDIO_STREAM_EXTRA`.
     The caller adds ``ekey``/``eiv`` and the top-level session fields.
     """
     return {
@@ -122,6 +128,7 @@ def audio_setup_stream_params(stream_connection_id: int) -> dict:
         "spf": AUDIO_SAMPLES_PER_FRAME,
         "audioFormat": 0x1000000,
         "usingScreen": True,
+        **AUDIO_STREAM_EXTRA,
     }
 
 

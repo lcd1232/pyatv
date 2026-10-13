@@ -138,10 +138,10 @@ async def test_mvp_streams_to_fake_receiver_after_mfisap_handshake(
         receiver.assert_protocol_ok()
         # Modern mirroring sends no ANNOUNCE/SDP.
         assert not receiver.announce_received, "ANNOUNCE must not be sent"
-        # The session opens with the type-96 audio SETUP (which carries the
-        # eventPort); there is no metadata-only session SETUP.
+        # The session opens with a session SETUP (which carries the
+        # eventPort), then the type-96 audio SETUP.
+        assert receiver.session_setup_received, "session SETUP not received"
         assert receiver.audio_setup_received, "audio SETUP not received"
-        assert not receiver.session_setup_received
         # The receiver sends POST /command on the event channel and tears the
         # session down after ~30 s if it goes unanswered.
         assert (
@@ -152,8 +152,8 @@ async def test_mvp_streams_to_fake_receiver_after_mfisap_handshake(
         assert b"CSeq: 7\r\n" in reply, reply[:64]
         assert receiver.stream_setup_received, "stream SETUP not received"
         assert (
-            receiver.setup_count == 2
-        ), f"expected 2 SETUPs, got {receiver.setup_count}"
+            receiver.setup_count == 3
+        ), f"expected 3 SETUPs (session, audio, video), got {receiver.setup_count}"
         assert receiver.record_received, "RECORD not received"
         assert receiver.teardown_received, "TEARDOWN not received"
         assert (
