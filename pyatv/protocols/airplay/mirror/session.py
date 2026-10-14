@@ -162,6 +162,9 @@ class MirrorSession:
         self._timing_server: Optional[TimingServer] = None
         self._tasks: list[asyncio.Task] = []
         self._stopped = False
+        #: Set when the receiver ends the session from its side: it closes
+        #: the event channel, the video connection or the RTSP connection.
+        self._receiver_closed = asyncio.Event()
         # Set once the session is under way, but declared here so the
         # object's full shape is visible in one place.
         self._session_uuid: str = ""
@@ -297,6 +300,7 @@ class MirrorSession:
                     chunk = await reader.read(4096)
                     if not chunk:
                         _LOGGER.info("EVENT channel: receiver EOF")
+                        self._receiver_closed.set()
                         break
                     buf += chunk
                     while True:
@@ -335,6 +339,7 @@ class MirrorSession:
                 pass
             except Exception as exc:  # noqa: BLE001
                 _LOGGER.debug("event channel handler ended: %s", exc)
+                self._receiver_closed.set()
 
         self._register(asyncio.ensure_future(_serve_events()))
         _LOGGER.debug(
@@ -491,6 +496,7 @@ class MirrorSession:
             self._ctx.video_data_port,
         )
         self._video_transport, self._video_channel = v_transport, v_channel
+        v_channel.on_lost = lambda _exc: self._receiver_closed.set()
         _LOGGER.debug(
             "Raw TCP video channel open to %s:%d",
             addr,
@@ -1033,11 +1039,34 @@ class MirrorSession:
                 name="mirror-heartbeat",
             ),
         )
+        await self._wait_until_done()
+
+    async def _wait_until_done(self) -> None:
+        """Wait for the streaming tasks, or for the receiver to end the session.
+
+        A receiver that ends the session (its user stopped mirroring) closes
+        its connections; the senders would otherwise keep writing into them.
+        """
+        if self._rtsp.connection.transport is None:
+            self._receiver_closed.set()  # dropped before we started watching
+        self._rtsp.connection.on_lost = self._receiver_closed.set
+        tasks = asyncio.ensure_future(asyncio.gather(*self._tasks))
+        closed = asyncio.ensure_future(self._receiver_closed.wait())
         try:
-            await asyncio.gather(*self._tasks)
+            await asyncio.wait({tasks, closed}, return_when=asyncio.FIRST_COMPLETED)
         except asyncio.CancelledError:
             _LOGGER.debug("MirrorSession streaming cancelled")
+            tasks.cancel()
+            closed.cancel()
             raise
+        if closed.done():
+            _LOGGER.info("receiver ended the session")
+            tasks.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await tasks
+            return
+        closed.cancel()
+        tasks.result()
 
     def _register(self, *tasks: asyncio.Task) -> None:
         """Track background tasks so ``stop()`` can cancel and await them.
@@ -1064,10 +1093,13 @@ class MirrorSession:
                 await t
             except (asyncio.CancelledError, Exception):
                 pass
-        try:
-            await self._rtsp.teardown(self._rtsp.session_id)
-        except Exception:
-            _LOGGER.exception("TEARDOWN failed")
+        if self._receiver_closed.is_set():
+            _LOGGER.debug("receiver ended the session; no TEARDOWN to send")
+        else:
+            try:
+                await self._rtsp.teardown(self._rtsp.session_id)
+            except Exception:
+                _LOGGER.exception("TEARDOWN failed")
         self._close_endpoints()
 
     def _close_endpoints(self) -> None:

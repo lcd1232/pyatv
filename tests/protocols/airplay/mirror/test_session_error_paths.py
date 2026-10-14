@@ -516,12 +516,13 @@ async def test_a_stopped_session_refuses_to_run_again(monkeypatch):
 
 
 @pytest.mark.parametrize("channel", ["video", "control"])
-async def test_a_dropped_receiver_does_not_end_the_session(monkeypatch, channel):
-    """Characterisation: losing the video or control connection is not fatal.
+async def test_a_receiver_that_drops_a_connection_ends_the_session(
+    monkeypatch, channel
+):
+    """Losing the video or RTSP connection ends ``run()``, without a TEARDOWN.
 
-    The loss is logged but not propagated, so ``run()`` keeps streaming until
-    the caller stops it. This records current behaviour, not a requirement;
-    change it deliberately.
+    A receiver whose user stops mirroring closes its connections; streaming
+    on into them would leave the sender sharing nothing.
     """
     async with driven_session(monkeypatch) as (receiver, sess):
         task = asyncio.ensure_future(sess.run())
@@ -539,9 +540,9 @@ async def test_a_dropped_receiver_does_not_end_the_session(monkeypatch, channel)
             for writer in writers:
                 writer.transport.abort()
 
-            with pytest.raises(asyncio.TimeoutError):
-                await asyncio.wait_for(asyncio.shield(task), timeout=1.0)
-            assert not task.done(), "run() ended -- the loss is now noticed"
+            await asyncio.wait_for(task, timeout=GUARD_TIMEOUT)
+            await sess.stop()
+            assert not receiver.teardown_received
         finally:
             task.cancel()
             with contextlib.suppress(BaseException):
@@ -925,30 +926,18 @@ async def test_a_full_live_queue_drops_the_oldest_access_unit(monkeypatch, tmp_p
 
 
 @pytest.mark.asyncio
-async def test_the_receiver_closing_the_event_channel_does_not_end_the_session(
+async def test_the_receiver_closing_the_event_channel_ends_the_session(
     monkeypatch,
 ):
-    """Characterisation: EOF on the event channel does not end the session.
-
-    The event reader stops; video and the other channels keep running. Like
-    ``test_a_dropped_receiver_does_not_end_the_session``, this records
-    current behaviour rather than a requirement.
-    """
+    """EOF on the event channel ends ``run()``: the receiver has stopped."""
     async with driven_session(monkeypatch, hang_up_event_channel=True) as (
         receiver,
         sess,
     ):
         task = asyncio.ensure_future(sess.run())
         try:
-            await asyncio.wait_for(
-                receiver.event_server.command_answered.wait(), timeout=GUARD_TIMEOUT
-            )
-            # Give the sender's reader time to see the hang-up after the reply.
-            for _ in range(20):
-                await asyncio.sleep(0)
-
-            assert not task.done(), "the session ended when the event channel shut"
-            await receiver.video_server.wait_frames(1, timeout=GUARD_TIMEOUT)
+            await asyncio.wait_for(task, timeout=GUARD_TIMEOUT)
+            assert receiver.event_server.command_answered.is_set()
         finally:
             await sess.stop()
             task.cancel()

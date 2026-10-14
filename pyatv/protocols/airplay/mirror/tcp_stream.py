@@ -26,7 +26,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import struct
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -53,6 +53,8 @@ class RawVideoTCPChannel(asyncio.Protocol):
         self.transport: Optional[asyncio.Transport] = None
         self._sent = 0
         self._bytes = 0
+        #: Called with the error (or None) once the connection is gone.
+        self.on_lost: Optional[Callable[[Optional[Exception]], None]] = None
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
         """Record the transport and log the peer."""
@@ -97,6 +99,8 @@ class RawVideoTCPChannel(asyncio.Protocol):
             self._bytes,
             exc,
         )
+        if self.on_lost is not None:
+            self.on_lost(exc)
 
 
 def build_geometry(
