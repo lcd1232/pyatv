@@ -129,6 +129,7 @@ class MirrorSession:
         eld_path: Optional[Path] = None,
         audio_command: Optional[str] = None,
         pair_secret: Optional[bytes] = None,
+        timing_port: int = 0,
     ) -> None:
         """Bind the session to one RTSP connection and one H.264 file.
 
@@ -140,7 +141,9 @@ class MirrorSession:
         ``pair_secret`` is the 32-byte X25519 shared secret of the media
         pair-verify (:func:`.media_pair_verify`); both stream keys are
         derived from it. ``verifier`` is only consulted when it is not given,
-        and may be None.
+        and may be None. ``timing_port`` is the local UDP port that answers
+        the receiver's timing requests; 0 picks a free one. A fixed port lets
+        a host firewall allow those requests with a single rule.
         """
         self._rtsp = rtsp
         self._verifier = verifier
@@ -150,6 +153,7 @@ class MirrorSession:
         self._eld_path = eld_path
         self._audio_command = audio_command
         self._pair_secret = pair_secret
+        self._timing_port = timing_port
         self._video_channel: Optional[streams.SendChannel] = None
         self._audio_udp: Optional[asyncio.BaseTransport] = None
         self._event_transport: Optional[asyncio.BaseTransport] = None
@@ -212,7 +216,8 @@ class MirrorSession:
         # RAOP's TimingServer speaks the same protocol.
         loop = asyncio.get_event_loop()
         _, timing_server = await loop.create_datagram_endpoint(
-            TimingServer, local_addr=(self._rtsp.connection.local_ip, 0)
+            TimingServer,
+            local_addr=(self._rtsp.connection.local_ip, self._timing_port),
         )
         self._timing_server = cast(TimingServer, timing_server)
 

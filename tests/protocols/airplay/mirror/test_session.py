@@ -73,6 +73,32 @@ async def test_session_never_sends_announce():
     rtsp.announce.assert_not_called()
 
 
+async def test_session_serves_timing_on_the_requested_port():
+    """A fixed timing_port is bound and advertised as timingPort."""
+    import plistlib
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+
+    session_ok = _ok(plistlib.dumps({"eventPort": 1}, fmt=plistlib.FMT_BINARY))
+    rtsp = _fake_rtsp([session_ok], _ok())
+    ctx = context.MirrorContext(
+        stream_encryptor=framing.MirrorEncryptor.from_key_iv(b"\x00" * 16, b"\x01" * 16)
+    )
+    s = session.MirrorSession(
+        rtsp=rtsp, verifier=MagicMock(), ctx=ctx, h264_path=TEST_FILE, timing_port=port
+    )
+    try:
+        await s._setup_session()
+        await s._setup_session_stream()
+        assert s._timing_server.port == port
+        assert rtsp.setup.call_args_list[0].kwargs["body"]["timingPort"] == port
+    finally:
+        await s.stop()
+
+
 async def test_session_stop_calls_teardown():
     rtsp = _fake_rtsp([], _ok())
     rtsp.session_id = 999
