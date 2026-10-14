@@ -943,3 +943,28 @@ async def test_the_receiver_closing_the_event_channel_ends_the_session(
             task.cancel()
             with contextlib.suppress(BaseException):
                 await task
+
+
+async def test_stopping_a_cancelled_session_logs_no_stray_exception(monkeypatch, caplog):
+    """Cancel run(), then stop(), as a sender does on SIGTERM.
+
+    stop() cancels the streaming tasks after run() has given up waiting on
+    them; their gathered result must still be consumed, or asyncio logs
+    "exception was never retrieved" when it is collected.
+    """
+    import gc
+
+    async with driven_session(monkeypatch) as (receiver, sess):
+        task = asyncio.ensure_future(sess.run())
+        await asyncio.wait_for(
+            receiver.video_server.wait_frames(2, timeout=GUARD_TIMEOUT),
+            timeout=GUARD_TIMEOUT,
+        )
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        await sess.stop()
+        for _ in range(5):
+            await asyncio.sleep(0)
+    gc.collect()
+    assert "never retrieved" not in caplog.text

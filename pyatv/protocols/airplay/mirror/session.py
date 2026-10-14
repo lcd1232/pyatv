@@ -115,6 +115,12 @@ def _device_id_from_uuid(uuid_str: str) -> str:
     return ":".join(hex12[i : i + 2] for i in range(0, 12, 2))
 
 
+def _consume_result(future: asyncio.Future) -> None:
+    """Mark a future's outcome as seen, whatever it was."""
+    if not future.cancelled():
+        future.exception()
+
+
 class MirrorSession:
     """One mirror session: setup → stream → teardown."""
 
@@ -1051,6 +1057,10 @@ class MirrorSession:
             self._receiver_closed.set()  # dropped before we started watching
         self._rtsp.connection.on_lost = self._receiver_closed.set
         tasks = asyncio.ensure_future(asyncio.gather(*self._tasks))
+        # stop() cancels the tasks after this returns or is cancelled, which
+        # finishes the gather with an exception nobody awaits; read it here so
+        # asyncio doesn't log "exception was never retrieved".
+        tasks.add_done_callback(_consume_result)
         closed = asyncio.ensure_future(self._receiver_closed.wait())
         try:
             await asyncio.wait({tasks, closed}, return_when=asyncio.FIRST_COMPLETED)
