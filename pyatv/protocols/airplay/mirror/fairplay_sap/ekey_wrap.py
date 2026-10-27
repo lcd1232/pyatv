@@ -19,7 +19,7 @@ keyed by the secret's tail under FPLY's usual 0x0d mask (the same mask
 header followed by the *plaintext* ``raw16``, not the wrapped value that
 goes on the wire.
 
-The wrap is AES-128 with Apple's own tables: AES's key schedule and round
+The wrap is AES-128 with its own tables: AES's key schedule and round
 constants, ShiftRows, the MixColumns matrix over the Rijndael field and
 ten rounds, but none of AES's S-boxes:
 
@@ -31,15 +31,12 @@ ten rounds, but none of AES's S-boxes:
     state[p] = LAST[p][ state[SHIFT_ROWS[p]] ] ^ K[10][p] ^ OUTPUT_XOR[p]
 
 with ``K = key_schedule(sap36[0:16] ^ KEY_XOR)``, which uses a different
-SubWord table for each of its ten round keys.  All sixty-three tables
-(ten for the key schedule, four per full round, sixteen for the last
-round, one before the column step) have the form ``T(x) = R[x ^ d] ^ e``
-for one of three base tables; ``fply_wrap_tables`` stores the three bases
-and a (class, in-xor, out-xor) triple per use.
+SubWord table for each of its ten round keys.  Every table has the form
+``T(x) = R[x ^ d] ^ e`` for one of three base tables; ``fply_wrap_tables``
+stores the bases and a (class, in-xor, out-xor) triple per use.
 
 The column step is MixColumns preceded by one more substitution
-(``COLUMN``) plus a per-lane constant.  Every column step XORs in all four
-lane constants, so only their XOR, ``COLUMN_XOR``, reaches the output.
+(``COLUMN``) and followed by the constant ``COLUMN_XOR``.
 This network has its own tables and shares none with ``fply_tables``.
 """
 

@@ -12,9 +12,7 @@ algorithm itself lives in ``fply_md5`` and ``fply_pure``:
 That is nine modified MD5 compressions for the key schedule, a ten-round
 block cipher run forwards over a fixed block and backwards over the link's
 output, and two more compressions.  The MD5 is standard except that step
-31 shuffles the message block with the state; the cipher's 320
-substitution tables reduce to six plus a (class, in-xor, out-xor) triple
-per step.
+31 shuffles the message block with the state.
 """
 
 from . import fply_pure

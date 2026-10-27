@@ -1,7 +1,6 @@
 """Tables of the device_tag and M2 cipher network (see ``fply_pure``).
 
-SUBSTITUTIONS holds six 256-byte tables; every one of the 320 the
-networks use is `SUBSTITUTIONS[c][x ^ d] ^ e` for one of them.
+Each substitution step is `SUBSTITUTIONS[c][x ^ d] ^ e`;
 FORWARD/BACKWARD give (c, d, e) per round and position.
 """
 

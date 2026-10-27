@@ -1,8 +1,7 @@
 """Tables of the ekey wrap network (see ``ekey_wrap``).
 
-SUBSTITUTIONS holds three 256-byte tables; every one of the sixty-three
-the network uses is `SUBSTITUTIONS[c][x ^ d] ^ e` for one of them.
-ROUNDS, LAST, KEY_SBOXES and COLUMN give the (c, d, e) of each use.
+Each substitution is `SUBSTITUTIONS[c][x ^ d] ^ e`; ROUNDS, LAST,
+KEY_SBOXES and COLUMN give the (c, d, e) of each use.
 """
 
 # Rounds are laid out as the 4x4 state they operate on.
@@ -131,6 +130,5 @@ RCON = (0x01, 0x02, 0x04, 0x08, 0x10,
 PLAINTEXT_XOR = bytes.fromhex("e69033f48a0f4d4a79d904222fffd4ff")
 KEY_XOR = bytes.fromhex("0f0f0f0fadadadad393939399e9e9e9e")
 OUTPUT_XOR = bytes.fromhex("afafafafeeeeeeeea1a1a1a13e3e3e3e")
-# The XOR of the four column tables' offsets: every column step XORs
-# all four in, so only their XOR reaches the answer.
+# the constant XORed into every column after MixColumns
 COLUMN_XOR = bytes.fromhex("4a4a4a4a")

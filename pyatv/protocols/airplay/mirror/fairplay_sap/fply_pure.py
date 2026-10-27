@@ -14,9 +14,8 @@ block cipher run twice under one key:
 The two directions are one cipher: ``backward(forward(CONST)) == CONST``
 under the same key, which is why the link in the middle has to be there.
 
-The tables are in ``fply_tables``.  All 320 substitution tables are
-XOR-equivalent to just six, so what ships is six tables and a (class,
-in-xor, out-xor) triple per step.
+The tables are in ``fply_tables``: each substitution step is a lookup
+in one of six tables, with an input and an output XOR.
 """
 
 from . import fply_md5
