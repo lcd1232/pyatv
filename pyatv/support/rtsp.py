@@ -87,6 +87,9 @@ class RtspSession:
         self.session_id: int = randrange(2**32)
         self.dacp_id: str = f"{randrange(2 ** 64):X}"
         self.active_remote: int = randrange(2**32)
+        # Overridable per session: AirPlay 2 screen mirroring is only offered
+        # to senders advertising a recent enough AirPlay version.
+        self.user_agent: str = USER_AGENT
 
     @property
     def uri(self) -> str:
@@ -171,9 +174,10 @@ class RtspSession:
         self,
         headers: Optional[Dict[str, Any]] = None,
         body: Optional[Union[str, bytes, dict]] = None,
+        timeout: float = 4.0,
     ) -> HttpResponse:
         """Send SETUP message."""
-        return await self.exchange("SETUP", headers=headers, body=body)
+        return await self.exchange("SETUP", headers=headers, body=body, timeout=timeout)
 
     async def record(
         self,
@@ -260,6 +264,7 @@ class RtspSession:
         body: Optional[Union[str, bytes, dict]] = None,
         allow_error: bool = False,
         protocol: str = "RTSP/1.0",
+        timeout: float = 4.0,
     ) -> HttpResponse:
         """Send a RTSP message and return response."""
         cseq = self.cseq
@@ -281,6 +286,11 @@ class RtspSession:
         if headers:
             hdrs.update(headers)
 
+        # A caller can suppress one of the defaults above by passing it as
+        # None. AirPlay 2 screen mirroring does this for the RAOP
+        # remote-control headers (DACP-ID/Active-Remote/Client-Instance).
+        hdrs = {k: v for k, v in hdrs.items() if v is not None}
+
         # If body is a dict, assume that payload should be sent as a binary plist
         if isinstance(body, dict):
             hdrs["Content-Type"] = BPLIST_CONTENT_TYPE
@@ -294,7 +304,7 @@ class RtspSession:
             method,
             uri or self.uri,
             protocol=protocol,
-            user_agent=USER_AGENT,
+            user_agent=self.user_agent,
             content_type=content_type,
             headers=hdrs,
             body=body,
@@ -313,7 +323,7 @@ class RtspSession:
 
         # Wait for response to the CSeq we expect
         try:
-            async with async_timeout(4):
+            async with async_timeout(timeout):
                 await self.requests[cseq][0].wait()
             response = self.requests[cseq][1]
         except asyncio.TimeoutError as ex:
