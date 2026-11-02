@@ -351,6 +351,8 @@ class HttpConnection(asyncio.Protocol):
         self._remote_ip: Optional[str] = None
         self._requests: deque = deque()
         self._buffer = b""
+        #: Called once the remote end has closed the connection.
+        self.on_lost: Optional[Callable[[], None]] = None
 
     @property
     def local_ip(self) -> str:
@@ -416,6 +418,8 @@ class HttpConnection(asyncio.Protocol):
             pending_request.event.set()
         self._requests.clear()
         self.transport = None
+        if self.on_lost is not None:
+            self.on_lost()
 
     async def get(self, path: str, allow_error: bool = False) -> HttpResponse:
         """Make a GET request and return response."""
